@@ -1,0 +1,12 @@
+node_modules/
+.bridge-state/
+config.json
+.env
+.env.*
+!.env.example
+*.log
+*.sqlite*
+coverage/
+tokens/
+state/
+credentials*.json

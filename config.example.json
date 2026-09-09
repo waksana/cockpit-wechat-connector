@@ -1,0 +1,24 @@
+{
+  "deliveryMode": "session",
+  "nativeInterruptFollowup": false,
+  "diagnostics": { "weixinHttp": false },
+  "cockpit": {
+    "apiUrl": "http://127.0.0.1:8771",
+    "webUrl": "https://YOUR-COCKPIT-HOST",
+    "sessionId": "",
+    "cwd": ""
+  },
+  "weixin": {
+    "allowedAccount": "",
+    "allowedPeer": "",
+    "approvedApiOrigins": ["https://ilinkai.weixin.qq.com"]
+  },
+  "limits": {
+    "requestTimeoutMs": 15000,
+    "resultTimeoutMs": 900000,
+    "statusIntervalMs": 2000,
+    "maxQueued": 100,
+    "textBytes": 1800,
+    "maxReplyParts": 32
+  }
+}

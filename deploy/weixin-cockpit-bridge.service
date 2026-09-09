@@ -1,0 +1,21 @@
+[Unit]
+Description=Private Weixin to Cockpit text connector
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=/home/honglai/weixin-cockpit-bridge
+ExecStart=/home/honglai/.local/bin/node /home/honglai/weixin-cockpit-bridge/src/cli.js run --config /home/honglai/weixin-cockpit-bridge/profiles/assistant/config.json
+Environment=NODE_ENV=production
+UMask=0077
+NoNewPrivileges=true
+Restart=on-failure
+RestartSec=30
+RestartPreventExitStatus=2
+KillSignal=SIGTERM
+TimeoutStopSec=45
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
