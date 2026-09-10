@@ -46,6 +46,10 @@ export function validateConfig(raw, configPath) {
   requireThat(typeof statusDisplay.typing === 'boolean' && typeof statusDisplay.tools === 'boolean'
     && ['text', 'native'].includes(statusDisplay.toolFormat)
     && Object.keys(statusDisplay).every(key => ['typing', 'tools', 'toolFormat'].includes(key)), 'INVALID_STATUS_DISPLAY');
+  if (statusDisplay.tools || statusDisplay.toolFormat === 'text') {
+    throw new BridgeError('TOOL_PROGRESS_RETIRED',
+      'WeChat tool-progress messages (native and text fallback) are retired. Remove statusDisplay.tools/toolFormat or use tools:false with toolFormat:"native"; typing remains supported.');
+  }
   const limits = { requestTimeoutMs: 15000, resultTimeoutMs: 900000, statusIntervalMs: 2000,
     maxQueued: 100, textBytes: 1800, maxReplyParts: 32, ...raw.limits };
   for (const [key, min, max] of [

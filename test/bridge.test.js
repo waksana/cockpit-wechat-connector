@@ -13,10 +13,14 @@ import { validateConfig, assertBinding, validateApiOrigin } from '../src/config.
 import { normalizeBatch, login, WeixinClient, sendSuccess } from '../src/weixin.js';
 import { requestJson } from '../src/http.js';
 import { splitText, errorCode } from '../src/common.js';
+import { correlate, quiescent } from '../src/cockpit.js';
 
 test('real local HTTP mocks: enqueue -> authoritative reply; accepted and early idle are not completion', async t => {
   const f = await fixture(t, { earlyIdle: true });
   await f.cockpit.capabilities();
+  const meta = await f.cockpit.meta();
+  assert.equal(Object.hasOwn(meta, 'error'), false, 'current loaded metadata has no last-error getter');
+  assert.equal(quiescent(meta), true);
   await f.bridge.receive();
   await f.bridge.step();
   assert.equal(f.prompts.length, 1);
@@ -167,15 +171,66 @@ for (const kind of ['ask', 'planRequest', 'elicitation']) {
   });
 }
 
-test('unloaded session uses existing prompt; missing or changed target fails closed', async t => {
+test('correlated mode waits for known native state; missing or changed target fails closed', async t => {
   const f = await fixture(t, { status: 'unloaded', loaded: false });
   await f.bridge.receive(); await f.bridge.step();
+  assert.equal(f.prompts.length, 0, 'unknown unloaded queue is not a quiescent target');
+  assert.equal(f.store.jobs()[0].status, 'queued');
+  f.state.loaded = true; f.state.status = 'idle';
+  await f.bridge.step();
   assert.equal(f.prompts.length, 1);
   f.state.missing = true;
   await assert.rejects(f.bridge.step(), { code: 'TARGET_SESSION_MISSING' });
   f.state.missing = false; f.state.changedCwd = '/tmp/other';
   await assert.rejects(f.bridge.step(), { code: 'TARGET_CWD_CHANGED' });
   assert.equal(f.sent.length, 0);
+});
+
+test('unloaded metadata preserves unknown queue/error; loaded native state remains required', async t => {
+  const f = await fixture(t, { status: 'unloaded', loaded: false, lastActivitySource: 'persisted' });
+  const meta = await f.cockpit.meta();
+  assert.equal(meta.queue, undefined);
+  assert.equal(meta.error, undefined);
+  assert.equal(meta.lastActivitySource, 'persisted');
+  assert.equal(quiescent(meta), false);
+  assert.equal(quiescent({ ...meta, queue: [] }), false, 'unloaded state cannot prove current native idle');
+  const result = correlate({ prompt: 'own prompt' }, [
+    { id: 'user', role: 'user', content: 'own prompt' },
+    { id: 'reply', role: 'assistant', content: 'A body is not proof of a drained queue' },
+  ], meta);
+  assert.equal(result.userMessageId, 'user');
+  assert.equal(result.reply, null);
+  f.state.loaded = true; f.state.status = 'idle'; f.state.omitNativeState = true;
+  await assert.rejects(f.cockpit.meta(), { code: 'COCKPIT_SESSION_SCHEMA' });
+  f.state.omitNativeState = false;
+  assert.equal(quiescent(await f.cockpit.meta()), true);
+});
+
+test('loaded metadata without error uses current native controls, without synthesizing a last-error value', async t => {
+  const f = await fixture(t);
+  const meta = await f.cockpit.meta();
+  assert.equal(Object.hasOwn(meta, 'error'), false);
+  assert.equal(quiescent(meta), true);
+  for (const state of [{ status: 'running' }, { queue: [{ id: 'q', text: 'queued work' }] },
+    { nativeProcessing: true }, { activeSubagents: 1 }, { activeMcpOperations: 1 }, { activeOperations: 1 },
+    { loading: true }, { closing: true }, { cancelling: true }, { compacting: true },
+    { ask: { requestId: 'ask' } }, { planRequest: { requestId: 'plan' } }, { elicitation: { requestId: 'choice' } }]) {
+    assert.equal(quiescent({ ...meta, ...state }), false);
+  }
+  f.state.error = 'Explicit legacy error';
+  assert.equal(quiescent(await f.cockpit.meta()), false);
+  f.state.error = false;
+  await assert.rejects(f.cockpit.meta(), { code: 'COCKPIT_SESSION_SCHEMA' });
+});
+
+test('native chat pages need no title/cwd; existing metadata remains the binding authority', async t => {
+  const f = await fixture(t, { messages: [{ id: 'answer', role: 'assistant', content: 'Native body' }] });
+  const page = await f.cockpit.nativePage({ source: 'live', direction: 'backward', max: 64 });
+  assert.equal(page.title, undefined);
+  assert.equal(page.cwd, undefined);
+  assert.equal((await f.cockpit.page()).messages[0].content, 'Native body');
+  f.state.changedCwd = '/another-target';
+  await assert.rejects(f.cockpit.page(), { code: 'TARGET_CWD_CHANGED' });
 });
 
 test('HTTP/schema errors do not leak remote error bodies or count as successful sends', async t => {
@@ -198,11 +253,11 @@ test('no marker even with assistant/idle never returns an unrelated reply', asyn
   await assert.rejects(f.bridge.step(), { code: 'RESULT_NEEDS_CONFIRMATION' });
 });
 
-test('history pagination recovers bounded baseline and rejects disappeared cursor', async t => {
+test('one bounded legacy migration page locates its anchor and rejects an absent one', async t => {
   const f = await fixture(t);
   f.state.messages = Array.from({ length: 230 }, (_, i) => ({ id: `m${i}`, role: 'assistant', content: `${i}`, timestamp: i }));
   assert.equal((await f.cockpit.since('m1')).length, 228);
-  await assert.rejects(f.cockpit.since('removed'), { code: 'BASELINE_DISAPPEARED' });
+  await assert.rejects(f.cockpit.since('removed'), { code: 'CHECKPOINT_MIGRATION_REQUIRED' });
 });
 
 test('binding and private permissions are mandatory; unsafe API hosts and redirects refused', async t => {
@@ -405,13 +460,13 @@ test('read-failed outbox can explicitly observe while preserving accepted pieces
   assert.equal(new Set(f.sent.map(row => row.msg.client_id)).size, clientIds.length);
 });
 
-test('changed checkpoint content is not treated as safe unchanged history', async t => {
+test('an expired native checkpoint blocks submission rather than silently adopting replacement history', async t => {
   const f = await fixture(t);
   f.state.messages = [{ id: 'before', role: 'assistant', content: 'initial', timestamp: 1 }];
   await f.bridge.establishCheckpoint();
-  f.state.messages[0].content = 'modified by another writer';
+  f.state.messages[0] = { id: 'replacement', role: 'assistant', content: 'replacement history', timestamp: 2 };
   await f.bridge.receive();
-  await assert.rejects(f.bridge.step(), { code: 'CHECKPOINT_CHANGED' });
+  await assert.rejects(f.bridge.step(), { code: 'NATIVE_CURSOR_EXPIRED' });
   assert.equal(f.prompts.length, 0);
 });
 

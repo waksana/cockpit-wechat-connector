@@ -64,8 +64,8 @@ WEIXIN_TEST_BACKEND_URL="$FIXTURE_ORIGIN" node --test test/backend-media-integra
 | --- | --- |
 | `deliveryMode` | `session`：原生排队 + 共享会话回复镜像；`correlated`：旧版独占单请求模式。旧配置缺省值仍为 `correlated`，新模板使用 `session` |
 | `nativeInterruptFollowup` | 默认 `false`，仅 `session` 可显式开启。新的绑定微信文本先中断旧主 turn，确认空闲后按序合并交接期间收到的新文本；不清原生队列、不预测用户何时说完 |
-| `statusDisplay.typing` / `statusDisplay.tools` | `session` 模式默认开启 typing；工具展示默认关闭，原生 UX 未确认，不自动降级刷聊天消息 |
-| `statusDisplay.toolFormat` | `native` 为实验性结构化事件路径；`text` 只用于显式接受普通聊天气泡的兼容展示，不是原生工具 UX |
+| `statusDisplay.typing` | `session` 模式默认开启 typing；继续使用原生执行状态 |
+| `statusDisplay.tools` / `statusDisplay.toolFormat` | 工具进度已正式退役；旧 `tools:false` / `toolFormat:"native"` 兼容保留。`tools:true` 或 `toolFormat:"text"` 拒绝启动并说明迁移方式 |
 | `diagnostics.weixinHttp` | 默认关闭；明确授权后记录微信 API 请求/响应业务原文，滚动保留 24 小时，最多 100 MiB；见下方隐私边界 |
 | `cockpit.apiUrl` | Cockpit API origin；同机可显式用 `http://127.0.0.1:8771`，非 loopback 必须 HTTPS |
 | `cockpit.webUrl` | 用户可打开的 Web origin，用于 `/session/<encoded-id>` 选择/错误链接；不要填 API 内网地址 |
@@ -89,6 +89,13 @@ account/peer/session/cwd/API origin；另一个绑定用独立配置目录和重
 `session` 模式允许同一用户在 Web 输入和 owner 回报进入同一个会话，不因外部正常输入而停机。
 同一会话此后产生的可见 assistant 正文也会镜像给唯一绑定用户，而不限于逐条微信请求的答复。
 此工具不会创建 session、切换 cwd、加载原生 SDK、注册 MCP/skill、自动重放队列或保持 session 常驻。
+`session/get` 在 unloaded 时可以省略 `queue`；省略表示未知，不补成空队列。新后端即使 loaded
+也不提供 last-error getter，因此 `error` 可以省略，不伪造 `error:null`。当前空闲只依据已加载的
+原生 status/processing/activity/queue/选择状态；兼容响应若显式提供错误仍阻止空闲判断。
+持久化 `session.error` 从原生事件读取，生成去重的脱敏 Web 提示，不依赖 metadata 的旧 error 字段。
+已有检查点的共享 `session` 模式仍可把新输入交给原生 enqueue/resume，完整持久正文也可继续交付。
+独占 `correlated` 模式的发送/最终回复判断以及新检查点绑定仍需要已知空闲状态。
+`lastActivitySource` 是可选元数据；聊天页无需重复 title/cwd，绑定只信任 `session/get`。
 
 ## 首次登录与绑定
 
@@ -169,7 +176,7 @@ journalctl --user -u weixin-cockpit-bridge -n 30 --no-pager
 重新启用后不能恢复先前未记录的数据；这些诊断不充当消息映射或投递状态数据库。
 
 支持 drain 的 runner 收到 `stop`、SIGINT 或 SIGTERM 后停止接收/开始新工作，等待已开始的 prompt、
-原生发送、CDN 上传或工具状态发送按原请求超时自然返回并落盘；停止信号不 abort 这些请求。
+原生正文/媒体发送、CDN 上传按原请求超时自然返回并落盘；停止信号不 abort 这些请求。
 只读 poll/SSE/等待会立即取消。当前上传完成后可留作待发送，不启动下一个媒体发送/分片/输入。
 重复 SIGINT/SIGTERM 不升级为强停。typing 清理保持原有最多 5 秒尝试。
 这只停止连接器，不取消已提交的 Copilot 工作、不清除它的队列。再次 `start` 读取本地状态恢复；
@@ -232,7 +239,7 @@ token 等退出码 2 **不自动重启**，需按下文核对或重新登录。�
 
 此机制不等待模型全部完成或清空所有待办；它排空**已开始的连接器操作**并保留未开始的持久工作。
 只读观察故障也走同一排空路径，不会为了退出而切断另一个循环里的 native send。
-隔离测试覆盖真实 CLI stop/SIGTERM、重复 SIGTERM、在途 IMAGE 发送、CDN 上传、prompt、工具事件，
+隔离测试覆盖真实 CLI stop/SIGTERM、重复 SIGTERM、在途 IMAGE 发送、CDN 上传、prompt、typing 清理，
 以及停机期间自然超时保留 unknown；测试不接触生产服务。
 
 ## 原生排队与会话回复镜像（当前 `session` 模式）
@@ -286,6 +293,10 @@ Web 恰好在空闲确认后先启动时，本次微信仍安全 enqueue，可�
 被打断的 ask/plan/elicitation 不会被连接器当作批准或代选答案；原生清理旧 turn 的等待
 请求，模型可以针对新输入重新询问。plan 模式仍保持 plan。没有新微信时原有 Web 选择通知
 及行为不变。`interrupted:false` 只表示当时没有可中断主 turn，不代表全 session 空闲。
+新输入到达 unloaded 目标时直接使用原生 enqueue/resume，不根据未知队列发起或完成中断。
+若中断已经开始，随后只读到 unloaded 元数据，则继续有界等待已加载的权威状态；
+不能把 unloaded 的未知队列当作 drain 完成，也不会发送新的 interrupt 或提前提交交接输入；
+已加载且当前控制状态确认空闲时，不要求存在旧版 error 字段。
 
 出站仍只依据持久历史里的完整 `assistant.message`：中断的 start/delta 半截不发送。
 已经完整的正文（包括尚在 outbox 等待发送的 owner 回执/讨论答复）照常按顺序交付，
@@ -373,7 +384,7 @@ client ID 和实际发送分片内容一起保存到原 job，完成后不随 ou
 
 输出按同一会话的历史游标读取，以 assistant message ID 去重，独立于某一条微信输入。Web 操作
 和 owner 回报引出的 assistant 回复也会给同一用户；不转发外部 user 原文、thought、工具日志、
-subagent 卡片。使用的 `session/history` 来自原生持久化事件日志，流中的 start/delta 不在其中；
+subagent 卡片。使用 `session/chat` 分页读取原生事件，排除 ephemeral 和子会话来源；
 非空 assistant 正文来自完整 `assistant.message`，不必等 turn/session idle、后续队列清空或
 整段历史两次相同。完整消息即使带工具调用，也只发送其中可见正文，不发送工具字段。
 结构化 `parts` 按原顺序处理；没有 parts 时按正文、attachments、旧 attachment 处理，
@@ -388,20 +399,41 @@ outbox 按序发送，后面的 assistant 消息不越过前面的回复；每�
 补出的 parts/attachments 不改变它们，不补发媒体也不重建原 outbox。新输出使用 version=3，
 冻结有序 parts/attachments，防止已排队的媒体被静默替换。
 
-`session` 模式通过现有认证的 Cockpit `/events` SSE 唤醒，约 500 ms 合并密集通知，再用上述
-HTTP 历史确认完整消息；绝不直接转发 SSE 中的增量正文。通知停止后约 1 秒再唤醒一次，覆盖
-实时事件先于持久化记录的情况。连接/重连主动补读，断线有界退避重连，70 秒没有任何 SSE 数据
-或心跳就重连；其它会话的消息更新不触发本绑定交付。
-无通知时每 30 秒补查兜底，不再固定每 2 秒查询回复。微信新入站会直接唤醒处理，已有本地排队
+`session` 模式通过现有认证的 Cockpit `/events` SSE 元数据/控制事件唤醒，约 500 ms 合并密集通知，
+包括只含 sessionId 的 `session/invalidated`；收到后重新读取 metadata，不把它当成聊天内容。
+再用上述 HTTP 原生读取确认完整消息；不依赖已退役的 `msg/upsert` 或聊天历史 SSE。
+通知停止后约 1 秒再唤醒一次，覆盖元数据事件先于持久化记录的情况。连接/重连主动补读，
+断线有界退避重连，70 秒没有任何 SSE 数据或心跳就重连；其它会话的更新不触发本绑定交付。
+原生 `assistant.message` 不保证触发即时 SSE：已读取的元数据显示会话运行中、有后台活动或队列时，
+按 `limits.statusIntervalMs` 补读（至少间隔 1 秒，默认 2 秒），确保随后推理/排队期间新产生的完整
+正文也能交付，不等 turn 结束。空闲时每 30 秒兜底。微信新入站会直接唤醒处理，已有本地排队
 输入和出站分片以约 100 ms 的步进间隔继续排空，不依赖后续 SSE。读取错误仍使用原有退避，
 未知写入仍停止核对；SSE 故障只记录脱敏状态并退回 HTTP，不修改游标或重发。
 微信侧 `getupdates` 长轮询及 typing 续期保持不变，旧 `correlated` 模式也保留原查询节奏。
 
-旧游标先按旧指纹验证，再原位升级为正文/附件指纹；不重置历史起点，不重建已有 outbox。
+原生游标是不透明位置，出站每次读取最多 64 个事件；需要停在首条可交付正文时只追加一次前缀读取，
+不能根据消息 ID 拼造游标。只有当前页全部消费（包括空页）才保存下一位置。
+后端冷启动为 unloaded，而旧 v3 检查点尚无 native position 时，继续使用单个最多 256 事件的
+被动后向窗口验证锚点；没有新正文就原样保留检查点，有新正文则按序交付并更新消息级锚点。
+被动后向游标不当作前向 tail，也不从头扫描补造位置。正常新输入触发原生 enqueue/resume 或用户
+明确恢复会话后，才在完整消费可见输出后采用后端提供的 live forward tail；读取本身不恢复会话。
+锚点不在有界窗口内或正文变化仍明确停止核对，不用冷启动为理由跳过未交付输出。
+旧游标在一个有界迁移窗口按旧指纹验证后继续原位迁移；不重置历史起点，不重建已有 outbox。
 旧版回复记录必须原文一致才迁移，保留既有分片状态及 client ID；不能静默补发旧版未交付的
 结构化附件。超出既有有界历史读取窗口、来源消失或内容被改写时仍明确停止核对。
+原生 epoch/来源变化导致游标过期时明确报告 `NATIVE_CURSOR_EXPIRED`，不静默跳到最新位置。
+最旧的无版本检查点只保存 folded 消息的哈希，工具 title/args/status 也在哈希内，并没有另存正文；
+不能把原生事件重建出来的不同工具字段直接当作正文被改写，也不能忽略旧哈希自动放行。
+若同一消息有已结束的旧出站记录，且其原始完整哈希与检查点完全相同，可用该记录冻结的正文验证
+原生消息的 ID/角色/正文（不补出旧记录未冻结的附件），再在原有有界窗口内迁移；已受理 outbox
+分片和 client ID 原样保留。正文确实变化仍报 `CHECKPOINT_CHANGED`。
+如果没有这一独立证据（例如首次绑定恰好停在带工具的 assistant 消息），报
+`LEGACY_CHECKPOINT_REVIEW_REQUIRED` 并保留原检查点/outbox，不扫描全历史猜测原 folded 数据。
+这需要用户另行明确审阅决定；不能在部署时自动运行 `trust-history`。人工选择现有
+`trust-history --confirm` 意味着接受截至当前尾部的历史，并非仅批准工具格式转换；它会跳过这段
+未交付历史，必须先审阅，且仍要求无 unresolved job 和目标空闲。
 
-**限制**：当前 Cockpit ChatMessage 没有“该 prompt 的最终回复”原子接口，prompt 也没有幂等键或
+**限制**：当前 Cockpit 原生聊天读取没有“该 prompt 的最终回复”原子接口，prompt 也没有幂等键或
 返回 userMessageId/runId。因此共享模式不伪造“每个 prompt 恰好对应某个 final”的关联；它交付
 同一个用户本来就有权在 Web 看到的会话正文。输出是消息级完成后发送，不是 Web 的逐字流式显示，
 仍受通知合并、历史持久化、分片及网络延迟影响。rewind/删除或改写未交付的来源历史仍需核对，不能静默换游标。
@@ -428,7 +460,7 @@ HTTP 历史确认完整消息；绝不直接转发 SSE 中的增量正文。通�
 | 入站语音与已有转写 | VOICE，可使用 voice_item.text；否则下载 SILK 并尝试转 WAV | 未接入；没有证据表明存在独立微信转写 API |
 | 出站语音气泡 | 有 VOICE 类型，但公开发送路由只覆盖图片、视频、附件 | 未接入；发送音频附件不等于语音气泡 |
 | 正在输入/响应中 | getconfig 的 typing_ticket + sendtyping，status 1 开始、2 取消 | 已实现；使用 Cockpit 原生执行状态，不以“队列里有消息”推断正在执行 |
-| 工具进度 | 有 TOOL_CALL_START/RESULT 结构化事件 | 当前关闭：原生事件未显示且响应非 JSON；文本兼容已收到，但不是用户要求的原生 UX |
+| 工具进度 | 有 TOOL_CALL_START/RESULT 结构化事件 | 已正式退役：不再发送原生工具消息或文本兼容气泡；保留 typing |
 | 引用、部分引用 | ref_msg.svr_id / message_item.msg_id、partial_text | 已接入精确本地 ID/真实原文降级；缺失明确提示，部分选区仅提供未验证元数据，不下载媒体 |
 | 分块回复 | 官方 blockStreaming，把内容分块发送 | 当前发送完成态文本/图文分片；非逐 token 修改同一气泡 |
 | 客户端启动/停止通知 | msg/notifystart、msg/notifystop | 未接入；不是取消 Copilot 当前任务 |
@@ -441,32 +473,18 @@ Typing 官方每 5 秒续发，这是客户端策略，不是公开的显示 TTL
 刷新策略也不是服务端有效期。缺少 ticket 时官方允许跳过 typing，不应阻断正常回复。
 sendmessage 的服务器 message_id 是发送受理标识，不是对方已读回执。
 
-状态适配直接读取现有 `session/get` 的 `nativeProcessing` / 后台活动字段，以及
-`session/history` 的 `toolCalls`（ID、name、status）。原生 subagent 摘要卡作为 `task` 展示
-开始/完成/失败，不读取子会话内部工具或思考。不修改 Cockpit、不读取原生数据库，
-也不自行决定工具是否完成。状态观察在既有 runner 内独立运行，不挡住原生 enqueue 和最终回复。
+Typing 适配只读取现有 `session/get` 的 `nativeProcessing` / 后台活动字段，
+不读取聊天或工具生命周期。不修改 Cockpit、不读取原生数据库。
+状态观察在既有 runner 内独立运行，不挡住原生 enqueue 和正文回复。
 typing 约每 5 秒刷新；空闲、等待选择或停止连接器时取消，不会因此唤醒或中断 Copilot。
 
-工具只传原生工具名和状态，不传可能含用户文本的 title、args、output。实验性原生模式使用
-原生工具 ID，并以原生 user 消息边界持久分配微信展示用 UUID；同一组工具、最终正文、图片
-共用这个 run_id，不宣称它是 Copilot 的原生执行 run ID。
-可选文本模式合并同次观察的少量状态并遵守文本长度限制，不发送微信结构化控制项，也不把聊天气泡
-冒充原生工具面板。当前用户不接受该降级，实际配置已关闭工具展示，保留 typing。首次开启不补发已经
-完成的历史工具；轮询间已经完成的新工具只发送完成状态，不伪造“现在刚开始执行”。
-进度发送前持久化，崩溃/响应未知不重发；该上下文的后续工具展示会暂停，正常收发不受影响。
-新微信上下文可恢复后续新状态，旧 unknown 不重放。CLI `status` 可查看脱敏展示状态。
-切换为文本兼容模式时，只依据当前权威状态生成一次新的状态快照；先前原生事件仍保留 unknown，
-不改成成功，也不重发原生事件。
-
-原生工具 UX 尚未完成：已补齐官方“同一 UUID run_id 贯穿工具事件与正文/媒体”的分组，并用
-新的只读工具调用完成开始/结束/正文链路。实际工具控制事件返回 HTTP 200、application/octet-stream、
-零字节正文，单独记为 submitted（仅传输受理、未确认显示），不重发；任意其它非 JSON 仍按未知处理。
-这个特殊空响应只适用于显式工具控制项 11/12，绝不放宽普通文本或媒体的成功判定。
-
-用户在微信 8.0.76 打开聊天窗口观察持续约 60 秒的真实工具执行：typing 可见，原生工具提示不可见，
-随后能收到正常日期答复。公开协议和 getconfig 均未提供足以解释此差异的工具 UI 启用条件，
-不能把发送实现算作手机端可用，也不能断言所有微信客户端都不支持。当前线上只启用已确认
-可见的 typing；工具推送和不被用户接受的文字气泡兼容均关闭，等待微信侧契约澄清。
+按用户确认，微信工具进度（原生控制消息和文本兼容气泡）已正式退役，不再保留可启用的发送路径。
+旧 `tools:false` / `toolFormat:"native"` 配置无需修改；启用工具或选择文本兼容会报
+`TOOL_PROGRESS_RETIRED`。迁移方式是移除这两个旧选项，或保留上述禁用值；`typing` 不受影响。
+不自动改写任何现有配置、SQLite/WAL、历史进度状态或诊断文件；旧 pending/sending/unknown
+进度只作原样保留，不观察、重放或改判成功。CLI 展示状态现在只报告 typing。
+已持久保存、仍供正文/媒体使用的 `run_id` 关联和 outbox 字段继续传递，不再新建工具展示分组。
+正文/媒体发送仍要求明确 JSON 成功回执；空 `application/octet-stream` 响应不算成功。
 
 图片的 4 MiB/8192 边长限制属于本连接器，不是腾讯上传上限。腾讯 CDN 保留时间、context_token
 寿命、回复窗口、日配额/QPS、账号/地区条件均无足够公开契约，不能套用公众号/企微规则。
@@ -685,7 +703,7 @@ npm run check
 ```
 
 原生 `node:test` 建立本地 HTTP WeixinMock + CockpitMock，所有 token/账号/session 都是假数据。
-mock 只实现已存在的 `/capabilities`、`/intent/prompt`、`session/get`、`session/history` 和公开 iLink
+mock 只实现已存在的 `/capabilities`、`/intent/prompt`、`session/get`、`session/chat` 和公开 iLink
 路径，不用虚构的 requestId API 掩盖关联缺口。CLI SIGTERM 子进程用测试专用 preload 限制到 loopback；
 生产 CLI 没有关闭微信 HTTPS/host 校验的开关。
 

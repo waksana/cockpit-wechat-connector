@@ -38,11 +38,14 @@ export class Bridge {
   async establishCheckpoint(signal, explicit = false) {
     if (this.store.get('historyCheckpoint') && !explicit) return;
     requireThat(quiescent(await this.cockpit.meta(signal)), 'TARGET_NOT_QUIESCENT');
-    const first = historyCheckpoint((await this.cockpit.page(undefined, signal)).messages.at(-1));
+    const firstPage = await this.cockpit.page(undefined, signal);
+    const first = historyCheckpoint(firstPage.messages.at(-1));
     requireThat(quiescent(await this.cockpit.meta(signal)), 'TARGET_NOT_QUIESCENT');
-    const second = historyCheckpoint((await this.cockpit.page(undefined, signal)).messages.at(-1));
+    const secondPage = await this.cockpit.page(undefined, signal);
+    const second = historyCheckpoint(secondPage.messages.at(-1));
     requireThat(JSON.stringify(first) === JSON.stringify(second), 'HISTORY_CHANGED_DURING_BIND');
-    this.store.set('historyCheckpoint', second);
+    requireThat(secondPage.position, 'CHECKPOINT_REQUIRES_LOADED_SESSION');
+    this.store.set('historyCheckpoint', { ...second, position: secondPage.position });
   }
   async evidence(job, signal) {
     const messages = await this.cockpit.since(job.baseline, signal);
@@ -145,7 +148,7 @@ export class Bridge {
       await this.establishCheckpoint(signal);
       const checkpoint = this.store.get('historyCheckpoint');
       try {
-        requireThat((await this.cockpit.since(checkpoint.id, signal, checkpoint.fingerprint)).length === 0,
+        requireThat((await this.cockpit.since(checkpoint, signal, checkpoint.fingerprint)).length === 0,
           'EXTERNAL_ACTIVITY_BETWEEN_JOBS');
       } catch (error) {
         if (retryableRead(errorCode(error))) throw error;
@@ -153,7 +156,7 @@ export class Bridge {
       }
       const second = await this.cockpit.meta(signal);
       if (!quiescent(second)) return;
-      job.baseline = checkpoint.id;
+      job.baseline = checkpoint;
       if (!await this.prepareInput(job, signal)) return;
       if (this.draining) return;
       job.status = 'prompting'; job.startedAt = Date.now();

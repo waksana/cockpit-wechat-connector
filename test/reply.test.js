@@ -8,6 +8,7 @@ import { historyCheckpoint } from '../src/cockpit.js';
 import { Store } from '../src/storage.js';
 import { preparePublishedImage, publishedImagePath } from '../src/image.js';
 import { setTimeout as delay } from 'node:timers/promises';
+import { createHash } from 'node:crypto';
 
 const web = 'https://cockpit.example.test';
 const config = { cockpit: { webUrl: web }, limits: { textBytes: 1800, maxReplyParts: 32 } };
@@ -116,23 +117,38 @@ test('session mirror preserves native image ordering and its image rechecks unde
   assert.equal(f.calls.filter(call => call === '/ilink/bot/getuploadurl').length, 1);
 });
 
-test('native progress grouping propagates the same UUID through text-image-text outbox', async t => {
+test('legacy body grouping survives tool retirement through text-image-text outbox', async t => {
   const f = await fixture(t, { bridgeClass: SessionBridge });
-  f.config.statusDisplay = { typing: false, tools: true, toolFormat: 'native' };
+  f.config.statusDisplay = { typing: false, tools: false, toolFormat: 'native' };
   f.config.limits.textBytes = 1800; f.store.set('historyCheckpoint', historyCheckpoint());
-  await f.bridge.receive(); await f.bridge.step(); f.finish(reply);
+  await f.bridge.receive(); await f.bridge.step();
+  const key = `reply-run:${createHash('sha256').update(`${f.config.cockpit.sessionId}:user:u1`).digest('hex')}`;
+  const legacyRun = '12345678-1234-4234-9234-123456789abc';
+  f.store.set(key, legacyRun);
+  f.finish(reply);
   const runs = [];
   f.weixin.send = async (_peer, _context, _text, _id, _signal, options) => runs.push(options.runId);
   f.weixin.sendItems = async (_peer, _context, _items, _id, _signal, options) => runs.push(options.runId);
   await f.bridge.step();
   const job = f.store.jobs().find(item => item.kind === 'session-output');
-  assert.match(job.runId, /^[0-9a-f-]{36}$/);
+  assert.equal(job.runId, legacyRun);
   job.outbox[1].imageItem = { type: 2, image_item: { media: {} } };
   f.store.save(job);
   await f.drain();
   assert.deepEqual(runs, [job.runId, job.runId, job.runId]);
+  assert.equal(f.store.get(key), legacyRun);
 });
 
+test('new body deliveries do not create retired progress grouping state', async t => {
+  const f = await fixture(t, { bridgeClass: SessionBridge });
+  f.store.set('historyCheckpoint', historyCheckpoint());
+  await f.bridge.receive(); await f.bridge.step(); f.finish('Body without tool progress');
+  await f.drain();
+  assert.equal(f.sent.length, 1);
+  assert.equal(f.sent[0].msg.run_id, undefined);
+  assert.equal(f.store.jobs().find(job => job.kind === 'session-output').runId, undefined);
+  assert.equal(f.store.db.prepare("SELECT COUNT(*) AS n FROM kv WHERE key LIKE 'reply-run:%'").get().n, 0);
+});
 test('uploaded image and accepted text survive database reopen without reupload or replay', async t => {
   const f = await automaticFixture(t);
   await f.bridge.step(); // text accepted

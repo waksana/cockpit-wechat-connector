@@ -157,6 +157,8 @@ export async function main(argv = process.argv.slice(2)) {
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
   main().catch(error => {
     console.error(`Bridge stopped: ${errorCode(error)}. Inspect status/README; no automatic mutation retry.`);
+    if (error instanceof BridgeError && ['TOOL_PROGRESS_RETIRED', 'LEGACY_CHECKPOINT_REVIEW_REQUIRED']
+      .includes(error.code)) console.error(error.message);
     process.exitCode = retryableRead(errorCode(error)) ? 75 : error instanceof BridgeError ? 2 : 1;
   });
 }

@@ -6,6 +6,7 @@ import { createCipheriv, createDecipheriv, createHash, randomUUID } from 'node:c
 import { Readable } from 'node:stream';
 import { CockpitClient } from '../src/cockpit.js';
 import { preparePublishedMedia, saveInboundMedia, uploadPreparedMedia } from '../src/media.js';
+import { nativeMessages } from '../src/native-messages.js';
 
 const backend = process.env.WEIXIN_TEST_BACKEND_URL;
 
@@ -34,7 +35,7 @@ test('isolated real Cockpit media schema/downloads produce verified fake-CDN IMA
       fetchImpl: (input, init) => {
         const url = new URL(input);
         assert.equal(url.origin, origin.origin, 'Only the explicitly supplied loopback fixture can receive HTTP');
-        assert.ok(['/intent/files/list', '/intent/files/get', '/upload', '/intent/prompt', '/intent/session/history'].includes(url.pathname)
+        assert.ok(['/intent/files/list', '/intent/files/get', '/upload', '/intent/prompt', '/intent/session/chat'].includes(url.pathname)
           || (url.pathname.startsWith('/uploads/') && init.method === 'GET'));
         requests.push(url.pathname);
         return fetch(url, init);
@@ -134,8 +135,8 @@ test('isolated real Cockpit media schema/downloads produce verified fake-CDN IMA
     const parts = [{ type: 'text', text: 'Real backend ordered fixture start\n' },
       ...received.flatMap(attachment => [{ type: 'file', attachment }, { type: 'text', text: '\nnext fixture\n' }])];
     await cockpit.prompt('', undefined, undefined, parts);
-    const history = await cockpit.call('session/history', { sessionId: config.cockpit.sessionId, limit: 10 });
-    const message = history.messages.findLast(value => value.role === 'user');
+    const history = await cockpit.nativePage({ source: 'persisted', direction: 'backward', max: 64 });
+    const message = nativeMessages(history.events).findLast(value => value.role === 'user');
     assert.deepEqual(message.parts.map(part => part.type === 'text' ? part.text : part.attachment.url),
       parts.map(part => part.type === 'text' ? part.text : part.attachment.url));
     assert.deepEqual(fs.readdirSync(path.join(dir, 'media-work')), []);

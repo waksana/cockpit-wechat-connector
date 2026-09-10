@@ -167,39 +167,6 @@ test('drain settles an already-started CDN upload but leaves its native send pen
   assert.deepEqual(fs.readdirSync(path.join(f.config.stateDir, 'media-work')), []);
 });
 
-test('drain settles in-flight native tool progress and starts no subsequent progress item', async t => {
-  const f = await fixture(t, { bridgeClass: SessionBridge, status: 'running' });
-  f.config.statusDisplay = { typing: false, tools: true, toolFormat: 'native' };
-  f.store.set('historyCheckpoint', deliveryCheckpoint());
-  await f.bridge.receive();
-  const job = f.store.jobs()[0]; job.status = 'done'; f.store.save(job);
-  f.state.messages = [{ id: 'tools', role: 'assistant', content: '', toolCalls: [
-    { toolCallId: 'first', name: 'bash', status: 'in_progress' },
-    { toolCallId: 'second', name: 'view', status: 'in_progress' },
-  ] }];
-  let progressSignal;
-  let release;
-  let calls = 0;
-  const gate = new Promise(resolve => { release = resolve; });
-  f.weixin.sendItems = async (_peer, _context, items, _id, signal) => {
-    calls++;
-    assert.equal(items[0].type, 11);
-    progressSignal = signal;
-    await gate;
-    return { acceptance: 'confirmed' };
-  };
-  const stop = new AbortController();
-  const running = f.bridge.run(stop.signal);
-  t.after(() => { stop.abort(); release(); });
-  await waitFor(() => progressSignal, 'fixture progress started');
-  stop.abort();
-  assert.equal(progressSignal.aborted, false);
-  release(); await running;
-  assert.equal(calls, 1);
-  const phases = Object.values(f.store.get('statusDisplay').tools).map(tool => tool.start.status);
-  assert.deepEqual(phases, ['accepted', 'pending']);
-});
-
 test('stop command refuses legacy runners instead of aborting their in-flight mutations', async t => {
   const f = await fixture(t);
   const lock = new RunLock(f.config.stateDir);

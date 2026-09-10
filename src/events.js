@@ -59,9 +59,8 @@ export class EventDecoder {
 
 export function eventAffectsSession(event, sessionId) {
   if (event.type === 'snapshot' || event.type === 'agent/status') return true;
-  if (event.type === 'session/reset') return event.page?.sessionId === sessionId;
   if (event.type === 'session/added') return event.session?.sessionId === sessionId;
-  return ['msg/upsert', 'session/patch', 'session/removed', 'session/notify'].includes(event.type)
+  return ['chat/invalidated', 'session/invalidated', 'session/patch', 'session/removed', 'session/notify'].includes(event.type)
     && event.sessionId === sessionId;
 }
 

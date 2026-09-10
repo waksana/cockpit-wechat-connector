@@ -17,9 +17,9 @@ async function until(predicate, timeout = 3000) {
 test('SSE parser handles arbitrary chunk/CRLF boundaries, comments and multiline data', () => {
   const events = [];
   const parser = new EventDecoder(event => events.push(event));
-  const raw = ': ping\r\nretry: 2000\r\ndata: {"type":"msg/upsert",\r\ndata: "sessionId":"s","message":{"content":"你好"}}\r\n\r\n';
+  const raw = ': ping\r\nretry: 2000\r\ndata: {"type":"session/patch",\r\ndata: "sessionId":"s","patch":{"title":"你好"}}\r\n\r\n';
   for (const char of raw) parser.feed(char);
-  assert.deepEqual(events, [{ type: 'msg/upsert', sessionId: 's', message: { content: '你好' } }]);
+  assert.deepEqual(events, [{ type: 'session/patch', sessionId: 's', patch: { title: '你好' } }]);
   parser.feed('data: {"type":"snapshot"}\n');
   assert.equal(events.length, 1);
   parser.feed('\n');
@@ -30,11 +30,17 @@ test('SSE parser handles arbitrary chunk/CRLF boundaries, comments and multiline
 });
 
 test('only bound session events or reconnect snapshots wake delivery', () => {
-  assert.equal(eventAffectsSession({ type: 'msg/upsert', sessionId: 'other' }, 'bound'), false);
-  assert.equal(eventAffectsSession({ type: 'msg/upsert', sessionId: 'bound' }, 'bound'), true);
-  assert.equal(eventAffectsSession({ type: 'session/reset', page: { sessionId: 'bound' } }, 'bound'), true);
-  assert.equal(eventAffectsSession({ type: 'session/reset', page: { sessionId: 'other' } }, 'bound'), false);
+  for (const type of ['session/invalidated', 'session/patch', 'session/notify', 'session/removed', 'chat/invalidated']) {
+    assert.equal(eventAffectsSession({ type, sessionId: 'other' }, 'bound'), false);
+    assert.equal(eventAffectsSession({ type, sessionId: 'bound' }, 'bound'), true);
+  }
+  assert.equal(eventAffectsSession({ type: 'session/added', session: { sessionId: 'bound' } }, 'bound'), true);
+  assert.equal(eventAffectsSession({ type: 'session/added', session: { sessionId: 'other' } }, 'bound'), false);
+  for (const type of ['msg/upsert', 'session/reset', 'session/history', 'assistant.message']) {
+    assert.equal(eventAffectsSession({ type, sessionId: 'bound' }, 'bound'), false);
+  }
   assert.equal(eventAffectsSession({ type: 'snapshot' }, 'bound'), true);
+  assert.equal(eventAffectsSession({ type: 'agent/status' }, 'bound'), true);
 });
 
 test('work latch preserves notifications before wait, coalesces bursts and aborts cleanly', async () => {
@@ -61,9 +67,10 @@ test('event stream uses authenticated same-origin GET, refuses redirects and fil
   const reading = readEventStream(f.cockpit, event => events.push(event), controller.signal);
   t.after(async () => { controller.abort(); await reading.catch(() => {}); });
   await until(() => f.streams.size === 1);
-  f.emit({ type: 'msg/upsert', sessionId: 'other', message: { content: 'FOREIGN' } });
-  f.emit({ type: 'session/patch', sessionId: 'test-session', status: 'running' });
-  await until(() => events.some(event => event.type === 'session/patch'));
+  f.emit({ type: 'session/invalidated', sessionId: 'other' });
+  f.emit({ type: 'session/invalidated', sessionId: 'test-session' });
+  await until(() => events.some(event => event.type === 'session/invalidated'));
+  assert.ok(events.every(event => event.sessionId !== 'other'));
   assert.ok(!JSON.stringify(events).includes('FOREIGN'));
   const request = f.requests.find(request => request.url === '/events');
   assert.equal(request.method, 'GET');
@@ -87,18 +94,18 @@ test('real runner wakes on SSE but sends only durable A while B remains queued; 
   const running = f.bridge.run(controller.signal);
   t.after(async () => { controller.abort(); await running; });
   await until(() => f.prompts.length === 1 && f.streams.size === 1);
-  f.emit({ type: 'msg/upsert', sessionId: 'test-session', message: { id: 'A', content: 'INCOMPLETE_DRAFT' } });
+  f.emit({ type: 'session/invalidated', sessionId: 'test-session' });
   await delay(1200);
   assert.equal(f.sent.length, 0);
   f.state.messages.push({ id: 'A', role: 'assistant', content: 'Durable A', timestamp: 1 });
-  const requestsBefore = f.requests.filter(request => request.url === '/intent/session/history').length;
-  for (let i = 0; i < 40; i++) f.emit({ type: 'msg/upsert', sessionId: 'test-session',
-    message: { id: 'A', content: 'Do not send SSE payload' } });
+  const requestsBefore = f.requests.filter(request => request.url === '/intent/session/chat').length;
+  for (let i = 0; i < 40; i++) f.emit({ type: 'session/invalidated', sessionId: 'test-session' });
   await until(() => f.sent.length === 1, 2000);
   assert.equal(f.sent[0].msg.item_list[0].text_item.text, 'Durable A');
   assert.equal(f.state.queue.length, 1);
   assert.equal(f.state.status, 'running');
-  assert.ok(f.requests.filter(request => request.url === '/intent/session/history').length - requestsBefore < 10);
+  const nativeReads = f.requests.filter(request => request.url === '/intent/session/chat').length - requestsBefore;
+  assert.ok(nativeReads > 0 && nativeReads < 10);
   await until(() => f.store.jobs().some(job => job.outputMessageId === 'A' && job.status === 'done'));
   for (const stream of f.streams) stream.end();
   f.state.messages.push({ id: 'B', role: 'assistant', content: 'Durable B during disconnect', timestamp: 2 });
@@ -109,22 +116,54 @@ test('real runner wakes on SSE but sends only durable A while B remains queued; 
   await delay(700);
   assert.equal(f.sent.length, 2);
   assert.equal(f.sent.filter(row => row.msg.item_list[0].text_item.text === 'Durable A').length, 1);
+  controller.abort(); await running;
 });
 
-test('trailing HTTP confirmation catches persistence arriving after the only SSE message', async t => {
+test('trailing HTTP confirmation catches persistence arriving after the only metadata event', async t => {
   const f = await fixture(t, { bridgeClass: SessionBridge, eventsEnabled: true, status: 'running', nativeQueue: true });
   f.config.statusDisplay = { typing: false, tools: false };
+  f.config.limits.requestTimeoutMs = 2000;
+  f.config.limits.statusIntervalMs = 60000;
   f.store.set('historyCheckpoint', deliveryCheckpoint());
   const controller = new AbortController();
   const running = f.bridge.run(controller.signal);
   t.after(async () => { controller.abort(); await running; });
   await until(() => f.prompts.length === 1 && f.streams.size === 1);
   await delay(1800);
-  f.emit({ type: 'msg/upsert', sessionId: 'test-session', message: { id: 'A', content: 'A' } });
+  f.emit({ type: 'session/invalidated', sessionId: 'test-session' });
   await delay(750);
   assert.equal(f.sent.length, 0);
   f.state.messages.push({ id: 'A', role: 'assistant', content: 'Now persisted', timestamp: 1 });
   await until(() => f.sent.length === 1, 1500);
+  controller.abort(); await running;
+});
+
+test('durable native bodies arriving much later while busy are delivered without any SSE chat event', async t => {
+  const f = await fixture(t, { bridgeClass: SessionBridge, eventsEnabled: true, status: 'running',
+    nativeQueue: true, nativeEvents: [] });
+  f.config.statusDisplay = { typing: false, tools: false };
+  f.config.limits.requestTimeoutMs = 2000;
+  f.store.set('historyCheckpoint', deliveryCheckpoint());
+  const controller = new AbortController();
+  const running = f.bridge.run(controller.signal);
+  t.after(async () => { controller.abort(); await running; });
+  await until(() => f.prompts.length === 1 && f.streams.size === 1);
+  await delay(2200); // The initial snapshot's single trailing confirmation has finished.
+  assert.equal(f.sent.length, 0);
+  const before = f.requests.filter(row => row.url === '/intent/session/chat').length;
+  f.state.nativeEvents.push({ id: 'event-A', type: 'assistant.message', data: { messageId: 'A', content: 'Durable A' } });
+  await until(() => f.sent.length === 1, 2500);
+  await delay(2200);
+  f.state.nativeEvents.push({ id: 'event-B', type: 'assistant.message', data: { messageId: 'B', content: 'Later durable B' } });
+  await until(() => f.sent.length === 2, 2500);
+  assert.deepEqual(f.sent.map(row => row.msg.item_list[0].text_item.text), ['Durable A', 'Later durable B']);
+  assert.equal(f.state.status, 'running');
+  assert.equal(f.state.queue.length, 1);
+  const reads = f.requests.filter(row => row.url === '/intent/session/chat');
+  assert.ok(reads.length - before < 20, 'active reads remain bounded');
+  assert.ok(reads.filter(row => row.data.direction === 'forward').every(row => row.data.max <= 64));
+  assert.ok(f.requests.every(row => !row.url.includes('/session/history')));
+  controller.abort(); await running;
 });
 
 test('idle fallback waits thirty seconds; local outbox drain never waits for another event', async t => {
@@ -136,6 +175,25 @@ test('idle fallback waits thirty seconds; local outbox drain never waits for ano
   f.bridge.deliveryMore = true;
   await f.bridge.waitForWork(new AbortController().signal);
   assert.deepEqual(waits, [30000]);
+});
+
+test('active native metadata selects bounded polling, independent of typing and local jobs', async t => {
+  const f = await fixture(t, { bridgeClass: SessionBridge });
+  const waits = [];
+  f.bridge.work.wait = async ms => { waits.push(ms); };
+  const signal = new AbortController().signal;
+  for (const state of [{ status: 'running' }, { nativeProcessing: true }, { activeSubagents: 1 },
+    { activeMcpOperations: 1 }, { queue: [{ id: 'queued' }] }]) {
+    f.bridge.deliveryMeta = { loaded: true, ...state };
+    await f.bridge.waitForWork(signal);
+  }
+  assert.deepEqual(waits, [1000, 1000, 1000, 1000, 1000]);
+  f.config.limits.statusIntervalMs = 2500;
+  await f.bridge.waitForWork(signal);
+  assert.equal(waits.at(-1), 2500);
+  f.bridge.deliveryMeta = { loaded: true, status: 'idle', nativeProcessing: false, queue: [] };
+  await f.bridge.waitForWork(signal);
+  assert.equal(waits.at(-1), 30000);
 });
 
 test('stalled event stream times out and releases its connection', async t => {

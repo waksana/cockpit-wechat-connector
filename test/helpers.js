@@ -33,6 +33,9 @@ export async function fixture(t, options = {}) {
   const heldSends = [];
   const heldPrompts = [];
   const streams = new Set();
+  const nativeCursors = new Map();
+  let nativeCursorSequence = 0;
+  let nativeLog = [];
   const state = {
     messages: [], batch: [incoming()], cursor: 'cursor-1', sendFault: null, promptFault: null, pollFault: null,
     status: 'idle', loaded: true, ask: null, planRequest: null, elicitation: null, queue: [], ...options,
@@ -79,7 +82,7 @@ export async function fixture(t, options = {}) {
     if (req.url.startsWith('/capabilities?')) {
       const name = new URL(req.url, 'http://mock').searchParams.get('name');
       const fields = name === 'prompt' ? ['sessionId', 'text', 'mode'] :
-        ['session/get', 'session/interrupt'].includes(name) ? ['sessionId'] : ['sessionId', 'beforeMsgId', 'limit', 'details'];
+        ['session/get', 'session/interrupt'].includes(name) ? ['sessionId'] : ['sessionId', 'cursor', 'max', 'source', 'direction'];
       return reply({ name, inputSchema: { type: 'object', properties: Object.fromEntries(fields.map(field =>
         [field, field === 'mode' ? { type: 'string', enum: ['enqueue', 'immediate'] } : { type: 'string' }])) },
       resultSchema: { type: 'object' } });
@@ -88,8 +91,10 @@ export async function fixture(t, options = {}) {
       if (state.metaFault) return reply({ error: 'FAKE_SECRET_IN_ERROR' }, state.metaFault);
       return reply({ meta: state.missing ? null : {
         sessionId: 'test-session', title: 'Test', cwd: state.changedCwd ?? '/tmp/test-target',
-        lastActivity: 1, error: state.error ?? null, status: state.status, loaded: state.loaded,
-        queue: state.queue, ask: state.ask, planRequest: state.planRequest, elicitation: state.elicitation,
+        lastActivity: 1, lastActivitySource: state.lastActivitySource, status: state.status, loaded: state.loaded,
+        ...(state.loaded && !state.omitNativeState ? { queue: state.queue,
+          ...(state.error === undefined ? {} : { error: state.error }) } : {}),
+        ask: state.ask, planRequest: state.planRequest, elicitation: state.elicitation,
         nativeProcessing: state.nativeProcessing ?? state.status === 'running',
         activeSubagents: state.activeSubagents ?? 0, activeMcpOperations: state.activeMcpOperations ?? 0,
         activeOperations: state.activeOperations ?? 0,
@@ -97,11 +102,61 @@ export async function fixture(t, options = {}) {
         loading: state.loading ?? false, compacting: state.compacting ?? false,
       } });
     }
-    if (req.url === '/intent/session/history') {
-      let messages = state.messages;
-      if (data.beforeMsgId) messages = messages.slice(0, messages.findIndex(message => message.id === data.beforeMsgId));
-      const selected = messages.slice(-200);
-      return reply({ sessionId: 'test-session', messages: selected, hasMore: messages.length > 200 });
+    if (req.url === '/intent/session/chat') {
+      const marker = attachment => `<cockpit-attachment version="2" ${['kind', 'name', 'url', 'size', 'mime']
+        .filter(key => attachment[key] !== undefined).map(key => `${key}="${encodeURIComponent(attachment[key])}"`).join(' ')}/>`;
+      const generated = state.messages.flatMap(message => {
+        const content = message.parts ? message.parts.map(part => part.type === 'text' ? part.text : marker(part.attachment)).join('')
+          : (message.attachments ?? (message.attachment ? [message.attachment] : [])).map(marker).join('') + message.content;
+        const type = message.subtype === 'ask-reply' ? 'tool.execution_complete'
+          : message.subtype === 'subagent' ? 'subagent.started'
+          : message.role === 'system' ? 'session.error' : `${message.role}.message`;
+        const rows = [{
+          id: message.id, type, timestamp: message.timestamp ?? 1,
+          data: { messageId: message.id, content,
+            ...(message.toolCalls ? { toolRequests: message.toolCalls.map(tool => ({ toolCallId: tool.toolCallId, name: tool.name })) } : {}) },
+        }];
+        for (const tool of message.toolCalls ?? []) {
+          const running = ['in_progress', 'running'].includes(tool.status);
+          rows.push({ id: `${message.id}:${tool.toolCallId}:${running ? 'start' : 'complete'}`,
+            type: running ? 'tool.execution_start' : 'tool.execution_complete',
+            data: { toolCallId: tool.toolCallId, success: tool.status !== 'failed' } });
+        }
+        return rows.map(event => ({ owner: message.id, event }));
+      });
+      // Adapt legacy test builders to an append-only event fixture, not a production reader.
+      generated.push(...(state.nativeEvents ?? []).map(event => ({ event })));
+      nativeLog = nativeLog.filter(row => row.owner === undefined || state.messages.some(message => message.id === row.owner));
+      for (const row of generated) {
+        const existing = nativeLog.find(item => item.event.id === row.event.id);
+        if (existing) existing.event = row.event;
+        else nativeLog.push(row);
+      }
+      const events = nativeLog.map(row => row.event);
+      const prior = data.cursor ? nativeCursors.get(data.cursor) : undefined;
+      const anchor = prior?.id ? events.findIndex(event => event.id === prior.id) : -1;
+      const expired = !!data.cursor && (!prior || (prior.id && anchor < 0));
+      const direction = prior?.direction ?? data.direction;
+      const boundary = prior ? (prior.id ? anchor + (direction === 'forward' ? 1 : 0) : 0)
+        : direction === 'backward' ? events.length : 0;
+      const candidates = events.map((event, index) => ({ event, index })).filter(({ event, index }) =>
+        (direction === 'backward' ? index < boundary : index >= boundary)
+        && (!data.types || data.types.includes(event.type)));
+      const selected = direction === 'backward' ? candidates.slice(-data.max) : candidates.slice(0, data.max);
+      const nextId = direction === 'backward' ? selected[0]?.event.id : selected.at(-1)?.event.id;
+      const cursor = `fixture-native-${++nativeCursorSequence}`;
+      nativeCursors.set(cursor, { id: nextId ?? prior?.id, direction });
+      let liveCursor;
+      if (data.bootstrap) {
+        liveCursor = `fixture-native-${++nativeCursorSequence}`;
+        nativeCursors.set(liveCursor, { id: events.at(-1)?.id, direction: 'forward' });
+      }
+      return reply({
+        sessionId: 'test-session', source: data.source, direction: data.direction,
+        events: selected.map(item => item.event), cursor, cursorStatus: expired ? 'expired' : 'ok',
+        hasMore: candidates.length > selected.length, ...(liveCursor ? { liveCursor } : {}),
+        read: { rpc: data.bootstrap ? 2 : 1, events: selected.length },
+      });
     }
     if (req.url === '/intent/files/get') return reply(managed(data.url).file);
     if (req.url.startsWith('/uploads/')) {
@@ -118,6 +173,7 @@ export async function fixture(t, options = {}) {
       if (!state.noMarker) state.messages.push({ id: `u${prompts.length}`, role: 'user',
         content: data.parts ? data.parts.filter(part => part.type === 'text').map(part => part.text).join('').trim()
           : data.attachments?.length ? data.text.trim() : data.text, timestamp: 10 });
+      state.loaded = true;
       state.status = state.earlyIdle ? 'idle' : 'running';
       if (state.promptFault === 'disconnect') return res.destroy();
       if (state.promptFault === 'hold') {

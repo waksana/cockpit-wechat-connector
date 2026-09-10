@@ -26,6 +26,9 @@ export class NativeFollowup {
     const { store, config, cockpit } = this.bridge;
     let round = store.get('nativeFollowup');
     if (!round && (!config.nativeInterruptFollowup || first.followupEpoch !== this.epoch || !this.textOnly(first))) return false;
+    // Cold metadata does not prove an empty queue. Fresh input can use native
+    // enqueue/resume, but it cannot complete an already-started interrupt drain.
+    if (!round && !meta.loaded) return false;
     if (!round) {
       round = { id: randomUUID(), epoch: this.epoch, leaderId: first.id,
         startedAt: Date.now(), phase: 'draining', attempts: 0 };
@@ -38,11 +41,11 @@ export class NativeFollowup {
     if (meta.error || meta.status === 'error') this.fail(round, first, 'INTERRUPT_TARGET_ERROR');
     if (meta.closing || meta.cancelling || meta.loading || meta.compacting
       || meta.activeOperations || meta.activeMcpOperations) return true;
+    if (!meta.loaded) return true;
 
     if (!quiescent(meta)) {
       // Never leave an interrupt request outstanding when the new prompt is sent.
       // ACK is not idle: an older queued turn may begin while this one unwinds.
-      requireThat(meta.loaded, 'INTERRUPT_TARGET_UNLOADED_BUSY');
       round.phase = 'requesting'; round.attempts++;
       store.set('nativeFollowup', round);
       let result;

@@ -5,6 +5,7 @@ import { deliveryCheckpoint, historyCheckpoint } from '../src/cockpit.js';
 import { createOutbox, resolveJob } from '../src/bridge.js';
 import { Store } from '../src/storage.js';
 import { fixture, incoming, credentials } from './helpers.js';
+import { setTimeout as delay } from 'node:timers/promises';
 
 async function setup(t, options = {}) {
   const f = await fixture(t, { bridgeClass: SessionBridge, ...options });
@@ -86,20 +87,243 @@ test('legacy pending and completed records migrate without replaying accepted pa
   assert.equal(f.sent.length, 0);
 });
 
-test('late append and backward pagination preserve complete-message order during native processing', async t => {
+async function foldedToolCheckpoint(t, { output = true } = {}) {
+  const folded = { id: 'old-tool-body', role: 'assistant', content: 'Already delivered body',
+    toolCalls: [{ toolCallId: 'bash-1', name: 'bash', title: 'Inspect files',
+      args: '{"command":"ls"}', status: 'completed' }] };
+  const f = await setup(t, { nativeEvents: [
+    { id: 'old-native-event', type: 'assistant.message', data: {
+      messageId: folded.id, content: folded.content,
+      toolRequests: [{ toolCallId: 'bash-1', name: 'bash', arguments: { command: 'ls' } }],
+    } },
+    { id: 'tool-complete', type: 'tool.execution_complete', data: { toolCallId: 'bash-1', success: true } },
+  ] });
+  await f.bridge.receive();
+  const context = f.store.jobs()[0];
+  context.status = 'done'; f.store.save(context);
+  const checkpoint = historyCheckpoint(folded);
+  f.store.set('historyCheckpoint', checkpoint);
+  const old = { id: `session-output:test-session:${folded.id}`, kind: 'session-output', status: 'done',
+    marker: 'legacy-tool', peer: credentials.peer, contextToken: 'FAKE_CONTEXT', receivedAt: 1,
+    original: folded.content, outputMessageId: folded.id, outputFingerprint: checkpoint.fingerprint,
+    outputBaseline: historyCheckpoint(), outboxPurpose: 'final', outbox: createOutbox(folded.content, f.config) };
+  delete old.outbox; // The legacy runner removed outbox only after every part was accepted.
+  if (output) f.store.ingest([old], null, 100);
+  return { ...f, folded, checkpoint, old };
+}
+
+test('real v1 folded-tool hash migrates using matching frozen output without replaying accepted outbox parts', async t => {
+  const f = await foldedToolCheckpoint(t);
+  const body = 'Later frozen response. '.repeat(20);
+  f.config.limits.textBytes = 128;
+  const pending = { ...f.old, id: 'session-output:test-session:pending', status: 'replying',
+    outputMessageId: 'pending', original: body, outputBaseline: f.checkpoint,
+    outputFingerprint: historyCheckpoint({ id: 'pending', role: 'assistant', content: body }).fingerprint,
+    outbox: createOutbox(body, f.config) };
+  pending.outbox[0].status = 'accepted';
+  f.store.ingest([pending], null, 100);
+  f.state.nativeEvents.push({ id: 'pending-event', type: 'assistant.message',
+    data: { messageId: 'pending', content: body } });
+  const page = await f.cockpit.page();
+  assert.notEqual(historyCheckpoint(page.messages[0]).fingerprint, f.checkpoint.fingerprint);
+  const before = f.requests.length;
+  const window = await f.bridge.readWindow(f.checkpoint);
+  assert.equal(window.checkpoint.version, 3);
+  assert.equal(window.checkpoint.id, f.folded.id);
+  assert.deepEqual(window.messages.map(message => message.id), ['pending']);
+  const reads = f.requests.slice(before).filter(row => row.url === '/intent/session/chat');
+  assert.equal(reads.length, 1);
+  assert.equal(reads[0].data.max, 256);
+  assert.deepEqual(f.store.get('historyCheckpoint'), f.checkpoint, 'read-only validation does not advance a cursor');
+  await f.settle(15);
+  assert.deepEqual(f.sent.map(row => row.msg.item_list[0].text_item.text), pending.outbox.slice(1).map(part => part.value));
+  assert.deepEqual(f.sent.map(row => row.msg.client_id), pending.outbox.slice(1).map(part => part.clientId));
+  assert.equal(f.store.job(pending.id).status, 'done');
+  assert.deepEqual(f.store.job(f.old.id), f.old);
+  assert.equal(f.store.get('historyCheckpoint').id, 'pending');
+  assert.ok(f.store.get('historyCheckpoint').position);
+  assert.equal(f.prompts.length, 0);
+});
+
+test('legacy folded-tool migration rejects actually changed body despite matching message and tool IDs', async t => {
+  const f = await foldedToolCheckpoint(t);
+  f.state.nativeEvents[0].data.content = 'Changed after the checkpoint';
+  const jobs = f.store.jobs();
+  await assert.rejects(f.bridge.step(), { code: 'CHECKPOINT_CHANGED' });
+  assert.deepEqual(f.store.get('historyCheckpoint'), f.checkpoint);
+  assert.deepEqual(f.store.jobs(), jobs);
+  assert.equal(f.sent.length, 0);
+  assert.equal(f.prompts.length, 0);
+});
+
+test('legacy folded-tool checkpoint without frozen-body evidence requires an explicit review decision', async t => {
+  const f = await foldedToolCheckpoint(t, { output: false });
+  const jobs = f.store.jobs();
+  await assert.rejects(f.bridge.step(), error => {
+    assert.equal(error.code, 'LEGACY_CHECKPOINT_REVIEW_REQUIRED');
+    assert.match(error.message, /explicit history-review decision/);
+    return true;
+  });
+  await assert.rejects(f.cockpit.since(f.checkpoint), { code: 'LEGACY_CHECKPOINT_REVIEW_REQUIRED' });
+  assert.deepEqual(f.store.get('historyCheckpoint'), f.checkpoint);
+  assert.deepEqual(f.store.jobs(), jobs);
+  assert.equal(f.sent.length, 0);
+});
+
+test('runner validates legacy folded-tool checkpoint before starting queued input or output work', async t => {
+  const f = await foldedToolCheckpoint(t, { output: false });
+  f.state.batch = [incoming({ message_id: 43 })];
+  await f.bridge.receive();
+  const jobs = f.store.jobs();
+  const before = f.requests.length;
+  await assert.rejects(f.bridge.run(new AbortController().signal), { code: 'LEGACY_CHECKPOINT_REVIEW_REQUIRED' });
+  assert.deepEqual(f.store.get('historyCheckpoint'), f.checkpoint);
+  assert.deepEqual(f.store.jobs(), jobs);
+  assert.equal(f.prompts.length, 0);
+  assert.equal(f.sent.length, 0);
+  assert.ok(f.requests.slice(before).every(row => row.url.startsWith('/capabilities')
+    || ['/intent/session/get', '/intent/session/chat'].includes(row.url)));
+});
+
+test('legacy migration cannot use unrelated evidence or skip an unresolved source outbox', async t => {
+  const f = await foldedToolCheckpoint(t);
+  const mismatched = { ...f.old, outputFingerprint: 'different-snapshot' };
+  f.store.save(mismatched);
+  await assert.rejects(f.bridge.readWindow(f.checkpoint), { code: 'LEGACY_CHECKPOINT_REVIEW_REQUIRED' });
+  const pending = { ...f.old, status: 'replying', outbox: createOutbox(f.old.original, f.config) };
+  pending.outbox[0].status = 'unknown';
+  f.store.save(pending);
+  await assert.rejects(f.bridge.readWindow(f.checkpoint), { code: 'UNRESOLVED_OUTPUT_STATE' });
+  assert.deepEqual(f.store.job(pending.id), pending);
+  assert.deepEqual(f.store.get('historyCheckpoint'), f.checkpoint);
+  assert.equal(f.sent.length, 0);
+});
+
+async function coldCheckpoint(t, count) {
+  const messages = Array.from({ length: count }, (_, i) => ({
+    id: `old-${i}`, role: 'assistant', content: `Already delivered ${i}`,
+  }));
+  const f = await setup(t, { loaded: false, status: 'unloaded', eventsEnabled: true, messages });
+  await f.bridge.receive();
+  const context = f.store.jobs()[0];
+  context.status = 'done'; f.store.save(context);
+  const source = messages.at(-1);
+  const checkpoint = deliveryCheckpoint(source);
+  f.store.set('historyCheckpoint', checkpoint);
+  const old = { id: `session-output:test-session:${source.id}`, kind: 'session-output', status: 'done',
+    marker: 'completed-before-restart', peer: credentials.peer, contextToken: 'FAKE_CONTEXT', receivedAt: 1,
+    original: source.content, outputMessageId: source.id, outputVersion: 3,
+    outputFingerprint: checkpoint.fingerprint, outputBaseline: deliveryCheckpoint(messages.at(-2)),
+    outboxPurpose: 'final' };
+  f.store.ingest([old], null, 100);
+  return { ...f, checkpoint, old };
+}
+
+for (const count of [2, 300]) {
+  test(`cold v3 checkpoint with ${count} historical events and no new body remains usable without a native tail`, async t => {
+    const f = await coldCheckpoint(t, count);
+    const before = f.requests.length;
+    await f.bridge.establishCheckpoint();
+    await f.settle(3);
+    assert.deepEqual(f.store.get('historyCheckpoint'), f.checkpoint);
+    assert.deepEqual(f.store.job(f.old.id), f.old);
+    assert.equal(f.state.loaded, false);
+    assert.equal(f.prompts.length, 0);
+    assert.equal(f.sent.length, 0);
+    const reads = f.requests.slice(before).filter(row => row.url === '/intent/session/chat');
+    assert.equal(reads.length, 3);
+    assert.ok(reads.every(row => row.data.source === 'persisted' && row.data.direction === 'backward'
+      && row.data.max === 256 && row.data.bootstrap === false && row.data.cursor === undefined));
+    assert.ok(f.requests.slice(before).every(row => ['/intent/session/get', '/intent/session/chat'].includes(row.url)));
+  });
+}
+
+test('cold passive migration delivers unseen bodies in order without replay or a fabricated forward cursor', async t => {
+  const f = await coldCheckpoint(t, 300);
+  f.state.messages.push({ id: 'cold-A', role: 'assistant', content: 'Unseen A' },
+    { id: 'cold-B', role: 'assistant', content: 'Unseen B' });
+  await f.settle(8);
+  assert.deepEqual(f.sent.map(row => row.msg.item_list[0].text_item.text), ['Unseen A', 'Unseen B']);
+  assert.equal(f.store.get('historyCheckpoint').id, 'cold-B');
+  assert.equal(f.store.get('historyCheckpoint').position, undefined);
+  assert.deepEqual(f.store.job(f.old.id), f.old);
+  assert.equal(f.state.loaded, false);
+  assert.equal(f.prompts.length, 0);
+  assert.ok(f.requests.filter(row => row.url === '/intent/session/chat')
+    .every(row => row.data.source === 'persisted' && row.data.direction === 'backward' && row.data.max === 256));
+  f.state.messages.at(-1).content = 'Changed cold checkpoint body';
+  await assert.rejects(f.bridge.step(), { code: 'CHECKPOINT_CHANGED' });
+  assert.equal(f.sent.length, 2);
+});
+
+test('cold runner keeps its v3 checkpoint until legitimate fresh input supplies a live forward tail', async t => {
+  const f = await coldCheckpoint(t, 300);
+  f.config.limits.requestTimeoutMs = 2000;
+  const controller = new AbortController();
+  const running = f.bridge.run(controller.signal);
+  t.after(async () => { controller.abort(); await running; });
+  const until = async predicate => {
+    const deadline = Date.now() + 5000;
+    while (!predicate()) {
+      assert.ok(Date.now() < deadline, 'cold runner did not make bounded progress');
+      await delay(10);
+    }
+  };
+  await until(() => f.requests.some(row => row.url === '/intent/session/chat'));
+  await delay(150);
+  assert.equal(f.state.loaded, false);
+  assert.equal(f.prompts.length, 0);
+  assert.deepEqual(f.store.get('historyCheckpoint'), f.checkpoint);
+  f.state.batch = [incoming({ message_id: 43 })];
+  await until(() => f.prompts.length === 1 && Boolean(f.store.get('historyCheckpoint').position));
+  assert.equal(f.prompts[0].mode, 'enqueue');
+  assert.equal(f.state.loaded, true);
+  assert.equal(f.store.get('historyCheckpoint').position.source, 'live');
+  f.finish('Fresh response after cold resume');
+  await until(() => f.sent.length === 1);
+  controller.abort(); await running;
+  assert.equal(f.sent[0].msg.item_list[0].text_item.text, 'Fresh response after cold resume');
+  assert.deepEqual(f.store.job(f.old.id), f.old);
+  assert.ok(f.requests.filter(row => row.url === '/intent/session/chat' && row.data.source === 'persisted')
+    .every(row => row.data.direction === 'backward' && row.data.bootstrap === false));
+  assert.ok(f.requests.every(row => !/reload|resume|interrupt|cancel|trust/.test(row.url)));
+});
+
+test('bounded forward pages skip empty tool messages and preserve output order during native processing', async t => {
   const f = await setup(t, { nativeQueue: true, status: 'running' });
   await f.bridge.receive(); await f.bridge.step();
+  const initialRequests = f.requests.length;
   f.state.messages.push({ id: 'A', role: 'assistant', content: 'A', timestamp: 1 });
   for (let i = 0; i < 205; i++) f.state.messages.push({ id: `tool-${i}`, role: 'assistant', content: '',
     toolCalls: [{ toolCallId: `t-${i}`, status: 'running' }], timestamp: 2 });
   f.state.messages.push({ id: 'B', role: 'assistant', content: 'B', timestamp: 3 });
   await f.bridge.step();
   f.state.messages.push({ id: 'C', role: 'assistant', content: 'C', timestamp: 4 });
-  await f.settle(8);
+  await f.settle(15);
   assert.deepEqual(f.sent.map(row => row.msg.item_list[0].text_item.text), ['A', 'B', 'C']);
   assert.equal(f.state.status, 'running');
   assert.equal(f.store.get('historyCheckpoint').id, 'C');
-  assert.ok(f.requests.some(row => row.url === '/intent/session/history' && row.data.beforeMsgId));
+  const reads = f.requests.slice(initialRequests).filter(row => row.url === '/intent/session/chat');
+  assert.ok(reads.length > 0);
+  assert.ok(reads.every(row => row.data.direction === 'forward' && row.data.max <= 64));
+});
+
+test('passive events without a visible message advance the native cursor without losing user ownership', async t => {
+  const f = await setup(t);
+  await f.bridge.receive(); await f.bridge.step();
+  const before = f.store.get('historyCheckpoint');
+  assert.ok(before.position);
+  f.state.loaded = false;
+  f.state.nativeEvents = [{ id: 'shutdown', type: 'session.shutdown', data: {} }];
+  await f.bridge.step();
+  const after = f.store.get('historyCheckpoint');
+  assert.notEqual(after.position.cursor, before.position.cursor);
+  assert.equal(after.id, before.id);
+  assert.equal(after.userMessageId, before.userMessageId);
+  f.finish('Later durable reply');
+  await f.settle(6);
+  assert.equal(f.sent[0].msg.item_list[0].text_item.text, 'Later durable reply');
+  assert.ok(f.store.get('historyCheckpoint').position);
 });
 
 test('existing outbox sends while busy but checks attachment identity and never reads private paths', async t => {
@@ -172,6 +396,39 @@ test('unloaded target resumes; native input receipt does not fabricate a complet
   f.finish('Recovered'); await f.settle();
   assert.equal(f.store.jobs()[0].status, 'done');
   assert.equal(f.sent.length, 1);
+});
+
+test('unloaded unknown native state neither blocks an accepted input as idle nor suppresses durable body delivery', async t => {
+  const f = await setup(t, { loaded: false, status: 'unloaded',
+    messages: [{ id: 'persisted-body', role: 'assistant', content: 'Durable message while unloaded' }] });
+  await f.bridge.receive();
+  const input = f.store.jobs()[0];
+  input.status = 'accepted'; input.prompt = 'Accepted input not yet observed';
+  input.startedAt = Date.now() - f.config.limits.resultTimeoutMs - 1000;
+  f.store.save(input);
+  await f.settle(3);
+  assert.equal(f.store.job(input.id).status, 'accepted');
+  assert.deepEqual(f.sent.map(row => row.msg.item_list[0].text_item.text), ['Durable message while unloaded']);
+  assert.equal(f.prompts.length, 0);
+});
+
+test('shared native delivery handles durable session errors without a loaded metadata error field', async t => {
+  const f = await setup(t);
+  await f.bridge.receive(); await f.bridge.step();
+  f.state.status = 'idle';
+  assert.equal(Object.hasOwn(await f.cockpit.meta(), 'error'), false);
+  f.state.nativeEvents = [{ id: 'native-error', type: 'session.error', data: { message: 'PRIVATE_NATIVE_ERROR' } },
+    { id: 'native-recovery', type: 'assistant.message', data: { messageId: 'recovery', content: 'Recovered body' } }];
+  await f.settle(8);
+  assert.equal(f.sent.length, 2);
+  assert.match(f.sent[0].msg.item_list[0].text_item.text, /报告运行错误/);
+  assert.equal(f.sent[1].msg.item_list[0].text_item.text, 'Recovered body');
+  assert.ok(!JSON.stringify(f.sent).includes('PRIVATE_NATIVE_ERROR'));
+  assert.equal(f.store.job('session-error:test-session:native-error').status, 'done');
+  await f.settle(3);
+  assert.equal(f.sent.length, 2);
+  assert.ok(f.requests.filter(row => row.url === '/intent/session/chat' && row.data.source === 'live')
+    .every(row => row.data.types.includes('session.error')));
 });
 
 test('new output after completed input is mirrored without forwarding thoughts, tools or old history', async t => {

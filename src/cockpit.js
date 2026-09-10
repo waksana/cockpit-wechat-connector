@@ -2,24 +2,57 @@ import { BridgeError, object, requireThat, text } from './common.js';
 import { createHash } from 'node:crypto';
 import { requestJson } from './http.js';
 import fs from 'node:fs';
+import { nativeMessages } from './native-messages.js';
 
 export function historyCheckpoint(message) {
-  return { id: message?.id ?? null, fingerprint: message ? createHash('sha256')
+  return { ...(message?.nativePosition ? { position: message.nativePosition } : {}),
+    id: message?.id ?? null, fingerprint: message ? createHash('sha256')
     .update(JSON.stringify([message.role, message.content, message.subtype, message.toolCalls])).digest('hex') : null };
+}
+
+export function verifyCheckpoint(checkpoint, message, legacyOutput) {
+  requireThat(message?.id === checkpoint.id, 'CHECKPOINT_CHANGED');
+  const actual = checkpoint.version === 2 || checkpoint.version === 3
+    ? deliveryCheckpoint(message, checkpoint.version) : historyCheckpoint(message);
+  if (actual.fingerprint === checkpoint.fingerprint) return;
+  requireThat(checkpoint.version === undefined, 'CHECKPOINT_CHANGED');
+  // A v1 checkpoint saved only a hash of folded tool metadata, not its preimage.
+  // An old output with that exact hash independently retains the frozen body.
+  if (legacyOutput?.kind === 'session-output' && legacyOutput.outboxPurpose === 'final' && legacyOutput.outputVersion === undefined
+    && legacyOutput.outputMessageId === checkpoint.id && legacyOutput.outputFingerprint === checkpoint.fingerprint) {
+    requireThat(['done', 'abandoned'].includes(legacyOutput.status), 'UNRESOLVED_OUTPUT_STATE');
+    requireThat(legacyOutput.status === 'abandoned' || !legacyOutput.outbox
+      || legacyOutput.outbox.every(part => part.status === 'accepted'), 'UNRESOLVED_OUTPUT_STATE');
+    requireThat(message.role === 'assistant' && !message.subtype && legacyOutput.original === message.content
+      && !message.attachment && !message.attachments?.length
+      && !message.parts?.some(part => part.type === 'file'), 'CHECKPOINT_CHANGED');
+    return;
+  }
+  throw new BridgeError('LEGACY_CHECKPOINT_REVIEW_REQUIRED',
+    'The legacy checkpoint hash includes folded tool fields unavailable in native chat. No matching frozen output proves its original body. Keep the checkpoint/outbox unchanged and obtain an explicit history-review decision; do not automatically trust the latest history.');
 }
 
 export function deliveryCheckpoint(message, version = 3) {
   requireThat(version === 2 || version === 3, 'UNKNOWN_CHECKPOINT_VERSION');
   const attachment = message?.attachment;
-  return { version, id: message?.id ?? null, fingerprint: message ? createHash('sha256')
+  return { ...(message?.nativePosition ? { position: message.nativePosition } : {}),
+    version, id: message?.id ?? null, fingerprint: message ? createHash('sha256')
     .update(JSON.stringify([message.role, message.content, message.subtype ?? null,
       attachment ? [attachment.kind, attachment.name, attachment.url, attachment.size ?? null, attachment.mime ?? null] : null,
       ...(version === 3 ? [message.parts ?? null, message.attachments ?? null] : [])]))
     .digest('hex') : null };
 }
 
+export function nativeCheckpoint(message, position, previous = {}) {
+  return {
+    ...deliveryCheckpoint(message), position,
+    ...(message?.role === 'user' ? { userMessageId: message.id }
+      : previous.userMessageId ? { userMessageId: previous.userMessageId } : {}),
+  };
+}
+
 export function quiescent(meta) {
-  return ['idle', 'unloaded'].includes(meta.status) && meta.queue.length === 0
+  return meta.loaded === true && meta.status === 'idle' && Array.isArray(meta.queue) && meta.queue.length === 0
     && !meta.ask && !meta.planRequest && !meta.elicitation && !meta.error
     && !['loading', 'closing', 'cancelling', 'compacting', 'nativeProcessing',
       'activeSubagents', 'activeMcpOperations', 'activeOperations'].some(key => Boolean(meta[key]));
@@ -37,7 +70,7 @@ export class CockpitClient {
   }
   async capabilities(signal) {
     for (const [name, fields] of [['prompt', ['sessionId', 'text', 'mode']],
-      ['session/get', ['sessionId']], ['session/history', ['sessionId', 'beforeMsgId', 'limit', 'details']],
+      ['session/get', ['sessionId']], ['session/chat', ['sessionId', 'cursor', 'max', 'source', 'direction']],
       ...(this.config.nativeInterruptFollowup ? [['session/interrupt', ['sessionId']]] : [])]) {
       const detail = await requestJson(new URL(`/capabilities?name=${encodeURIComponent(name)}`, this.config.cockpit.apiUrl),
         { method: 'GET', headers: this.headers, signal, fetchImpl: this.fetchImpl, timeoutMs: this.config.limits.requestTimeoutMs });
@@ -55,8 +88,9 @@ export class CockpitClient {
     requireThat(object(meta) && meta.sessionId === this.config.cockpit.sessionId
       && typeof meta.cwd === 'string' && typeof meta.loaded === 'boolean'
       && ['idle', 'unloaded', 'running', 'error'].includes(meta.status)
-      && Array.isArray(meta.queue) && meta.queue.every(item => object(item) && text(item.id) && typeof item.text === 'string')
-      && (meta.error === null || typeof meta.error === 'string')
+      && ((!meta.loaded && meta.queue === undefined) || (Array.isArray(meta.queue)
+        && meta.queue.every(item => object(item) && text(item.id) && typeof item.text === 'string')))
+      && (meta.error === undefined || meta.error === null || typeof meta.error === 'string')
       && (meta.ask === null || object(meta.ask)), 'COCKPIT_SESSION_SCHEMA');
     for (const name of ['ask', 'planRequest', 'elicitation']) {
       if (meta[name]) requireThat(text(meta[name].requestId), 'COCKPIT_CHOICE_SCHEMA');
@@ -64,55 +98,87 @@ export class CockpitClient {
     requireThat(meta.cwd === this.config.cockpit.cwd, 'TARGET_CWD_CHANGED');
     return meta;
   }
-  async page(beforeMsgId, signal) {
-    const result = await this.call('session/history', {
-      sessionId: this.config.cockpit.sessionId, limit: 200, details: 'summary',
-      ...(beforeMsgId ? { beforeMsgId } : {}),
+  async nativePage(query, signal) {
+    const result = await this.call('session/chat', {
+      sessionId: this.config.cockpit.sessionId, max: 64, waitMs: 0, bootstrap: false,
+      includeEphemeral: false, ...query,
     }, signal);
-    requireThat(result.sessionId === this.config.cockpit.sessionId && Array.isArray(result.messages)
-      && typeof result.hasMore === 'boolean', 'COCKPIT_HISTORY_SCHEMA');
-    for (const message of result.messages) {
-      requireThat(object(message) && text(message.id)
-        && ['user', 'assistant', 'system', 'tool'].includes(message.role)
-        && typeof message.content === 'string'
-        && (message.toolCalls === undefined || Array.isArray(message.toolCalls)), 'COCKPIT_MESSAGE_SCHEMA');
-    }
-    requireThat(new Set(result.messages.map(message => message.id)).size === result.messages.length, 'HISTORY_DUPLICATE_IDS');
+    requireThat(result.sessionId === this.config.cockpit.sessionId && Array.isArray(result.events)
+      && typeof result.cursor === 'string' && typeof result.hasMore === 'boolean'
+      && result.source === query.source && result.direction === query.direction, 'COCKPIT_HISTORY_SCHEMA');
+    requireThat(result.cursorStatus === 'ok', 'NATIVE_CURSOR_EXPIRED');
+    requireThat(result.events.length <= (query.max ?? 64), 'NATIVE_PAGE_BOUND_EXCEEDED');
     return result;
+  }
+  liveFilter() {
+    return { agentScope: 'primary', types: ['user.message', 'assistant.message', 'session.error'] };
+  }
+  async page(before, signal) {
+    requireThat(before === undefined, 'CHAT_PROTOCOL_CHANGED');
+    const meta = await this.meta(signal);
+    const source = meta.loaded ? 'live' : 'persisted';
+    const page = await this.nativePage({
+      source, direction: 'backward', max: 256, bootstrap: source === 'live',
+      ...(source === 'live' ? this.liveFilter() : {}),
+    }, signal);
+    let position;
+    if (page.liveCursor !== undefined) position = { cursor: page.liveCursor, source: 'live' };
+    return { messages: nativeMessages(page.events), hasMore: page.hasMore, position };
   }
   async baseline(signal) {
     const page = await this.page(undefined, signal);
     requireThat(page.messages.length > 0 || !page.hasMore, 'COCKPIT_HISTORY_SCHEMA');
-    return page.messages.at(-1)?.id ?? null;
+    requireThat(page.position, 'CHECKPOINT_REQUIRES_LOADED_SESSION');
+    return nativeCheckpoint(page.messages.at(-1), page.position);
   }
-  async since(baseline, signal, fingerprint, { version, includeBaseline = false } = {}) {
-    let tail = [];
-    let before;
-    const seen = new Set();
+  async since(baseline, signal, fingerprint, { version, includeBaseline = false, position } = {}) {
+    if (object(baseline)) { position ??= baseline.position; fingerprint ??= baseline.fingerprint; version ??= baseline.version; baseline = baseline.id; }
+    if (!position) {
+      const page = await this.page(undefined, signal);
+      const index = baseline === null ? -1 : page.messages.findIndex(message => message.id === baseline);
+      requireThat(baseline === null ? !page.hasMore : index >= 0, 'CHECKPOINT_MIGRATION_REQUIRED');
+      if (fingerprint && index >= 0) verifyCheckpoint({ id: baseline, version, fingerprint }, page.messages[index]);
+      return page.messages.slice(index + (includeBaseline && index >= 0 ? 0 : 1));
+    }
+    const events = [];
+    const meta = await this.meta(signal);
+    const source = meta.loaded ? 'live' : 'persisted';
+    let cursor = position.cursor || undefined;
     for (let pageNo = 0; pageNo < 10; pageNo++) {
-      const page = await this.page(before, signal);
-      for (const message of page.messages) {
-        requireThat(!seen.has(message.id), 'HISTORY_PAGINATION_CHANGED');
-        seen.add(message.id);
-      }
-      tail = [...page.messages, ...tail];
-      if (baseline !== null) {
-        const index = tail.findIndex(message => message.id === baseline);
-        if (index >= 0) {
-          if (fingerprint) requireThat((version === 2 || version === 3
-            ? deliveryCheckpoint(tail[index], version) : historyCheckpoint(tail[index])).fingerprint
-            === fingerprint, 'CHECKPOINT_CHANGED');
-          return tail.slice(index + (includeBaseline ? 0 : 1));
-        }
-      }
+      const page = await this.nativePage({
+        source, direction: 'forward', cursor, max: 256, ...(source === 'live' ? this.liveFilter() : {}),
+      }, signal);
+      events.push(...page.events);
+      requireThat(!page.hasMore || page.cursor !== cursor, 'HISTORY_PAGINATION_CHANGED');
+      cursor = page.cursor;
       if (!page.hasMore) {
-        requireThat(baseline === null, 'BASELINE_DISAPPEARED');
-        return tail;
+        const messages = nativeMessages(events);
+        if (messages.length) messages.at(-1).nativePosition = { cursor, source };
+        return messages;
       }
-      requireThat(page.messages.length > 0, 'HISTORY_PAGINATION_CHANGED');
-      before = page.messages[0].id;
     }
     throw new BridgeError('HISTORY_WINDOW_EXCEEDED');
+  }
+  async deliveryPage(checkpoint, signal) {
+    requireThat(checkpoint?.position, 'NATIVE_CHECKPOINT_REQUIRED');
+    const meta = await this.meta(signal);
+    const source = meta.loaded ? 'live' : 'persisted';
+    const query = {
+      source, direction: 'forward', cursor: checkpoint.position.cursor || undefined, max: 64,
+      ...(source === 'live' ? this.liveFilter() : {}),
+    };
+    let page = await this.nativePage(query, signal);
+    const output = page.events.findIndex(event => nativeMessages([event]).some(message =>
+      message.role === 'assistant' && (message.content.trim() || message.parts?.length)));
+    if (output >= 0 && output + 1 < page.events.length) {
+      const prefix = await this.nativePage({ ...query, max: output + 1 }, signal);
+      requireThat(JSON.stringify(prefix.events.map(event => event.id))
+        === JSON.stringify(page.events.slice(0, output + 1).map(event => event.id)), 'HISTORY_CHANGED_DURING_READ');
+      page = prefix;
+    }
+    requireThat(!page.hasMore || page.cursor !== query.cursor, 'HISTORY_PAGINATION_CHANGED');
+    return { messages: nativeMessages(page.events), hasMore: page.hasMore,
+      position: { cursor: page.cursor, source } };
   }
   async uploadFile(file, metadata, size, signal) {
     const origin = new URL(this.config.cockpit.apiUrl);
@@ -145,7 +211,8 @@ export function correlate(job, messages, meta) {
   requireThat(own.length <= 1, 'DUPLICATE_PROMPT_MARKER');
   const foreign = messages.some(message => message.role === 'user'
     && message.content !== (job.promptVisible ?? job.prompt) && message.subtype !== 'ask-reply');
-  requireThat(!foreign && meta.queue.every(item => item.text === job.prompt), 'EXTERNAL_INPUT_DETECTED');
+  requireThat(!foreign && (meta.queue === undefined || meta.queue.every(item => item.text === job.prompt)),
+    'EXTERNAL_INPUT_DETECTED');
   if (!own.length) {
     requireThat(!job.userMessageId, 'PROMPT_MARKER_DISAPPEARED');
     return { waiting: true };

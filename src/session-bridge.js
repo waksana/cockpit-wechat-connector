@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { Bridge, createOutbox } from './bridge.js';
 import { errorCode, requireThat, sessionLink, sleep } from './common.js';
-import { deliveryCheckpoint, quiescent } from './cockpit.js';
+import { deliveryCheckpoint, quiescent, verifyCheckpoint } from './cockpit.js';
 import { StatusDisplay } from './status-display.js';
 import { replyRunId } from './reply-run.js';
 import { readEventStream, WorkSignal } from './events.js';
@@ -17,6 +17,13 @@ const anchor = message => !message.subtype && ['user', 'assistant'].includes(mes
 export class SessionBridge extends Bridge {
   followup = new NativeFollowup(this);
   prepareIngress(jobs, freshPoll) { this.followup.tag(jobs, freshPoll); }
+  async establishCheckpoint(signal, explicit = false) {
+    const checkpoint = this.store.get('historyCheckpoint');
+    if (!explicit && checkpoint?.fingerprint && !checkpoint.position && checkpoint.version === undefined) {
+      await this.readWindow(checkpoint, signal);
+    }
+    return super.establishCheckpoint(signal, explicit);
+  }
   work = new WorkSignal();
   wakeWork() { this.work.notify(); }
   async waitForWork(signal) {
@@ -29,8 +36,11 @@ export class SessionBridge extends Bridge {
       || (job.status === 'queued' && !this.ingressPaused));
     if (ready) await sleep(100, signal);
     else {
-      await this.work.wait(30000, signal);
-      await sleep(500, signal);
+      const meta = this.deliveryMeta;
+      const active = meta?.loaded && (meta.nativeProcessing || meta.status === 'running'
+        || meta.activeSubagents > 0 || meta.activeMcpOperations > 0 || meta.queue?.length);
+      await this.work.wait(active ? Math.max(1000, this.config.limits.statusIntervalMs) : 30000, signal);
+      if (this.work.pending) await sleep(500, signal);
     }
     this.work.consume();
   }
@@ -40,8 +50,8 @@ export class SessionBridge extends Bridge {
     const wake = event => {
       if (event.type === 'connected') { failures = 0; this.log('COCKPIT_SSE_CONNECTED'); }
       this.wakeWork();
-      // A live upsert can precede its durable journal entry. Recheck once after
-      // the burst rather than treating SSE text as a completed reply.
+      // Metadata/control wakeups can precede durable journal writes. Confirm once
+      // after each burst; assistant bodies arrive only through native reads.
       clearTimeout(trailing);
       trailing = setTimeout(() => this.wakeWork(), 1000);
     };
@@ -58,7 +68,7 @@ export class SessionBridge extends Bridge {
   }
   needsEvidence(job) { return job.kind === 'session-output' || super.needsEvidence(job); }
   async observeStatus(signal, stopSignal) {
-    if (!this.config.statusDisplay?.typing && !this.config.statusDisplay?.tools) return;
+    if (!this.config.statusDisplay?.typing) return;
     await new StatusDisplay(this.config, this.store, this.weixin, this.cockpit, this.log).run(signal, stopSignal);
   }
 
@@ -76,12 +86,28 @@ export class SessionBridge extends Bridge {
   async readWindow(checkpoint, signal) {
     requireThat(checkpoint, 'HISTORY_CHECKPOINT_REQUIRED');
     requireThat(checkpoint.version === undefined || [2, 3].includes(checkpoint.version), 'UNKNOWN_CHECKPOINT_VERSION');
-    const messages = await this.cockpit.since(checkpoint.id, signal, checkpoint.fingerprint,
-      { version: checkpoint.version, includeBaseline: true });
-    const baseline = checkpoint.id === null ? undefined : messages.shift();
-    return { checkpoint: checkpoint.version === 2 || checkpoint.version === 3 ? checkpoint : {
+    if (checkpoint.position) {
+      const page = await this.cockpit.deliveryPage(checkpoint, signal);
+      return { checkpoint, ...page };
+    }
+    // One bounded migration window. Drain already-observed legacy output before
+    // adopting tail(); missing anchors pause delivery, never silently skip it.
+    const page = await this.cockpit.page(undefined, signal);
+    const index = checkpoint.id === null ? -1 : page.messages.findIndex(message => message.id === checkpoint.id);
+    requireThat(checkpoint.id === null ? !page.hasMore : index >= 0, 'CHECKPOINT_MIGRATION_REQUIRED');
+    const baseline = index >= 0 ? page.messages[index] : undefined;
+    if (checkpoint.fingerprint) verifyCheckpoint(checkpoint, baseline,
+      this.store.job(`session-output:${this.config.cockpit.sessionId}:${checkpoint.id}`));
+    const messages = page.messages.slice(index + 1);
+    const migrated = checkpoint.version === 2 || checkpoint.version === 3 ? checkpoint : {
       ...deliveryCheckpoint(baseline), ...(baseline?.role === 'user' ? { userMessageId: baseline.id } : {}),
-    }, messages };
+    };
+    if (!messages.length && page.position) {
+      return { checkpoint: { ...migrated, position: page.position }, messages, hasMore: false };
+    }
+    // A passive backward page cannot bootstrap a forward tail. Keep the verified
+    // anchor until normal input/resume provides one; never resume just to read.
+    return { checkpoint: migrated, messages, position: page.position, hasMore: false };
   }
 
   checkOutput(job, message, code) {
@@ -110,7 +136,7 @@ export class SessionBridge extends Bridge {
     if (queued) {
       if (queued.kind !== 'text') await this.processJob(queued, signal);
       else {
-        const meta = await this.cockpit.meta(signal);
+        const meta = this.deliveryMeta = await this.cockpit.meta(signal);
         this.ingressPaused = Boolean(meta.closing || meta.cancelling || meta.loading || meta.compacting);
         if (this.draining) return;
         const following = await this.followup.step(queued, meta, signal);
@@ -130,7 +156,7 @@ export class SessionBridge extends Bridge {
       if (notice) await this.processJob(notice, signal);
       return;
     }
-    const meta = await this.cockpit.meta(signal);
+    const meta = this.deliveryMeta = await this.cockpit.meta(signal);
     if (this.draining) return;
     if (meta.status === 'error' || meta.error) {
       const id = `session-error:${createHash('sha256')
@@ -146,8 +172,8 @@ export class SessionBridge extends Bridge {
     }
     // This HTTP API projects persisted SDK events, not live SSE deltas. Nonempty
     // root assistant bodies are complete messages, even while later work is running.
-    const { checkpoint, messages } = await this.readWindow(this.store.get('historyCheckpoint'), signal);
-    await this.cockpit.meta(signal);
+    const { checkpoint, messages, position, hasMore } = await this.readWindow(this.store.get('historyCheckpoint'), signal);
+    this.deliveryMeta = await this.cockpit.meta(signal);
     this.store.transaction(() => {
       for (const job of this.store.jobs().filter(item => item.status === 'accepted' && item.kind === 'text')) {
         const own = messages.filter(message => message.role === 'user' && message.content === (job.promptVisible ?? job.prompt));
@@ -155,34 +181,43 @@ export class SessionBridge extends Bridge {
         if (own.length === 1) {
           // Receipt of the input in native history, not completion of the model's work.
           job.userMessageId = own[0].id; job.status = 'done'; this.store.save(job);
-        } else if (quiescent(meta) && Date.now() - job.startedAt > this.config.limits.resultTimeoutMs) {
+        } else if (!hasMore && quiescent(meta) && Date.now() - job.startedAt > this.config.limits.resultTimeoutMs) {
           job.status = 'blocked'; job.reason = 'PROMPT_NOT_OBSERVED';
           this.store.save(job);
         }
       }
     });
     let nextCheckpoint = checkpoint;
+    let consumed = true;
+    this.deliveryMore ||= hasMore;
     for (const message of messages) {
+      if (message.role === 'system' && message.level === 'error' && meta.status !== 'error' && !meta.error) {
+        const id = `session-error:${this.config.cockpit.sessionId}:${message.id}`;
+        if (!this.store.job(id)) this.queueOutput(id,
+          `Cockpit 报告运行错误，请在网页查看：${sessionLink(this.config)}`, context, null, null);
+      }
       if (visible(message)) {
         const id = `session-output:${this.config.cockpit.sessionId}:${message.id}`;
         const existing = this.store.job(id);
         if (!existing) {
-          const runId = replyRunId(this.config, this.store, messages, message.id, checkpoint,
-            Boolean(this.config.statusDisplay?.tools && this.config.statusDisplay.toolFormat !== 'text'));
+          const runId = replyRunId(this.config, this.store, messages, message.id, checkpoint);
           this.queueOutput(id, message.content, context, message, nextCheckpoint, runId);
           this.deliveryMore = true;
+          consumed = false;
           break;
         }
         this.checkOutput(existing, message, existing.status === 'replying' ? 'FINAL_EVIDENCE_CHANGED' : 'DELIVERED_OUTPUT_CHANGED');
-        if (existing.status === 'replying') { this.deliveryMore = true; break; }
+        if (existing.status === 'replying') { this.deliveryMore = true; consumed = false; break; }
         requireThat(['done', 'abandoned'].includes(existing.status), 'UNRESOLVED_OUTPUT_STATE');
       }
       if (anchor(message)) nextCheckpoint = {
         ...deliveryCheckpoint(message),
+        ...(nextCheckpoint.position ? { position: nextCheckpoint.position } : {}),
         ...(message.role === 'user' ? { userMessageId: message.id }
           : nextCheckpoint.userMessageId ? { userMessageId: nextCheckpoint.userMessageId } : {}),
       };
     }
+    if (consumed && position) nextCheckpoint = { ...nextCheckpoint, position };
     this.store.set('historyCheckpoint', nextCheckpoint);
     const pending = this.store.jobs().find(job => job.status === 'replying');
     if (pending) await this.processJob(pending, signal);

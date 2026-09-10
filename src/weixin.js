@@ -4,7 +4,7 @@ import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { BridgeError, object, requireThat, sleep, text } from './common.js';
 import { DEFAULT_ORIGIN, validateApiOrigin } from './config.js';
-import { EMPTY_CONTROL_ACK, requestJson } from './http.js';
+import { requestJson } from './http.js';
 import { privateDirectory, writePrivate } from './storage.js';
 import { HttpDiagnostics } from './diagnostics.js';
 import { incomingQuoteItems, normalizeQuotes } from './quote.js';
@@ -42,8 +42,7 @@ export class WeixinClient {
     }
   }
   async call(endpoint, body, { token = this.credentials?.token, baseUrl = this.credentials?.baseUrl ?? DEFAULT_ORIGIN,
-    method = 'POST', timeoutMs = this.config.limits.requestTimeoutMs, signal, base = true, onResponseShape,
-    allowEmptyControlResponse = false } = {}) {
+    method = 'POST', timeoutMs = this.config.limits.requestTimeoutMs, signal, base = true, onResponseShape } = {}) {
     const origin = validateApiOrigin(baseUrl, this.config.weixin.approvedApiOrigins);
     const headers = { ...appHeaders };
     if (method === 'POST') {
@@ -57,7 +56,7 @@ export class WeixinClient {
     const requestId = this.diagnostics ? randomUUID() : undefined;
     return requestJson(new URL(endpoint, `${origin}/`), {
       method, headers, body: requestBody,
-      timeoutMs, signal, fetchImpl: this.fetchImpl, preserveMessageIds: true, onResponseShape, allowEmptyControlResponse,
+      timeoutMs, signal, fetchImpl: this.fetchImpl, preserveMessageIds: true, onResponseShape,
       onTraffic: this.diagnostics ? event =>
         this.diagnostics.record({ ...event, requestId, at: Date.now() }, requestBody) : undefined,
     });
@@ -77,7 +76,7 @@ export class WeixinClient {
   async send(peer, contextToken, value, clientId, signal, options) {
     return this.sendItems(peer, contextToken, [{ type: 1, text_item: { text: value } }], clientId, signal, options);
   }
-  async sendItems(peer, contextToken, items, clientId, signal, { runId, progress = false } = {}) {
+  async sendItems(peer, contextToken, items, clientId, signal, { runId } = {}) {
     requireThat(text(contextToken), 'CONTEXT_TOKEN_REQUIRED');
     privateDirectory(this.config.stateDir);
     const result = await this.call('ilink/bot/sendmessage', { msg: {
@@ -85,10 +84,9 @@ export class WeixinClient {
       context_token: contextToken, item_list: items,
       ...(runId ? { run_id: runId } : {}),
     } }, {
-      signal, allowEmptyControlResponse: progress && items.length > 0 && items.every(item => [11, 12].includes(item.type)),
+      signal,
       onResponseShape: shape =>
-      writePrivate(path.join(this.config.stateDir, progress ? 'last-progress-response.json' : 'last-send-response.json'), shape) });
-    if (result === EMPTY_CONTROL_ACK) return { acceptance: 'transport-only' };
+      writePrivate(path.join(this.config.stateDir, 'last-send-response.json'), shape) });
     sendSuccess(result);
     return { acceptance: 'confirmed',
       ...(result.message_id === undefined ? {} : { messageId: String(result.message_id) }) };

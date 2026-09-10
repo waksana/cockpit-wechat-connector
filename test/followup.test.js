@@ -31,9 +31,54 @@ test('default remains enqueue and enabling requires session mode', async t => {
 
 test('idle hands off immediately, without a silence timer or an interrupt', async t => {
   const f = await setup(t);
+  assert.equal(Object.hasOwn(await f.cockpit.meta(), 'error'), false);
   await f.bridge.receive(); await f.bridge.step();
   assert.equal(f.prompts.length, 1);
   assert.equal(f.interrupts().length, 0);
+});
+
+test('fresh input into an unloaded target uses native enqueue without claiming an empty queue', async t => {
+  const queue = [{ id: 'hidden-old-input', text: 'Existing native work' }];
+  const f = await setup(t, { loaded: false, status: 'unloaded', queue });
+  assert.equal((await f.cockpit.meta()).queue, undefined);
+  await f.bridge.receive(); await f.bridge.step();
+  assert.equal(f.prompts.length, 1);
+  assert.equal(f.prompts[0].mode, 'enqueue');
+  assert.equal(f.interrupts().length, 0);
+  assert.deepEqual(f.state.queue, queue);
+  assert.equal(f.store.get('nativeFollowup'), null);
+});
+
+test('an acknowledged interrupt cannot hand off using unknown unloaded queue/error', async t => {
+  const f = await setup(t, { status: 'running' });
+  await f.bridge.receive(); await f.bridge.step();
+  assert.equal(f.interrupts().length, 1);
+  f.state.loaded = false; f.state.status = 'unloaded';
+  await f.bridge.step(); await f.bridge.step();
+  assert.equal(f.prompts.length, 0);
+  assert.equal(f.interrupts().length, 1);
+  assert.equal(f.store.get('nativeFollowup').phase, 'draining');
+  f.state.loaded = true; f.state.status = 'idle';
+  assert.equal(Object.hasOwn(await f.cockpit.meta(), 'error'), false);
+  await f.bridge.step();
+  assert.equal(f.prompts.length, 1);
+  assert.equal(f.interrupts().length, 1);
+});
+
+test('loaded interrupt drain completes with absent error only after current controls are idle', async t => {
+  const f = await setup(t, { status: 'running' });
+  assert.equal(Object.hasOwn(await f.cockpit.meta(), 'error'), false);
+  await f.bridge.receive(); await f.bridge.step();
+  assert.equal(f.interrupts().length, 1);
+  assert.equal(f.prompts.length, 0);
+  f.state.status = 'idle'; f.state.activeOperations = 1;
+  await f.bridge.step();
+  assert.equal(f.prompts.length, 0);
+  f.state.activeOperations = 0;
+  await f.bridge.step();
+  assert.equal(f.prompts.length, 1);
+  assert.equal(f.store.get('nativeFollowup'), null);
+  assert.equal(f.interrupts().length, 1);
 });
 
 test('interrupt before send; merge same-poll and during-drain text/quotes once in order', async t => {

@@ -138,17 +138,12 @@ export class Store {
   }
   summary() {
     const display = this.get('statusDisplay');
-    const phases = Object.values(display?.tools ?? {}).flatMap(tool => [tool.start, tool.end, tool.snapshot]).filter(Boolean);
     return {
       cursorSaved: Boolean(this.get('cursor')),
       bindingSaved: Boolean(this.get('binding')),
       nativeFollowup: this.get('nativeFollowup'),
       statusDisplay: display ? {
         typingMayBeActive: Boolean(display.typingMayBeActive),
-        toolProgressAccepted: phases.filter(phase => phase.status === 'accepted').length,
-        toolProgressSubmitted: phases.filter(phase => phase.status === 'submitted').length,
-        toolProgressUnknown: phases.filter(phase => phase.status === 'unknown').length,
-        toolsPaused: Boolean(display.pausedContext), lastToolError: display.lastToolError ?? null,
       } : null,
       jobs: this.jobs().map(job => ({
         id: job.id, marker: job.marker, status: job.status, reason: job.reason,

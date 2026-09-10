@@ -1,7 +1,5 @@
 import { BridgeError, object, requireThat } from './common.js';
 
-export const EMPTY_CONTROL_ACK = Symbol('empty-control-http-ack');
-
 function valueType(value) {
   return value === null ? 'null' : Array.isArray(value) ? 'array' : typeof value;
 }
@@ -36,8 +34,7 @@ function responseShape(value) {
 }
 
 export async function requestJson(url, { method = 'POST', body, rawBody, headers = {}, timeoutMs = 15000,
-  signal, fetchImpl = fetch, preserveMessageIds = false, onResponseShape, onTraffic,
-  allowEmptyControlResponse = false } = {}) {
+  signal, fetchImpl = fetch, preserveMessageIds = false, onResponseShape, onTraffic } = {}) {
   const timeout = AbortSignal.timeout(timeoutMs);
   const combined = signal ? AbortSignal.any([signal, timeout]) : timeout;
   let shape = { version: 1, httpStatus: null, bodyType: 'unread' };
@@ -83,10 +80,6 @@ export async function requestJson(url, { method = 'POST', body, rawBody, headers
       responseBody = ''; capture = 'complete';
       shape.bodyType = 'empty';
       if (onResponseShape) shape.bodyBytes = 0;
-      if (allowEmptyControlResponse && response.status === 200
-        && response.headers.get('content-type')?.split(';', 1)[0]?.trim().toLowerCase() === 'application/octet-stream') {
-        outcome = 'empty-control-ack'; return EMPTY_CONTROL_ACK;
-      }
       throw new BridgeError('INVALID_JSON_RESPONSE');
     }
     const reader = response.body.getReader();
@@ -102,11 +95,6 @@ export async function requestJson(url, { method = 'POST', body, rawBody, headers
     let parsed;
     responseBody = Buffer.concat(chunks).toString('utf8'); capture = 'complete';
     if (onResponseShape) shape.bodyBytes = size;
-    if (size === 0 && allowEmptyControlResponse && response.status === 200
-      && response.headers.get('content-type')?.split(';', 1)[0]?.trim().toLowerCase() === 'application/octet-stream') {
-      shape.bodyType = 'empty';
-      outcome = 'empty-control-ack'; return EMPTY_CONTROL_ACK;
-    }
     try {
       parsed = JSON.parse(responseBody, preserveMessageIds
         ? (key, value, context) => {
