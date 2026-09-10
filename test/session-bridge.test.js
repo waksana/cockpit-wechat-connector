@@ -231,11 +231,36 @@ for (const count of [2, 300]) {
     assert.equal(f.prompts.length, 0);
     assert.equal(f.sent.length, 0);
     const reads = f.requests.slice(before).filter(row => row.url === '/intent/session/chat');
-    assert.equal(reads.length, 3);
+    assert.equal(reads.length, 4);
     assert.ok(reads.every(row => row.data.source === 'persisted' && row.data.direction === 'backward'
       && row.data.max === 256 && row.data.bootstrap === false && row.data.cursor === undefined));
     assert.ok(f.requests.slice(before).every(row => ['/intent/session/get', '/intent/session/chat'].includes(row.url)));
   });
+}
+
+for (const version of [2, 3]) {
+  for (const change of ['body', 'outside-window']) {
+    test(`runner validates cold v${version} ${change} checkpoint before submitting queued input`, async t => {
+      const f = await coldCheckpoint(t, 300);
+      const checkpoint = deliveryCheckpoint(f.state.messages.at(-1), version);
+      f.store.set('historyCheckpoint', checkpoint);
+      if (change === 'body') f.state.messages.at(-1).content = 'Changed checkpoint body';
+      else f.state.messages.push(...Array.from({ length: 300 }, (_, index) => ({
+        id: `later-${index}`, role: 'assistant', content: `Later message ${index}`,
+      })));
+      f.state.batch = [incoming({ message_id: 44 })];
+      await f.bridge.receive();
+      const jobs = f.store.jobs();
+      await assert.rejects(f.bridge.run(new AbortController().signal), {
+        code: change === 'body' ? 'CHECKPOINT_CHANGED' : 'CHECKPOINT_MIGRATION_REQUIRED',
+      });
+      assert.deepEqual(f.store.get('historyCheckpoint'), checkpoint);
+      assert.deepEqual(f.store.jobs(), jobs);
+      assert.equal(f.prompts.length, 0);
+      assert.equal(f.sent.length, 0);
+      assert.equal(f.state.loaded, false);
+    });
+  }
 }
 
 test('cold passive migration delivers unseen bodies in order without replay or a fabricated forward cursor', async t => {

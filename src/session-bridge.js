@@ -19,7 +19,7 @@ export class SessionBridge extends Bridge {
   prepareIngress(jobs, freshPoll) { this.followup.tag(jobs, freshPoll); }
   async establishCheckpoint(signal, explicit = false) {
     const checkpoint = this.store.get('historyCheckpoint');
-    if (!explicit && checkpoint?.fingerprint && !checkpoint.position && checkpoint.version === undefined) {
+    if (!explicit && checkpoint?.fingerprint && !checkpoint.position) {
       await this.readWindow(checkpoint, signal);
     }
     return super.establishCheckpoint(signal, explicit);
