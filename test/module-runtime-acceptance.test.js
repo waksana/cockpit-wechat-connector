@@ -167,6 +167,26 @@ test('committed WeChat archive runs its real service entry, attests identity, an
   const health = await localRequest(serviceOrigin, manifest.service.healthPath);
   assert.equal(health.status, 200);
   assert.deepEqual(health.body, { ...identity, running: true, ok: true, phase: 'running' });
+  const boundState = readPrivate(path.join(raw.lockDir, 'module-binding.json'));
+  const databaseFiles = ['', '-wal', '-shm'].map(suffix => path.join(boundState.active.stateDir, `bridge.sqlite${suffix}`));
+  const beforeProof = databaseFiles.map(file => fs.existsSync(file) ? sha256(file) : null);
+  const requestsBeforeProof = requests.length;
+  const reader = childResult(spawn(process.execPath,
+    [path.join(release, 'src/module-control.js'), '--config', configFile],
+    { cwd: release, env, stdio: ['pipe', 'pipe', 'pipe'] }));
+  reader.child.stdin.end(JSON.stringify({ operation: 'status' }));
+  const proofResult = await reader.exit;
+  assert.equal(proofResult.code, 0, proofResult.stdout + proofResult.stderr);
+  const bindingProof = JSON.parse(proofResult.stdout).status;
+  assert.equal(bindingProof.bindingConfirmed, true);
+  assert.equal(bindingProof.boundSessionId, sessionId);
+  assert.equal(bindingProof.revision, boundState.revision);
+  assert.equal(bindingProof.reason, 'RUNNING');
+  assert.equal(bindingProof.detailsAvailable, false);
+  assert.equal(bindingProof.pendingJobs, null);
+  assert.equal(bindingProof.unknownJobs, null);
+  assert.equal(requests.length, requestsBeforeProof);
+  assert.deepEqual(databaseFiles.map(file => fs.existsSync(file) ? sha256(file) : null), beforeProof);
   const drain = await localRequest(serviceOrigin, manifest.service.drainPath, { pending: true });
   assert.equal(drain.status, 200);
   assert.deepEqual(drain.body, { ...identity, drainProtocol: 1, running: true,
@@ -196,7 +216,7 @@ test('committed WeChat archive runs its real service entry, attests identity, an
     || ['/intent/session/get', '/intent/session/chat', '/weixin/ilink/bot/getupdates'].includes(event.path)));
   const report = { commit, archiveSha256: digest, entrySha256: cliHash, serviceEntry: manifest.service,
     config: raw, launchEnvironment: { ...env, ...moduleEnv }, argv, identity,
-    health, drain, exit: stopped, network, pollAborted, retainedBinding: sessionId,
+    health, bindingProof, drain, exit: stopped, network, pollAborted, retainedBinding: sessionId,
     jobs: 0, cursorSaved: false, credentialFilesUnchanged: true,
     digestAuthority: 'SHA-256 of the fixed-commit fixture archive, not a Cockpit catalog attestation',
     limits: 'Test-only transport redirects the real runner to synthetic loopback providers; no live account/token/native SDK acceptance.' };

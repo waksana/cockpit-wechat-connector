@@ -1,6 +1,6 @@
 # Official WeChat module (opt-in, offline control)
 
-`module.json` is schema/config version 1, module/package version 0.1.2, Linux x64,
+`module.json` is schema/config version 1, module/package version 0.1.3, Linux x64,
 Node 24, Cockpit API 1. Its sole role `wechat` provides binding only: no injected
 instructions, skills or MCP. The existing lifecycle service remains
 `node src/cli.js run`: `/health`, `/version`, `/admin/restart`. It requires one
@@ -15,7 +15,7 @@ runtime startup is separately authorized:
 ```text
 node src/cli.js run --config /absolute/private/module-config.json
 COCKPIT_MODULE_ID=wechat
-COCKPIT_MODULE_VERSION=0.1.2
+COCKPIT_MODULE_VERSION=0.1.3
 COCKPIT_MODULE_DIGEST=<64 lowercase hexadecimal catalog digest>
 COCKPIT_MODULE_INSTANCE=<canonical lowercase UUID for this process>
 COCKPIT_MODULE_PORT=<loopback port, integer 1..65535>
@@ -38,7 +38,7 @@ identity validation and all its response shapes remain unchanged.
 Module `/version`:
 
 ```json
-{"moduleApi":1,"moduleId":"wechat","moduleDigest":"<digest64>","instanceId":"<uuid>","version":"0.1.2","moduleVersion":"0.1.2"}
+{"moduleApi":1,"moduleId":"wechat","moduleDigest":"<digest64>","instanceId":"<uuid>","version":"0.1.3","moduleVersion":"0.1.3"}
 ```
 
 `moduleVersion` aliases the already validated actual `version`; both are retained.
@@ -138,9 +138,39 @@ but token validity is only evaluated by the native server.
 In 0.1.2 and later, detailed status prioritizes `PERSISTED_BINDING_CHANGED`
 over business blockers such as `PENDING_JOBS` and `UNKNOWN_OUTCOMES`. Counts
 remain unchanged; a job blocker no longer hides a detected session/cwd
-mismatch. Partial running/WAL snapshots still do not inspect the historical
+mismatch. In 0.1.2, partial running/WAL snapshots do not inspect the historical
 Store binding: their control ID/revision is not a claim of Store consistency.
-No field, mutation fence or recovery behavior changes.
+Mutation fences and recovery behavior are unchanged.
+
+Starting in 0.1.3, `bindingConfirmed` requires the current managed configuration
+authority, one active routing identity, its unique successful bind receipt at
+the current revision, known runner/control state, and an exactly matching
+persisted Store `binding` (account, peer and all Cockpit configuration fields).
+The routing record is reread after inspection. Pending control operations,
+duplicate active/archive identity, changed or missing bindings, and unknown
+runner/control state cannot produce true. Invalid private control/configuration
+records still fail explicitly.
+
+Business blockers and unknown/null job counts do not negate a valid identity
+proof. For live runners or nonempty WAL, only the binding is queried from an
+owner-private temporary copy of the main database and WAL, at most 128 MiB
+combined. Source inode/size/mtime/ctime must remain unchanged across the copy
+and query. SQLite never opens the original live database, WAL or SHM for this
+proof; the temporary directory is removed in `finally`. A nonempty rollback
+journal, exceeded bound, changing snapshot or unreadable binding cannot be
+confirmed. Detailed job diagnostics remain null and no recovery/checkpoint or
+business mutation runs. This is a point-in-time identity proof, not a promise
+that state cannot change afterward.
+
+A fresh bind can succeed before the runner creates its Store. Until a matching
+Store binding exists, `bindingConfirmed` is false, including an empty/deleted
+Store or a missing binding row. The exact successful bind response authorizes
+first initialization; it must not be replaced by a fake Store proof. Subsequent
+cold/same-binding apply requires the existing identity proof. Consumers must
+also compare the original session/revision and require managed/config/credential
+readiness. An explicit false cannot fall back to `RUNNING`/`ALREADY_BOUND`.
+The flag grants no permission to start, send, unbind, rebind or bypass their
+existing fences; it does not validate all historical jobs or checkpoints.
 
 Status success:
 
@@ -156,6 +186,7 @@ Status success:
     "running": false,
     "runnerUnknown": false,
     "unknownOperation": false,
+    "bindingConfirmed": false,
     "pendingJobs": 0,
     "unknownJobs": 0,
     "revision": 0,

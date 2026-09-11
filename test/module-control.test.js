@@ -27,6 +27,7 @@ const unbind = (operationId = 'unbind-first', sessionId = 'session-one') => ({
 const sessionUnbind = (operationId = 'session-unbind-first', sessionId = 'session-one') => ({
   operation: 'session-unbind', operationId, sessionId,
 });
+const storedBinding = config => ({ account: config.weixin.allowedAccount, peer: config.weixin.allowedPeer, ...config.cockpit });
 
 async function fixture(t) {
   const dir = path.join(root, `.module-test-${randomUUID()}`);
@@ -140,6 +141,7 @@ test('offline status, unique binding, durable idempotent receipts and exact nati
   const before = await control(f.file, { operation: 'status' });
   assert.equal(before.status.available, true);
   assert.equal(before.status.boundSessionId, null);
+  assert.equal(before.status.bindingConfirmed, false);
   assert.equal(f.requests.length, 0);
   assert.equal(fs.existsSync(f.raw.stateDir), false);
   const bound = await control(f.file, bind());
@@ -153,6 +155,7 @@ test('offline status, unique binding, durable idempotent receipts and exact nati
   const unavailable = await control(f.file, { operation: 'status' });
   assert.equal(unavailable.status.reason, 'ALREADY_BOUND');
   assert.equal(unavailable.status.available, false);
+  assert.equal(unavailable.status.bindingConfirmed, false, 'a successful fresh bind has not yet initialized a Store');
   const other = await control(f.file, bind('bind-another', 'session-two'));
   assert.equal(other.error.code, 'ALREADY_BOUND');
   await assert.rejects(control(f.file, bind('bind-first', 'session-two')), { code: 'OPERATION_ID_CONFLICT' });
@@ -187,6 +190,7 @@ test('binding inconsistency takes precedence over business blockers without chan
       assert.equal(response.code, 0, response.stdout);
       const { status } = JSON.parse(response.stdout);
       assert.equal(status.reason, 'PERSISTED_BINDING_CHANGED');
+      assert.equal(status.bindingConfirmed, false);
       assert.equal(status.available, false);
       assert.equal(status.boundSessionId, 'session-one');
       assert.equal(status.revision, 1);
@@ -215,7 +219,7 @@ test('parallel offline status creates no control state and never competes for mu
   await control(f.file, bind());
   const config = loadConfig(f.file);
   const store = new Store(config.stateDir);
-  store.set('binding', { sessionId: 'session-one', cwd: '/fixture/workspace' });
+  store.set('binding', storedBinding(config));
   store.set('historyCheckpoint', { id: 'retained' });
   store.close();
   const before = fileSnapshot(f.dir);
@@ -228,8 +232,40 @@ test('parallel offline status creates no control state and never competes for mu
     const status = index % 2 ? parsed.status : parsed;
     assert.equal(status.boundSessionId, 'session-one');
     assert.equal(status.reason, 'ALREADY_BOUND');
+    assert.equal(status.bindingConfirmed, true);
   }
   assert.deepEqual(fileSnapshot(f.dir), before);
+  assert.equal(f.requests.length, 1);
+});
+
+test('binding confirmation distinguishes a live known runner, stale runner and explicitly unbound control', async t => {
+  const f = await fixture(t);
+  await control(f.file, bind());
+  const config = loadConfig(f.file);
+  const store = new Store(config.stateDir);
+  store.set('binding', storedBinding(config));
+  const runner = new RunLock(config.lockDir);
+  try {
+    const before = fileSnapshot(f.dir);
+    const { status } = await control(f.file, { operation: 'status' });
+    assert.equal(status.reason, 'RUNNING');
+    assert.equal(status.running, true);
+    assert.equal(status.bindingConfirmed, true);
+    assert.equal(status.detailsAvailable, false);
+    assert.equal(status.pendingJobs, null);
+    assert.deepEqual(fileSnapshot(f.dir), before);
+  } finally { runner.release(); store.close(); }
+  const lockFile = path.join(config.lockDir, 'run.lock');
+  writePrivate(lockFile, { pid: 2147483647, nonce: 'fixture-stale-runner' });
+  const before = fileSnapshot(f.dir);
+  const stale = await control(f.file, { operation: 'status' });
+  assert.equal(stale.status.reason, 'RUNNER_STATE_UNKNOWN');
+  assert.equal(stale.status.bindingConfirmed, false);
+  assert.equal(stale.status.boundSessionId, 'session-one');
+  assert.deepEqual(fileSnapshot(f.dir), before);
+  fs.unlinkSync(lockFile);
+  assert.equal((await control(f.file, unbind())).ok, true);
+  assert.equal((await control(f.file, { operation: 'status' })).status.bindingConfirmed, false);
   assert.equal(f.requests.length, 1);
 });
 
@@ -246,7 +282,7 @@ test('read-only status preserves authoritative binding while another operation o
       assert.deepEqual(JSON.parse(result.stdout).status, {
         available: false, reason: 'MODULE_CONTROL_BUSY', boundSessionId: 'session-one',
         credentialsPresent: true, configReady: true, running: null, runnerUnknown: true,
-        unknownOperation: false, pendingJobs: null, unknownJobs: null, revision: 1,
+        unknownOperation: false, bindingConfirmed: false, pendingJobs: null, unknownJobs: null, revision: 1,
         managed: true, detailsAvailable: false,
       });
     }
@@ -261,7 +297,7 @@ test('read-only status never ignores or checkpoints an unconsumed WAL, and keeps
   await control(f.file, bind());
   const config = loadConfig(f.file);
   const store = new Store(config.stateDir);
-  store.set('binding', { sessionId: 'session-one', cwd: '/fixture/workspace' });
+  store.set('binding', storedBinding(config));
   store.db.prepare('INSERT INTO jobs VALUES (?,?,?)').run('unknown', 1,
     JSON.stringify({ id: 'unknown', status: 'prompting' }));
   try {
@@ -273,6 +309,7 @@ test('read-only status never ignores or checkpoints an unconsumed WAL, and keeps
       const { status } = JSON.parse(result.stdout);
       assert.equal(status.boundSessionId, 'session-one');
       assert.equal(status.reason, 'STATE_SNAPSHOT_UNAVAILABLE');
+      assert.equal(status.bindingConfirmed, true);
       assert.equal(status.available, false);
       assert.equal(status.detailsAvailable, false);
       assert.equal(status.unknownJobs, null);
@@ -282,8 +319,127 @@ test('read-only status never ignores or checkpoints an unconsumed WAL, and keeps
   } finally { store.close(); }
   const status = JSON.parse((await wire(f.file, { operation: 'status' })).stdout).status;
   assert.equal(status.reason, 'UNKNOWN_OUTCOMES');
+  assert.equal(status.bindingConfirmed, true);
   assert.equal(status.unknownJobs, 1);
   assert.equal(f.requests.length, 1);
+});
+
+test('binding proof sees committed WAL identity changes independently of business counts without source writes', async t => {
+  const f = await fixture(t);
+  await control(f.file, bind());
+  const config = loadConfig(f.file), store = new Store(config.stateDir);
+  const expected = storedBinding(config);
+  store.set('binding', expected);
+  store.db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
+  store.db.prepare('INSERT INTO jobs VALUES (?,?,?)').run('fixture-pending', 1,
+    JSON.stringify({ id: 'fixture-pending', status: 'prompting' }));
+  try {
+    for (const running of [false, true]) {
+      const runner = running ? new RunLock(config.lockDir) : null;
+      try {
+        for (const changed of [
+          { sessionId: 'other-session' }, { cwd: '/other-workspace' }, { account: 'other-account' },
+          { peer: 'other-peer' }, { apiUrl: 'http://127.0.0.1:1' }, { tokenFile: '/other/credential-reference' },
+        ]) {
+          store.set('binding', { ...expected, ...changed });
+          const before = fileSnapshot(f.dir);
+          const response = await wire(f.file, { operation: 'status' });
+          assert.equal(response.code, 0, response.stdout);
+          const { status } = JSON.parse(response.stdout);
+          assert.equal(status.reason, running ? 'RUNNING' : 'STATE_SNAPSHOT_UNAVAILABLE');
+          assert.equal(status.bindingConfirmed, false);
+          assert.equal(status.boundSessionId, 'session-one');
+          assert.equal(status.revision, 1);
+          assert.equal(status.pendingJobs, null);
+          assert.equal(status.unknownJobs, null);
+          assert.deepEqual(fileSnapshot(f.dir), before);
+        }
+        store.set('binding', expected);
+        const before = fileSnapshot(f.dir);
+        assert.equal((await control(f.file, { operation: 'status' })).status.bindingConfirmed, true);
+        assert.deepEqual(fileSnapshot(f.dir), before);
+        store.db.prepare('DELETE FROM kv WHERE key=?').run('binding');
+        assert.equal((await control(f.file, { operation: 'status' })).status.bindingConfirmed, false);
+      } finally { runner?.release(); }
+    }
+    assert.equal(store.job('fixture-pending').status, 'prompting');
+  } finally { store.close(); }
+  assert.equal(f.requests.length, 1, 'identity status never performs another native or WeChat request');
+});
+
+test('confirmed identity cannot be borrowed from missing Stores, mismatched authority or ambiguous control receipts', async t => {
+  const f = await fixture(t);
+  await control(f.file, bind());
+  const config = loadConfig(f.file);
+  assert.equal(moduleStatus(config).bindingConfirmed, false);
+  const store = new Store(config.stateDir);
+  store.set('binding', storedBinding(config));
+  store.close();
+  assert.equal(moduleStatus(config).bindingConfirmed, true);
+  const original = readControl(config);
+  for (const mutate of [
+    state => { state.revision++; },
+    state => { state.operations['bind-first'].request.cwd = '/other'; },
+    state => { state.operations['bind-first'].result.boundSessionId = 'other'; },
+    state => {
+      state.operations['duplicate-bind'] = structuredClone(state.operations['bind-first']);
+      state.operations['duplicate-bind'].request.operationId = 'duplicate-bind';
+      state.operations['duplicate-bind'].result.operationId = 'duplicate-bind';
+    },
+    state => { state.history.push(structuredClone(state.active)); },
+  ]) {
+    const state = structuredClone(original);
+    mutate(state);
+    writePrivate(controlFile(config), state);
+    const before = fileSnapshot(f.dir);
+    assert.equal(moduleStatus(config).bindingConfirmed, false);
+    assert.deepEqual(fileSnapshot(f.dir), before);
+  }
+  writePrivate(controlFile(config), original);
+  writePrivate(f.file, { ...f.raw, limits: { ...f.raw.limits, statusIntervalMs: 25 } });
+  assert.equal(moduleStatus(config).bindingConfirmed, false, 'stale loaded config cannot prove the current file authority');
+  writePrivate(f.file, f.raw);
+  fs.unlinkSync(path.join(config.stateDir, 'bridge.sqlite'));
+  assert.equal(moduleStatus(config).bindingConfirmed, false, 'deleted Store cannot fall back to the control record');
+  assert.equal(f.requests.length, 1);
+});
+
+test('binding snapshot rejects racing or oversized sources and always removes its private temporary copy', async t => {
+  const f = await fixture(t);
+  await control(f.file, bind());
+  const config = loadConfig(f.file), store = new Store(config.stateDir);
+  store.set('binding', storedBinding(config));
+  const runner = new RunLock(config.lockDir);
+  const main = path.join(config.stateDir, 'bridge.sqlite'), copies = [];
+  const makeTemp = fs.mkdtempSync, read = fs.readSync;
+  const tempMock = t.mock.method(fs, 'mkdtempSync', (...args) => {
+    const directory = makeTemp(...args);
+    copies.push(directory);
+    assert.equal(fs.statSync(directory).mode & 0o777, 0o700);
+    return directory;
+  });
+  let changed = false;
+  const readMock = t.mock.method(fs, 'readSync', (fd, ...args) => {
+    const bytes = read(fd, ...args);
+    if (!changed && fs.fstatSync(fd).ino === fs.statSync(main).ino) {
+      changed = true;
+      store.set('binding', { ...storedBinding(config), sessionId: 'changed-during-copy' });
+    }
+    return bytes;
+  });
+  try {
+    try {
+      assert.equal(moduleStatus(config).bindingConfirmed, false);
+      assert.equal(changed, true);
+      assert.equal(copies.length, 1);
+      assert.ok(copies.every(directory => !fs.existsSync(directory)));
+    } finally {
+      readMock.mock.restore(); tempMock.mock.restore(); store.close();
+    }
+    fs.truncateSync(main, 128 * 1024 * 1024 + 1);
+    assert.equal(moduleStatus(config).bindingConfirmed, false);
+    assert.equal(fs.statSync(main).size, 128 * 1024 * 1024 + 1);
+  } finally { runner.release(); }
 });
 
 test('parallel status cannot interfere with unique bind native validation or persist partial routing', async t => {
@@ -698,7 +854,7 @@ test('status never recovers old jobs, and unbind refuses every unresolved work c
   const config = loadConfig(f.file);
   const store = new Store(config.stateDir);
   t.after(() => store.close());
-  store.set('binding', { sessionId: config.cockpit.sessionId, cwd: config.cockpit.cwd });
+  store.set('binding', storedBinding(config));
   const cases = [
     [{ id: 'pending', status: 'queued' }, 'PENDING_JOBS'],
     [{ id: 'prompt', status: 'prompting' }, 'UNKNOWN_OUTCOMES'],
@@ -711,6 +867,7 @@ test('status never recovers old jobs, and unbind refuses every unresolved work c
     store.db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
     const status = await control(f.file, { operation: 'status' });
     assert.equal(status.status.reason, reason);
+    assert.equal(status.status.bindingConfirmed, true);
     const result = await control(f.file, unbind(`unbind-${job.id}`));
     assert.equal(result.error.code, reason);
     assert.deepEqual(store.job(job.id), before);
@@ -824,6 +981,7 @@ test('unknown operation fences mutations and stale locks require explicit operat
   writePrivate(controlFile(config), state);
   const status = await control(f.file, { operation: 'status' });
   assert.equal(status.status.reason, 'OPERATION_OUTCOME_UNKNOWN');
+  assert.equal(status.status.bindingConfirmed, false);
   await assert.rejects(control(f.file, unbind('uncertain-operation')), { code: 'OPERATION_OUTCOME_UNKNOWN' });
   await assert.rejects(control(f.file, unbind()), { code: 'OPERATION_OUTCOME_UNKNOWN' });
   const refused = await cli(f.file, ['run']).done;
@@ -832,6 +990,7 @@ test('unknown operation fences mutations and stale locks require explicit operat
   const runner = new RunLock(config.lockDir, { drain: true });
   try {
     assert.equal((await control(f.file, { operation: 'status' })).status.running, true);
+    assert.equal((await control(f.file, { operation: 'status' })).status.bindingConfirmed, false);
     assert.equal((await cli(f.file, ['unlock', '--confirm']).done).code, 2);
   } finally { runner.release(); }
 });
@@ -921,6 +1080,7 @@ test('legacy status exposes existing target without creating a database, lock or
   const result = await control(f.file, { operation: 'status' });
   assert.equal(result.status.reason, 'ALREADY_BOUND');
   assert.equal(result.status.boundSessionId, 'legacy-session');
+  assert.equal(result.status.bindingConfirmed, false);
   assert.deepEqual(fs.readdirSync(f.dir), before);
   await assert.rejects(control(f.file, unbind()), { code: 'LEGACY_ADOPTION_REQUIRED' });
   assert.equal(f.requests.length, 0);
@@ -1020,7 +1180,10 @@ test('real managed CLI runner shares stable lock with offline mutations, status,
     { ...version, running: true, ok: true, phase: 'running' });
   assert.ok(readPrivate(path.join(config.lockDir, 'run.lock')));
   assert.equal(fs.existsSync(path.join(config.stateDir, 'run.lock')), false);
-  assert.equal((await control(f.file, { operation: 'status' })).status.running, true);
+  const runningStatus = (await control(f.file, { operation: 'status' })).status;
+  assert.equal(runningStatus.running, true);
+  assert.equal(runningStatus.bindingConfirmed, true);
+  assert.equal(runningStatus.detailsAvailable, false);
   assert.equal(JSON.parse((await cli(f.file).done).stdout).running, true);
   await assert.rejects(control(f.file, unbind()), { code: 'RUNNING' });
   assert.equal((await cli(f.file, ['run']).done).code, 2);
