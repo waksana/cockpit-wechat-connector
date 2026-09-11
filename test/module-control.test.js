@@ -4,11 +4,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import http from 'node:http';
 import net from 'node:net';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { setTimeout as delay } from 'node:timers/promises';
-import { control } from '../src/module-control.js';
+import { control, moduleStatus } from '../src/module-control.js';
 import { CockpitClient } from '../src/cockpit.js';
 import { loadConfig, validateConfig } from '../src/config.js';
 import { acquireModuleGate, assertCurrentConfig, controlFile, readControl } from '../src/module-state.js';
@@ -99,6 +99,21 @@ function wire(file, request) {
   return result.done;
 }
 
+function fileSnapshot(dir) {
+  const files = {};
+  const visit = current => {
+    for (const name of fs.readdirSync(current).sort()) {
+      const file = path.join(current, name);
+      const stat = fs.lstatSync(file);
+      files[path.relative(dir, file)] = { mode: stat.mode,
+        digest: stat.isDirectory() ? null : createHash('sha256').update(fs.readFileSync(file)).digest('hex') };
+      if (stat.isDirectory()) visit(file);
+    }
+  };
+  visit(dir);
+  return files;
+}
+
 test('official manifest, validated paths and unchanged legacy defaults', () => {
   const manifest = JSON.parse(fs.readFileSync(path.join(root, 'module.json')));
   const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json')));
@@ -148,6 +163,244 @@ test('offline status, unique binding, durable idempotent receipts and exact nati
   assert.equal(failed.error.code, 'TARGET_CWD_CHANGED');
   assert.equal((await control(f.file, { operation: 'status' })).status.boundSessionId, null);
 });
+
+test('parallel offline status creates no control state and never competes for mutation locks', async t => {
+  const f = await fixture(t);
+  const initial = fileSnapshot(f.dir);
+  const fresh = await Promise.all(Array.from({ length: 12 }, () => wire(f.file, { operation: 'status' })));
+  for (const result of fresh) {
+    assert.equal(result.code, 0, result.stdout);
+    const { status } = JSON.parse(result.stdout);
+    assert.equal(status.available, true);
+    assert.equal(status.boundSessionId, null);
+  }
+  assert.deepEqual(fileSnapshot(f.dir), initial);
+  assert.equal(f.requests.length, 0);
+  await control(f.file, bind());
+  const config = loadConfig(f.file);
+  const store = new Store(config.stateDir);
+  store.set('binding', { sessionId: 'session-one', cwd: '/fixture/workspace' });
+  store.set('historyCheckpoint', { id: 'retained' });
+  store.close();
+  const before = fileSnapshot(f.dir);
+  const bound = await Promise.all(Array.from({ length: 16 }, (_, index) =>
+    index % 2 ? wire(f.file, { operation: 'status' }) : cli(f.file).done));
+  for (let index = 0; index < bound.length; index++) {
+    const result = bound[index];
+    assert.equal(result.code, 0, result.stdout);
+    const parsed = JSON.parse(result.stdout);
+    const status = index % 2 ? parsed.status : parsed;
+    assert.equal(status.boundSessionId, 'session-one');
+    assert.equal(status.reason, 'ALREADY_BOUND');
+  }
+  assert.deepEqual(fileSnapshot(f.dir), before);
+  assert.equal(f.requests.length, 1);
+});
+
+test('read-only status preserves authoritative binding while another operation owns the gate', async t => {
+  const f = await fixture(t);
+  await control(f.file, bind());
+  const config = loadConfig(f.file);
+  const gate = acquireModuleGate(config);
+  try {
+    const before = fileSnapshot(f.dir);
+    const results = await Promise.all(Array.from({ length: 8 }, () => wire(f.file, { operation: 'status' })));
+    for (const result of results) {
+      assert.equal(result.code, 0, result.stdout);
+      assert.deepEqual(JSON.parse(result.stdout).status, {
+        available: false, reason: 'MODULE_CONTROL_BUSY', boundSessionId: 'session-one',
+        credentialsPresent: true, configReady: true, running: null, runnerUnknown: true,
+        unknownOperation: false, pendingJobs: null, unknownJobs: null, revision: 1,
+        managed: true, detailsAvailable: false,
+      });
+    }
+    assert.equal(JSON.parse((await cli(f.file).done).stdout).boundSessionId, 'session-one');
+    assert.deepEqual(fileSnapshot(f.dir), before);
+  } finally { gate.release(); }
+  assert.equal(f.requests.length, 1);
+});
+
+test('read-only status never ignores or checkpoints an unconsumed WAL, and keeps trusted target identity', async t => {
+  const f = await fixture(t);
+  await control(f.file, bind());
+  const config = loadConfig(f.file);
+  const store = new Store(config.stateDir);
+  store.set('binding', { sessionId: 'session-one', cwd: '/fixture/workspace' });
+  store.db.prepare('INSERT INTO jobs VALUES (?,?,?)').run('unknown', 1,
+    JSON.stringify({ id: 'unknown', status: 'prompting' }));
+  try {
+    const before = fileSnapshot(f.dir);
+    assert.ok(fs.statSync(path.join(config.stateDir, 'bridge.sqlite-wal')).size > 0);
+    const results = await Promise.all(Array.from({ length: 8 }, () => wire(f.file, { operation: 'status' })));
+    for (const result of results) {
+      assert.equal(result.code, 0, result.stdout);
+      const { status } = JSON.parse(result.stdout);
+      assert.equal(status.boundSessionId, 'session-one');
+      assert.equal(status.reason, 'STATE_SNAPSHOT_UNAVAILABLE');
+      assert.equal(status.available, false);
+      assert.equal(status.detailsAvailable, false);
+      assert.equal(status.unknownJobs, null);
+    }
+    assert.deepEqual(fileSnapshot(f.dir), before);
+    assert.equal(store.job('unknown').status, 'prompting');
+  } finally { store.close(); }
+  const status = JSON.parse((await wire(f.file, { operation: 'status' })).stdout).status;
+  assert.equal(status.reason, 'UNKNOWN_OUTCOMES');
+  assert.equal(status.unknownJobs, 1);
+  assert.equal(f.requests.length, 1);
+});
+
+test('parallel status cannot interfere with unique bind native validation or persist partial routing', async t => {
+  const f = await fixture(t);
+  f.raw.limits.requestTimeoutMs = 15000;
+  writePrivate(f.file, f.raw);
+  let release;
+  f.hold(new Promise(resolve => { release = resolve; }));
+  t.after(() => release());
+  const binding = control(f.file, bind());
+  const until = Date.now() + 5000;
+  while (f.requests.length < 1 && Date.now() < until) await delay(5);
+  assert.equal(f.requests.length, 1);
+  const before = fileSnapshot(f.dir);
+  const results = await Promise.all(Array.from({ length: 8 }, () => wire(f.file, { operation: 'status' })));
+  for (const result of results) {
+    assert.equal(result.code, 0, result.stdout);
+    const { status } = JSON.parse(result.stdout);
+    assert.equal(status.boundSessionId, null);
+    assert.equal(status.reason, 'OPERATION_OUTCOME_UNKNOWN');
+    assert.equal(status.available, false);
+  }
+  assert.deepEqual(fileSnapshot(f.dir), before);
+  release();
+  assert.equal((await binding).ok, true);
+  assert.equal(JSON.parse((await wire(f.file, { operation: 'status' })).stdout).status.boundSessionId, 'session-one');
+  assert.equal(f.requests.length, 1);
+});
+
+test('status routes its database inspection from one atomic record, not a stale loaded config', async t => {
+  const f = await fixture(t);
+  await control(f.file, bind());
+  const stale = loadConfig(f.file);
+  const oldStore = new Store(stale.stateDir);
+  oldStore.set('binding', { sessionId: 'session-one', cwd: '/fixture/workspace' });
+  oldStore.close();
+  await control(f.file, unbind());
+  assert.equal(moduleStatus(stale).boundSessionId, null);
+  await control(f.file, bind('bind-fresh', 'session-two'));
+  const current = loadConfig(f.file);
+  const newStore = new Store(current.stateDir);
+  newStore.set('binding', { sessionId: 'session-two', cwd: '/fixture/workspace' });
+  newStore.db.prepare('INSERT INTO jobs VALUES (?,?,?)').run('new-queued', 1,
+    JSON.stringify({ id: 'new-queued', status: 'queued' }));
+  newStore.close();
+  const status = moduleStatus(stale);
+  assert.equal(status.boundSessionId, 'session-two');
+  assert.equal(status.pendingJobs, 1);
+  assert.equal(status.reason, 'PENDING_JOBS');
+  assert.equal(status.revision, 3);
+  assert.equal(f.requests.length, 2);
+});
+
+test('status bounds read-only snapshot retries and preserves trusted binding under continuous record changes', async t => {
+  const f = await fixture(t);
+  await control(f.file, bind());
+  const config = loadConfig(f.file);
+  const file = controlFile(config);
+  const read = fs.readFileSync;
+  let reads = 0;
+  fs.readFileSync = function(target, ...args) {
+    const value = read.call(this, target, ...args);
+    if (target === file) {
+      const state = JSON.parse(value);
+      const request = sessionUnbind(`concurrent-receipt-${++reads}`, 'unrelated-session');
+      state.operations[request.operationId] = { phase: 'complete', request,
+        result: { ok: true, operationId: request.operationId, sessionId: request.sessionId, unbound: true } };
+      writePrivate(file, state);
+    }
+    return value;
+  };
+  let status;
+  try { status = moduleStatus(config); }
+  finally { fs.readFileSync = read; }
+  assert.equal(reads, 7);
+  assert.equal(status.reason, 'MODULE_CONTROL_BUSY');
+  assert.equal(status.boundSessionId, 'session-one');
+  assert.equal(status.available, false);
+  assert.equal(status.detailsAvailable, false);
+  assert.equal(f.requests.length, 1);
+});
+
+test('read-only status does not turn corrupt business/control state into a successful unbound fallback', async t => {
+  const f = await fixture(t);
+  await control(f.file, bind());
+  const config = loadConfig(f.file);
+  fs.writeFileSync(path.join(config.stateDir, 'bridge.sqlite'), 'invalid SQLite fixture', { mode: 0o600 });
+  const database = await wire(f.file, { operation: 'status' });
+  assert.equal(database.code, 2);
+  assert.deepEqual(JSON.parse(database.stdout), { ok: false, error: { code: 'MODULE_CONTROL_FAILED' } });
+  const state = readControl(config);
+  writePrivate(controlFile(config), { ...state, schemaVersion: 999 });
+  const record = await wire(f.file, { operation: 'status' });
+  assert.equal(record.code, 2);
+  assert.deepEqual(JSON.parse(record.stdout), { ok: false, error: { code: 'MODULE_STATE_INVALID' } });
+  assert.equal(f.requests.length, 1);
+});
+
+for (const operation of ['unbind', 'session-unbind']) {
+  test(`parallel status during ${operation} retains old binding until atomic commit without writes`, async t => {
+    const f = await fixture(t);
+    await control(f.file, bind());
+    const config = loadConfig(f.file);
+    const preload = path.join(f.dir, 'pause-control-commit.js');
+    const waiting = path.join(f.dir, 'commit-waiting');
+    const release = path.join(f.dir, 'commit-release');
+    fs.writeFileSync(preload, `
+      import fs from 'node:fs';
+      const rename = fs.renameSync;
+      let writes = 0;
+      fs.renameSync = function(from, to) {
+        if (to === ${JSON.stringify(controlFile(config))} && ++writes === 2) {
+          fs.writeFileSync(${JSON.stringify(waiting)}, 'waiting', {mode: 0o600});
+          const deadline = Date.now() + 10000;
+          while (!fs.existsSync(${JSON.stringify(release)})) {
+            if (Date.now() > deadline) throw new Error('Fixture commit wait expired');
+            Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+          }
+        }
+        return rename.call(this, from, to);
+      };
+    `, { mode: 0o600 });
+    const child = spawn(process.execPath, ['--import', preload, 'src/module-control.js', '--config', f.file],
+      { cwd: root, stdio: ['pipe', 'pipe', 'pipe'] });
+    const output = processResult(child);
+    child.stdin.end(JSON.stringify(operation === 'unbind' ? unbind() : sessionUnbind()));
+    t.after(async () => {
+      if (child.exitCode === null && child.signalCode === null) {
+        fs.writeFileSync(release, 'release', { mode: 0o600 });
+        await output.done;
+      }
+    });
+    const until = Date.now() + 5000;
+    while (!fs.existsSync(waiting) && Date.now() < until && child.exitCode === null) await delay(5);
+    assert.ok(fs.existsSync(waiting));
+    const before = fileSnapshot(f.dir);
+    const results = await Promise.all(Array.from({ length: 8 }, () => wire(f.file, { operation: 'status' })));
+    for (const result of results) {
+      assert.equal(result.code, 0, result.stdout);
+      const { status } = JSON.parse(result.stdout);
+      assert.equal(status.boundSessionId, 'session-one');
+      assert.equal(status.available, false);
+      assert.equal(status.reason, 'OPERATION_OUTCOME_UNKNOWN');
+      assert.equal(status.detailsAvailable, false);
+    }
+    assert.deepEqual(fileSnapshot(f.dir), before);
+    fs.writeFileSync(release, 'release', { mode: 0o600 });
+    const result = await output.done;
+    assert.equal(result.code, 0, result.stdout + result.stderr);
+    assert.equal(JSON.parse((await wire(f.file, { operation: 'status' })).stdout).status.boundSessionId, null);
+    assert.equal(f.requests.length, 1);
+  });
+}
 
 test('concurrent child mutations have one authority; repeated IDs are readback, never native retries', async t => {
   const f = await fixture(t);
@@ -419,6 +672,7 @@ test('status never recovers old jobs, and unbind refuses every unresolved work c
   for (const [job, reason] of cases) {
     store.db.prepare('INSERT INTO jobs VALUES (?,?,?)').run(job.id, 1, JSON.stringify(job));
     const before = store.job(job.id);
+    store.db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
     const status = await control(f.file, { operation: 'status' });
     assert.equal(status.status.reason, reason);
     const result = await control(f.file, unbind(`unbind-${job.id}`));

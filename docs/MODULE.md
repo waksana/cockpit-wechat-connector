@@ -160,9 +160,31 @@ Status success:
 `configReason` is additionally returned when credential/account configuration
 validation fails. `configReady` is a local identity/configuration check, **not**
 remote token validity or target-health verification. Status makes no network
-requests. It opens an existing SQLite store read-only, never creates/upgrades
-its schema, calls recovery, or changes jobs/checkpoints. Managed status uses
-an ephemeral control gate; legacy status creates no local state.
+requests. Managed adapter/CLI status never acquires/creates the mutation gate or
+any control state. It derives the target and state directory from the **same
+atomic routing record**, checking that record again after diagnostic reads
+(at most three read-only attempts). Parallel status calls cannot block each
+other or a mutation. Actual bind/unbind/session-unbind and runner startup retain
+their exclusive gates and revision checks.
+
+Checkpointed SQLite diagnostics use immutable read-only access, with source-file
+identity checks before/after reading: no database, WAL or SHM files are created.
+Nonempty WAL/journal files are **not** silently ignored or checkpointed. Their
+diagnostics return `reason:"STATE_SNAPSHOT_UNAVAILABLE"`, `available:false`,
+`detailsAvailable:false`, and `pendingJobs:null,unknownJobs:null` rather than
+inventing zero counts. Once the existing owner has safely checkpointed/closed
+the store, ordinary detailed status is readable again; status itself never
+performs recovery or changes jobs/checkpoints.
+
+While a runner or real mutation is active, status still returns `ok:true` with
+the trusted `boundSessionId` and routing `revision`. Unavailable diagnostic
+fields are explicitly marked by `detailsAvailable:false` and null job counts.
+The reason is `RUNNING`, `RUNNER_STATE_UNKNOWN`, `MODULE_CONTROL_BUSY`, or the
+existing `OPERATION_OUTCOME_UNKNOWN` fence. `running:null,runnerUnknown:true`
+means runner activity could not be read consistently during a control change.
+A busy result is not permission to bind or retry an unknown mutation.
+Corrupt/insecure state and unrelated I/O failures still fail explicitly; they
+are not converted into a successful unbound status.
 
 Mutation success:
 
@@ -294,7 +316,7 @@ Important status/mutation fences:
   rollback, retransmission or replacement operation.
 
 `cli run/check/resolve/...` retain `lockDir/run.lock` for their lifetime.
-Runner startup, CLI status/stop/unlock and adapter status/mutations share
+Runner startup, CLI stop/unlock and adapter mutations share
 `lockDir/module-control/run.lock` as a short gate. Routing/config revision is
 rechecked after acquiring that gate, before a runner can acquire its lifetime
 lock. `cli stop` uses the stable lock's existing safe-drain protocol.

@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { createHash } from 'node:crypto';
+import { pathToFileURL } from 'node:url';
 import { BridgeError, object, requireThat } from './common.js';
 import { privateDirectory, readPrivate, RunLock, secureExisting } from './storage.js';
 
@@ -57,15 +58,12 @@ export function readControl(config) {
   return state;
 }
 
-export function routeConfig(config) {
+export function routeConfig(config, state = config.moduleManaged ? readControl(config) : null) {
   if (!config.moduleManaged) return config;
-  const state = readControl(config);
   return {
     ...config, moduleRevision: state?.revision ?? 0,
-    ...(state?.active ? {
-      stateDir: state.active.stateDir,
-      cockpit: { ...config.cockpit, sessionId: state.active.sessionId, cwd: state.active.cwd },
-    } : {}),
+    stateDir: state?.active?.stateDir ?? config.moduleStateRoot,
+    cockpit: { ...config.cockpit, sessionId: state?.active?.sessionId ?? '', cwd: state?.active?.cwd ?? '' },
   };
 }
 
@@ -92,8 +90,17 @@ export function assertCurrentConfig(config) {
   requireThat((readControl(config)?.revision ?? 0) === config.moduleRevision, 'MODULE_CONFIG_STALE');
 }
 
-export function runnerState(config) {
-  const lock = readPrivate(path.join(config.lockDir, 'run.lock'));
+export function runnerState(config, { snapshot = false } = {}) {
+  let lock;
+  try { lock = readPrivate(path.join(config.lockDir, 'run.lock')); }
+  catch (error) {
+    if (snapshot && error.code === 'ENOENT') return { running: false, runnerUnknown: false };
+    if (snapshot && error.code === 'INVALID_PRIVATE_FILE'
+      && fs.existsSync(path.join(gateDir(config), 'run.lock'))) {
+      return { running: null, runnerUnknown: true };
+    }
+    throw error;
+  }
   if (!lock) return { running: false, runnerUnknown: false };
   requireThat(Number.isSafeInteger(lock.pid) && lock.pid > 0 && typeof lock.nonce === 'string', 'INVALID_LOCK');
   try {
@@ -105,7 +112,19 @@ export function runnerState(config) {
   }
 }
 
-export function inspectBinding(dir) {
+function databaseIdentity(file) {
+  return ['', '-wal', '-journal'].map(suffix => {
+    try {
+      const stat = fs.statSync(file + suffix, { bigint: true });
+      return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
+    } catch (error) {
+      if (error.code === 'ENOENT') return null;
+      throw error;
+    }
+  }).join('|');
+}
+
+export function inspectBinding(dir, { snapshot = false } = {}) {
   const empty = { binding: null, pendingJobs: 0, unknownJobs: 0, pendingBatch: false,
     nativeFollowup: false, typingMayBeActive: false, inboxHistory: false };
   if (!fs.existsSync(dir)) return empty;
@@ -116,7 +135,19 @@ export function inspectBinding(dir) {
     for (const suffix of ['', '-wal', '-shm', '-journal']) {
       if (fs.existsSync(file + suffix)) secureExisting(file + suffix);
     }
-    const db = new DatabaseSync(file, { readOnly: true });
+    const before = snapshot ? databaseIdentity(file) : null;
+    if (snapshot) {
+      for (const suffix of ['-wal', '-journal']) {
+        if (fs.existsSync(file + suffix)) {
+          requireThat(fs.statSync(file + suffix).size === 0, 'STATE_SNAPSHOT_UNAVAILABLE');
+        }
+      }
+    }
+    const source = pathToFileURL(file);
+    // Immutable reads never create WAL/SHM, but ignore WAL. Only use them when
+    // all data is in the main file, and reject any change during the read.
+    if (snapshot) source.searchParams.set('immutable', '1');
+    const db = new DatabaseSync(snapshot ? source.href : file, { readOnly: true });
     try {
       db.exec('PRAGMA query_only=ON; BEGIN;');
       const get = key => {
@@ -132,7 +163,10 @@ export function inspectBinding(dir) {
       nativeFollowup: Boolean(get('nativeFollowup')),
       typingMayBeActive: Boolean(get('statusDisplay')?.typingMayBeActive),
       inboxHistory: Boolean(get('cursor')) || jobs.length > 0 };
-    } finally { db.close(); }
+    } finally {
+      db.close();
+      if (snapshot) requireThat(databaseIdentity(file) === before, 'STATE_SNAPSHOT_UNAVAILABLE');
+    }
   }
   const images = path.join(dir, 'image-deliveries');
   if (fs.existsSync(images)) {

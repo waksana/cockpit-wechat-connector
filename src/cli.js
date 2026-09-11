@@ -77,12 +77,12 @@ export async function main(argv = process.argv.slice(2)) {
   process.on('SIGTERM', onSignal);
   try {
     if (config.moduleManaged) {
-      gate = acquireModuleGate(config, { unlockStale: command === 'unlock' && confirm });
-      assertCurrentConfig(config);
       if (command === 'status') {
         console.log(JSON.stringify(moduleStatus(config), null, 2));
         return;
       }
+      gate = acquireModuleGate(config, { unlockStale: command === 'unlock' && confirm });
+      assertCurrentConfig(config);
     }
     if (command === 'stop') {
       RunLock.requestStop(config.lockDir, { requireDrain: true });

@@ -7,8 +7,8 @@ import { loadConfig, assertBinding } from './config.js';
 import { CockpitClient, cockpitToken } from './cockpit.js';
 import { BridgeError, object, requireThat } from './common.js';
 import { privateDirectory, readPrivate, secureExisting, writePrivate } from './storage.js';
-import { acquireModuleGate, assertCurrentConfig, blocker, controlFile, inspectBinding,
-  readControl, runnerState } from './module-state.js';
+import { acquireModuleGate, assertCurrentConfig, blocker, controlFile, gateDir, inspectBinding,
+  readControl, routeConfig, runnerState } from './module-state.js';
 
 const MAX_BYTES = 16384;
 const sessionValid = sessionId => typeof sessionId === 'string'
@@ -30,10 +30,49 @@ function readiness(config) {
 }
 
 export function moduleStatus(config) {
+  if (!config.moduleManaged) return statusDetails(config, null, runnerState(config, { snapshot: true }));
+  const gateBusy = () => fs.existsSync(path.join(gateDir(config), 'run.lock'));
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const state = readControl(config);
+    const routed = routeConfig(config, state);
+    if (gateBusy()) return partialStatus(routed, state, { running: null, runnerUnknown: true });
+    const runner = runnerState(routed, { snapshot: true });
+    let status;
+    if (runner.running || runner.runnerUnknown) {
+      status = partialStatus(routed, state, runner);
+    } else {
+      try { status = statusDetails(routed, state, runner); }
+      catch (error) {
+        if (error instanceof BridgeError && error.code === 'STATE_SNAPSHOT_UNAVAILABLE') {
+          status = partialStatus(routed, state, runner, error.code);
+        } else {
+          if (error.code === 'ENOENT') continue;
+          const transient = error.code === 'ERR_SQLITE_ERROR'
+            && ([5, 6].includes(error.errcode) || /^no such table: (kv|jobs)$/.test(error.message));
+          if (!transient || (!gateBusy() && !runnerState(routed, { snapshot: true }).running)) throw error;
+          continue;
+        }
+      }
+    }
+    if (!gateBusy() && JSON.stringify(state) === JSON.stringify(readControl(config))) return status;
+  }
+  const state = readControl(config);
+  return partialStatus(routeConfig(config, state), state, { running: null, runnerUnknown: true });
+}
+
+function partialStatus(config, state, runner, reason) {
+  const unknownOperation = Boolean(state && Object.values(state.operations).some(op => op.phase === 'pending'));
+  return { available: false,
+    reason: unknownOperation ? 'OPERATION_OUTCOME_UNKNOWN' : reason ?? (runner.running ? 'RUNNING'
+      : runner.running === false && runner.runnerUnknown ? 'RUNNER_STATE_UNKNOWN' : 'MODULE_CONTROL_BUSY'),
+    boundSessionId: state?.active?.sessionId ?? null, ...readiness(config), ...runner,
+    unknownOperation, pendingJobs: null, unknownJobs: null, revision: state?.revision ?? 0,
+    managed: true, detailsAvailable: false };
+}
+
+function statusDetails(config, state, runner) {
   const managed = Boolean(config.moduleManaged);
-  const state = managed ? readControl(config) : null;
-  const inspection = inspectBinding(config.stateDir);
-  const runner = runnerState(config);
+  const inspection = inspectBinding(config.stateDir, { snapshot: managed });
   const ready = readiness(config);
   const boundSessionId = state?.active?.sessionId || inspection.binding?.sessionId
     || config.cockpit.sessionId || null;
@@ -41,7 +80,7 @@ export function moduleStatus(config) {
     || inspection.binding.cwd !== config.cockpit.cwd);
   const unknownOperation = Boolean(state && Object.values(state.operations).some(op => op.phase === 'pending'));
   const historyReview = !state?.active && Boolean(state?.history.some(binding =>
-    inspectBinding(binding.stateDir).inboxHistory));
+    inspectBinding(binding.stateDir, { snapshot: true }).inboxHistory));
   const legacyData = managed && !state && (inspection.binding || inspection.inboxHistory
     || (fs.existsSync(config.moduleStateRoot) && fs.readdirSync(config.moduleStateRoot).length > 0));
   const reason = unknownOperation ? 'OPERATION_OUTCOME_UNKNOWN'
@@ -101,10 +140,10 @@ export async function control(configPath, request, { fetchImpl } = {}) {
     return { ok: true, status: moduleStatus(config) };
   }
   secureExisting(configPath);
+  if (request.operation === 'status') return { ok: true, status: moduleStatus(config) };
   const gate = acquireModuleGate(config);
   try {
     assertCurrentConfig(config);
-    if (request.operation === 'status') return { ok: true, status: moduleStatus(config) };
     const sessionUnbind = request.operation === 'session-unbind';
     const identity = { operation: request.operation, operationId: request.operationId,
       sessionId: request.sessionId, ...(sessionUnbind ? {} : { cwd: request.cwd }) };
