@@ -1,9 +1,10 @@
-import { BridgeError, object, requireThat, text } from './common.js';
+import { BridgeError, errorCode, object, requireThat, text } from './common.js';
 import { createHash } from 'node:crypto';
 import { requestJson } from './http.js';
 import fs from 'node:fs';
 import { secureExisting } from './storage.js';
 import { nativeMessages } from './native-messages.js';
+import { assertActiveBinding, retireMissingBinding } from './module-state.js';
 
 export function historyCheckpoint(message) {
   return { ...(message?.nativePosition ? { position: message.nativePosition } : {}),
@@ -79,9 +80,11 @@ export class CockpitClient {
   constructor(config, { fetchImpl = fetch, token = process.env.COCKPIT_API_TOKEN } = {}) {
     token = cockpitToken(config, token);
     this.config = config; this.fetchImpl = fetchImpl;
+    this.guardBinding = Boolean(config.moduleManaged && config.moduleBindingId);
     this.headers = { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) };
   }
   call(name, body, signal) {
+    if (this.guardBinding) assertActiveBinding(this.config);
     return requestJson(new URL(`/intent/${name}`, this.config.cockpit.apiUrl), {
       body, headers: this.headers, timeoutMs: this.config.limits.requestTimeoutMs, signal, fetchImpl: this.fetchImpl,
     });
@@ -101,7 +104,21 @@ export class CockpitClient {
   }
   async meta(signal) {
     const result = await this.call('session/get', { sessionId: this.config.cockpit.sessionId }, signal);
-    if (result.meta === null) throw new BridgeError('TARGET_SESSION_MISSING');
+    requireThat(Object.hasOwn(result, 'meta') && (result.ok === undefined || result.ok === true) && result.error === undefined,
+      'COCKPIT_SESSION_SCHEMA');
+    if (result.meta === null) {
+      const error = new BridgeError('TARGET_SESSION_MISSING');
+      error.nativeMissing = true;
+      if (this.guardBinding) {
+        try {
+          const cleanup = retireMissingBinding(this.config);
+          error.bindingCleared = cleanup.cleared;
+          error.cleanupCode = cleanup.cleanupCode;
+        }
+        catch (cleanupError) { error.cleanupCode = errorCode(cleanupError); }
+      }
+      throw error;
+    }
     const meta = result.meta;
     requireThat(object(meta) && meta.sessionId === this.config.cockpit.sessionId
       && typeof meta.cwd === 'string' && typeof meta.loaded === 'boolean'
@@ -114,6 +131,7 @@ export class CockpitClient {
       if (meta[name]) requireThat(text(meta[name].requestId), 'COCKPIT_CHOICE_SCHEMA');
     }
     requireThat(meta.cwd === this.config.cockpit.cwd, 'TARGET_CWD_CHANGED');
+    if (this.guardBinding) assertActiveBinding(this.config);
     return meta;
   }
   async ensureLoaded(signal) {
@@ -208,6 +226,7 @@ export class CockpitClient {
       position: { cursor: page.cursor, source } };
   }
   async uploadFile(file, metadata, size, signal) {
+    if (this.guardBinding) assertActiveBinding(this.config);
     const origin = new URL(this.config.cockpit.apiUrl);
     requireThat(['127.0.0.1', '[::1]', 'localhost'].includes(origin.hostname), 'MEDIA_BACKEND_MUST_BE_LOOPBACK');
     const stream = fs.createReadStream(file);

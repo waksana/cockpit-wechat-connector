@@ -6,6 +6,7 @@ import { normalizeBatch } from './weixin.js';
 import { replyParts } from './reply.js';
 import { cleanMediaScratch, preparePublishedMedia, saveInboundMedia, uploadPreparedMedia } from './media.js';
 import { inputParts, inputPrompt, recordDelivery, retainedQuoteAttachments } from './quote.js';
+import { assertActiveBinding } from './module-state.js';
 
 const terminal = new Set(['done', 'abandoned', 'rejected']);
 const mediaPart = part => part.kind === 'image' || part.kind === 'media';
@@ -75,6 +76,7 @@ export class Bridge {
     this.store.save(job);
   }
   async receive(signal, timeoutMs = 35000) {
+    assertActiveBinding(this.config);
     let result = this.store.get('pendingBatch');
     const freshPoll = !result;
     if (!result) {
@@ -83,6 +85,8 @@ export class Bridge {
       this.store.set('pendingBatch', result);
     }
     const jobs = normalizeBatch(result.msgs, this.config);
+    assertActiveBinding(this.config);
+    if (this.config.moduleManaged && jobs.some(job => job.status === 'queued')) await this.cockpit.meta(signal);
     this.prepareIngress(jobs, freshPoll);
     const inserted = this.store.ingest(jobs, result.get_updates_buf, this.config.limits.maxQueued, true);
     if (inserted) { this.log(`INBOX_RECEIVED ${inserted}`); this.wakeWork(); }
@@ -96,6 +100,7 @@ export class Bridge {
   }
   async prepareInput(job, signal) {
     if (this.draining) return false;
+    assertActiveBinding(this.config);
     requireThat((job.media?.length ?? 0) <= 20, 'INBOUND_MEDIA_COUNT_EXCEEDED');
     if (job.media?.length) job.mediaFingerprint ??= createHash('sha256').update(JSON.stringify(job.media)).digest('hex');
     for (const entry of job.media ?? []) {
@@ -153,6 +158,7 @@ export class Bridge {
   }
   async processJob(job, signal) {
     if (this.draining) return;
+    assertActiveBinding(this.config);
     if (job.status === 'blocked') throw new BridgeError(job.reason ?? 'JOB_BLOCKED');
     if (job.status === 'queued') {
       if (job.kind === 'unsupported') {
@@ -260,6 +266,7 @@ export class Bridge {
           // A read may have taken time; recheck before any upload mutation.
           if (this.needsEvidence(job)) await this.evidence(job, signal);
           if (this.draining) return;
+          assertActiveBinding(this.config);
           part.nativeKind = prepared.nativeKind;
           part.attachment = prepared.attachment;
           part.status = 'sending'; this.store.save(job);
@@ -278,6 +285,7 @@ export class Bridge {
         return;
       }
       if (this.draining) return;
+      assertActiveBinding(this.config);
       part.status = 'sending';
       if (mediaPart(part)) part.imageStage = 'sending_image';
       this.store.save(job);

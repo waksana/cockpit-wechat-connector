@@ -6,6 +6,7 @@ import { StatusDisplay } from './status-display.js';
 import { replyRunId } from './reply-run.js';
 import { readEventStream, WorkSignal } from './events.js';
 import { NativeFollowup, submitInputs } from './followup.js';
+import { assertActiveBinding } from './module-state.js';
 
 const visible = message => message.role === 'assistant' && !message.subtype
   && (message.content.trim() || message.attachment || message.attachments?.length || message.parts?.length);
@@ -127,6 +128,7 @@ export class SessionBridge extends Bridge {
 
   async step(signal) {
     if (this.draining) return;
+    assertActiveBinding(this.config);
     this.deliveryMore = false;
     this.ingressPaused = false;
     const jobs = this.store.jobs();

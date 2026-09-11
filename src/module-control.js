@@ -92,20 +92,30 @@ function partialStatus(config, state, runner, reason) {
     boundSessionId: state?.active?.sessionId ?? null, ...ready, ...runner,
     unknownOperation,
     pendingJobs: null, unknownJobs: null, revision: state?.revision ?? 0,
-    managed: true, detailsAvailable: false, bindingConfirmed: bindingConfirmed(config, state, runner, ready) };
+    managed: true, detailsAvailable: false, bindingConfirmed: bindingConfirmed(config, state, runner, ready),
+    ...retainedMissing(state) };
+}
+
+function retainedMissing(state) {
+  const count = state?.history.filter(binding => binding.retiredReason === 'TARGET_SESSION_MISSING').length ?? 0;
+  return count ? { retainedMissingBindings: count } : {};
 }
 
 function statusDetails(config, state, runner) {
   const managed = Boolean(config.moduleManaged);
   const inspection = inspectBinding(config.stateDir, { snapshot: managed });
   const ready = readiness(config);
-  const boundSessionId = state?.active?.sessionId || inspection.binding?.sessionId
-    || config.cockpit.sessionId || null;
+  const boundSessionId = managed ? state?.active?.sessionId ?? null
+    : inspection.binding?.sessionId || config.cockpit.sessionId || null;
   const bindingChanged = inspection.binding && (inspection.binding.sessionId !== config.cockpit.sessionId
     || inspection.binding.cwd !== config.cockpit.cwd);
   const unknownOperation = Boolean(state && Object.values(state.operations).some(op => op.phase === 'pending'));
-  const historyReview = !state?.active && Boolean(state?.history.some(binding =>
-    inspectBinding(binding.stateDir, { snapshot: true }).inboxHistory));
+  let historyReason;
+  if (!state?.active) for (const binding of state?.history ?? []) {
+    const old = inspectBinding(binding.stateDir, { snapshot: true });
+    historyReason = blocker(old) ?? (old.inboxHistory ? 'REBIND_HISTORY_REVIEW_REQUIRED' : null);
+    if (historyReason) break;
+  }
   const legacyData = managed && !state && (inspection.binding || inspection.inboxHistory
     || (fs.existsSync(config.moduleStateRoot) && fs.readdirSync(config.moduleStateRoot).length > 0));
   const reason = unknownOperation ? 'OPERATION_OUTCOME_UNKNOWN'
@@ -115,20 +125,51 @@ function statusDetails(config, state, runner) {
         || (boundSessionId ? 'ALREADY_BOUND' : null)
         || (!managed ? 'MODULE_MANAGED_OPT_IN_REQUIRED' : null)
         || (!ready.configReady ? 'NOT_CONFIGURED' : null)
-        || (historyReview ? 'REBIND_HISTORY_REVIEW_REQUIRED' : null);
+        || historyReason || null;
   return { available: reason === null, reason, boundSessionId, ...ready, ...runner,
     unknownOperation,
     pendingJobs: inspection.pendingJobs, unknownJobs: inspection.unknownJobs,
-    revision: state?.revision ?? 0, managed, bindingConfirmed: bindingConfirmed(config, state, runner, ready, inspection) };
+    revision: state?.revision ?? 0, managed, bindingConfirmed: bindingConfirmed(config, state, runner, ready, inspection),
+    ...retainedMissing(state) };
+}
+
+async function canBind(config, { fetchImpl } = {}) {
+  const checkedSessionId = config.cockpit.sessionId || null;
+  let exists = null, cleared = false, reason;
+  if (checkedSessionId && config.moduleManaged) {
+    try {
+      await new CockpitClient(config, { fetchImpl }).meta();
+      exists = true;
+    } catch (error) {
+      if (error.code === 'TARGET_SESSION_MISSING' && error.nativeMissing === true) {
+        exists = false;
+        cleared = error.bindingCleared === true;
+        reason = error.cleanupCode;
+        if (!cleared && !reason) reason = 'BINDING_CHANGED_DURING_CHECK';
+      } else reason = ['TARGET_SESSION_MISSING', 'MODULE_CONFIG_STALE'].includes(error.code)
+        ? 'BINDING_CHANGED_DURING_CHECK' : codeOf(error);
+    }
+  }
+  const current = loadConfig(config.configPath);
+  requireThat(current.configDigest === config.configDigest, 'MODULE_CONFIG_CHANGED');
+  const status = moduleStatus(current);
+  if (exists === true) reason ??= current.moduleBindingId === config.moduleBindingId
+    && current.moduleRevision === config.moduleRevision ? 'ALREADY_BOUND' : 'BINDING_CHANGED_DURING_CHECK';
+  if (cleared && (current.moduleRevision !== config.moduleRevision + 1 || current.moduleBindingId !== null)) {
+    reason = 'BINDING_CHANGED_DURING_CHECK';
+  }
+  if (reason) { status.available = false; status.reason = reason; }
+  return { ok: true, status, checkedSessionId, exists, cleared };
 }
 
 function validateRequest(request) {
-  requireThat(object(request) && ['status', 'bind', 'unbind', 'session-unbind'].includes(request.operation), 'INVALID_REQUEST');
-  const allowed = request.operation === 'status' ? ['operation']
+  requireThat(object(request) && ['status', 'can-bind', 'bind', 'unbind', 'session-unbind'].includes(request.operation), 'INVALID_REQUEST');
+  const check = ['status', 'can-bind'].includes(request.operation);
+  const allowed = check ? ['operation']
     : request.operation === 'session-unbind' ? ['operation', 'operationId', 'sessionId']
       : ['operation', 'operationId', 'sessionId', 'cwd'];
   requireThat(Object.keys(request).every(key => allowed.includes(key)), 'INVALID_REQUEST');
-  if (request.operation !== 'status') {
+  if (!check) {
     requireThat(typeof request.operationId === 'string' && /^[A-Za-z0-9_-]{8,120}(?![\s\S])/.test(request.operationId)
       && !['__proto__', 'prototype', 'constructor'].includes(request.operationId),
       'OPERATION_ID_REQUIRED');
@@ -167,6 +208,7 @@ export async function control(configPath, request, { fetchImpl } = {}) {
   }
   secureExisting(configPath);
   if (request.operation === 'status') return { ok: true, status: moduleStatus(config) };
+  if (request.operation === 'can-bind') return canBind(config, { fetchImpl });
   const gate = acquireModuleGate(config);
   try {
     assertCurrentConfig(config);
@@ -178,6 +220,13 @@ export async function control(configPath, request, { fetchImpl } = {}) {
     if (previous) {
       requireThat(JSON.stringify(previous.request) === JSON.stringify(identity), 'OPERATION_ID_CONFLICT');
       if (previous.phase === 'pending') throw new BridgeError('OPERATION_OUTCOME_UNKNOWN');
+      if (previous.result.ok && (sessionUnbind ? state.active?.sessionId === request.sessionId
+        : previous.result.revision !== state.revision
+          || previous.result.boundSessionId !== (state.active?.sessionId ?? null))) {
+        return { ok: false, operationId: request.operationId, error: { code: 'OPERATION_STATE_CHANGED' },
+          ...(sessionUnbind ? { sessionId: request.sessionId }
+            : { revision: state.revision, boundSessionId: state.active?.sessionId ?? null }), replayed: true };
+      }
       return { ...previous.result, replayed: true };
     }
     requireThat(!state || !Object.values(state.operations).some(op => op.phase === 'pending'),
@@ -214,7 +263,7 @@ export async function control(configPath, request, { fetchImpl } = {}) {
         const ready = readiness(config);
         requireThat(ready.configReady, ready.configReason ?? 'NOT_CONFIGURED');
         for (const old of state.history) {
-          const inspection = inspectBinding(old.stateDir);
+          const inspection = inspectBinding(old.stateDir, { snapshot: true });
           requireThat(!blocker(inspection), blocker(inspection));
           requireThat(!inspection.inboxHistory, 'REBIND_HISTORY_REVIEW_REQUIRED');
         }

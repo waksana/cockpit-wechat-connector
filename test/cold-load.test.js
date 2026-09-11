@@ -22,7 +22,7 @@ async function cold(t, BridgeClass, options = {}) {
 for (const BridgeClass of [Bridge, SessionBridge]) {
   const mode = BridgeClass.name;
   test(`${mode}: one queued input restores the original target and validates its original cursor before one prompt`, async t => {
-    const f = await cold(t, BridgeClass);
+    const f = await cold(t, BridgeClass, { sendRaw: '{"ret":0,"message_id":18446744073709551615}' });
     await f.bridge.receive();
     const originalJob = f.store.jobs()[0].id, start = f.requests.length;
     await f.bridge.step();
@@ -40,6 +40,8 @@ for (const BridgeClass of [Bridge, SessionBridge]) {
     await f.drain(12);
     assert.equal(f.prompts.length, 1);
     assert.equal(f.sent.length, 1);
+    assert.deepEqual(f.store.jobs().flatMap(job => (job.deliveries ?? []).map(delivery => delivery.messageId)),
+      ['18446744073709551615']);
     assert.equal(loads(f).length, 1);
     assert.equal(f.store.job(originalJob).status, 'done');
     assert.ok(f.requests.every(row => !/reload|session\/new|session\/start|interrupt/.test(row.url)));

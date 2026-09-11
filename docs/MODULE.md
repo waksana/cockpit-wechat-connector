@@ -1,6 +1,6 @@
-# Official WeChat module (opt-in, offline control)
+# Official WeChat module (opt-in control)
 
-`module.json` is schema/config version 1, module/package version 0.1.4, Linux x64,
+`module.json` is schema/config version 1, module/package version 0.1.5, Linux x64,
 Node 24, Cockpit API 1. Its sole role `wechat` provides binding only: no injected
 instructions, skills or MCP. The existing lifecycle service remains
 `node src/cli.js run`: `/health`, `/version`, `/admin/restart`. It requires one
@@ -15,7 +15,7 @@ runtime startup is separately authorized:
 ```text
 node src/cli.js run --config /absolute/private/module-config.json
 COCKPIT_MODULE_ID=wechat
-COCKPIT_MODULE_VERSION=0.1.4
+COCKPIT_MODULE_VERSION=0.1.5
 COCKPIT_MODULE_DIGEST=<64 lowercase hexadecimal catalog digest>
 COCKPIT_MODULE_INSTANCE=<canonical lowercase UUID for this process>
 COCKPIT_MODULE_PORT=<loopback port, integer 1..65535>
@@ -38,7 +38,7 @@ identity validation and all its response shapes remain unchanged.
 Module `/version`:
 
 ```json
-{"moduleApi":1,"moduleId":"wechat","moduleDigest":"<digest64>","instanceId":"<uuid>","version":"0.1.4","moduleVersion":"0.1.4"}
+{"moduleApi":1,"moduleId":"wechat","moduleDigest":"<digest64>","instanceId":"<uuid>","version":"0.1.5","moduleVersion":"0.1.5"}
 ```
 
 `moduleVersion` aliases the already validated actual `version`; both are retained.
@@ -139,6 +139,7 @@ Unknown request fields are rejected. Requests:
 
 ```json
 {"operation":"status"}
+{"operation":"can-bind"}
 {"operation":"bind","operationId":"unique-bind-0001","sessionId":"native-session-id","cwd":"/exact/native/cwd"}
 {"operation":"unbind","operationId":"unique-unbind-0001","sessionId":"native-session-id","cwd":"/exact/native/cwd"}
 ```
@@ -272,32 +273,100 @@ Preflight/transport failures return `{"ok":false,"error":{"code":"..."}}`.
 The parent must retain the originally created native session on **every**
 binding failure; no recreation or automatic retry.
 
-The same operation ID plus identical fields returns only its saved result with
-`replayed:true` (including failures), never re-executes. This receipt may describe
-an older revision/target: explicitly request status for current routing.
+The same operation ID plus identical fields never re-executes. Saved failures
+still return unchanged with `replayed:true`. A saved success whose revision or
+active target has since changed instead returns `ok:false`,
+`error:{code:"OPERATION_STATE_CHANGED"}`, `replayed:true` and the **current**
+`revision/boundSessionId`; the original stored receipt remains untouched.
+An old successful bind must not claim an invalidated association is still active.
 Reusing an ID with different fields returns `OPERATION_ID_CONFLICT`.
 The protected log retains up to 10,000 operation identities, then refuses with
 `OPERATION_LOG_FULL`; it does not evict identities and permit replay.
 
-## Optional session-unbind capability
+## Explicit creation eligibility and use-time invalidation
 
-The official manifest explicitly opts into this session-deletion hook:
+Starting in 0.1.5, the manifest declares this optional creation eligibility entry:
 
 ```json
-{"sessionLifecycle":{"unbind":{"entry":"src/module-control.js"}}}
+{"sessionLifecycle":{"canBind":{"entry":"src/module-control.js"},"unbind":{"entry":"src/module-control.js"}}}
 ```
 
-This is optional module metadata, not a generic hook platform. The parent owns
-the explicit delete-modal selection and sequencing: invoke selected declared
-unbind capabilities, then delete the native session. Absence of this manifest
-field means no hook/no notification. This adapter does not delete native
-sessions, initialize them, create first messages, or implement prebinding.
+Invoke `{"operation":"can-bind"}` through the same bounded control transport
+when the user opens creation UI or explicitly refreshes its module choices.
+No sessionId, cwd, operationId, reservation or prospective identity is accepted.
+The result is `{ok:true,status,...}` using the existing status object, plus:
+
+| Field | Meaning |
+| --- | --- |
+| `checkedSessionId` | Captured active ID, or null when no active reference exists |
+| `exists` | True for confirmed existence (including unloaded), false only for authoritative absence, null for an unbound or unconfirmed check |
+| `cleared` | True only when this check durably retired its exact captured active binding |
+
+Only the existing bound ID is queried, once, through `session/get`. No active
+reference means no native lookup. A successful `{meta:null}` is absence; missing
+or malformed metadata, HTTP errors (including 403/404), timeout and connection
+failure are not. Those responses preserve the route and return
+`status.available:false` with a stable reason. Existing unloaded sessions remain
+bound and unavailable without being loaded. This check does not send any prompt
+or WeChat request. `status` remains entirely offline; its binding confirmation
+attests the routing association, not current native existence.
+
+Confirmed absence retires only the active routing reference under the existing
+short control gate. The captured config authority, binding UUID, revision,
+sessionId, cwd and state directory must all still match. A late response cannot
+clear a newer binding, even if it uses the same sessionId. Configuration drift
+fails explicitly; changed binding generations return
+`BINDING_CHANGED_DURING_CHECK`, not permission to select a new target.
+An uncertain control write returns `BINDING_CLEANUP_OUTCOME_UNKNOWN`; never
+automatically retry it.
+
+The old reference is retained in `history` with
+`retiredReason:"TARGET_SESSION_MISSING"`. The Store binding, database/WAL,
+inbox, history checkpoints, files, credentials, configuration and unknown outbox
+effects are not rewritten, copied, recovered or deleted. Status then reports
+`boundSessionId:null`, `bindingConfirmed:false`, the new revision, and
+`retainedMissingBindings` when nonzero. Old Store/config fields are never used
+to reconstruct an active route.
+
+Ingress and native target use share this exact cleanup path. Managed admission
+checks incoming accepted input before any prompt or unsupported-message reply;
+queued input still uses the 0.1.4 safe original-ID load path. The runner checks
+its captured routing generation before further work and in its normal stop
+timer. Invalidation closes admission and uses the existing safe drain: already
+started mutations finish and retain their original outcome, never get cancelled
+or resent. Under the same exact-generation gate, cleanup also requests the
+existing nonce-bound `drainProtocol:1` stop, including for a 0.1.4 runner.
+Unsupported drain or uncertain stop writes remain explicit errors, never force
+signals; a late old check cannot stop a newly bound runner.
+A running runner's status does not inspect its database or WAL and
+may temporarily report `RUNNING` with no bound ID until it actually exits.
+
+After cleanup, availability and actual bind still enforce independent readiness,
+runner, pending-operation and retained-history fences. A missing empty binding
+becomes selectable; deleting a target with old inbox or unknown effects does
+**not** authorize abandoning/deduplicating/migrating that data. Such state remains
+explicitly unavailable (`UNKNOWN_OUTCOMES`, `PENDING_INBOX_BATCH`,
+`REBIND_HISTORY_REVIEW_REQUIRED`, etc.) rather than silently replaying old input
+from a fresh cursor. No new history-migration policy is implied.
+Eligibility is not a reservation: after real `session/new`, `bind` serializes
+and rechecks uniqueness and readiness before accepting that exact native ID.
+
+Native session deletion is independent of this module. It must not invoke
+unbind, require a module preview/approval, or broadcast deletion to the module.
+There is no native session scan, replacement creation, automatic rebind or
+automatic retry.
+
+## Independent manual unbind capability
+
+`sessionLifecycle.unbind` remains available only for an explicit module
+configuration action. It is **not a deletion hook** or prerequisite. The adapter
+does not delete native sessions, initialize them or create first messages.
 
 Invoke the same trusted Node entry with `--config /absolute/config.json`, using
 the same bounded stdin/stdout and exit-code rules:
 
 ```json
-{"operation":"session-unbind","operationId":"session-delete-0001","sessionId":"native-session-id"}
+{"operation":"session-unbind","operationId":"manual-unbind-0001","sessionId":"native-session-id"}
 ```
 
 `cwd` is deliberately absent (and rejected as an unknown field): the module
@@ -308,14 +377,14 @@ does not load/create the target or read account/API credentials.
 Success is exactly:
 
 ```json
-{"ok":true,"operationId":"session-delete-0001","sessionId":"native-session-id","unbound":true,"replayed":false}
+{"ok":true,"operationId":"manual-unbind-0001","sessionId":"native-session-id","unbound":true,"replayed":false}
 ```
 
 For the exact active session, this uses the existing unbind fences and archives
 the old binding reference. A running/stale runner, pending/unknown jobs,
 unresolved followup/batch/typing state or uncertain operation can refuse it.
 Runner and read-only archive/blocker validation happen under the module gate
-**before** reserving this hook's operation identity. Ordinary preflight refusals
+**before** reserving this action's operation identity. Ordinary preflight refusals
 therefore leave no receipt: after a separately authorized safe stop/settlement,
 the parent may explicitly continue with the same operation ID. There is no
 automatic continuation or retry, and no business state is changed by validation.
@@ -333,17 +402,19 @@ because the association outcome is uncertain.
 Completed failures carry `ok:false`, `operationId`, `sessionId`,
 `error:{code:"..."}` and `replayed:false`; preflight failures retain the existing
 bounded `{ok:false,error:{code:"..."}}` shape. Recorded successes/failures return
-unchanged on identical-ID readback, except `replayed:true`; changing the
+unchanged on identical-ID readback, except `replayed:true`, unless the same
+sessionId is now actively bound again: an old success then returns
+`OPERATION_STATE_CHANGED` without `unbound:true`. Changing the
 operation/session under that ID fails with `OPERATION_ID_CONFLICT`. A pending
 receipt returns `OPERATION_OUTCOME_UNKNOWN` and is never retried, resolved or
-replaced automatically. Historical successful receipts describe their original
-operation, not a fresh unbind of a subsequently rebound target.
+replaced automatically. Historical successful receipts remain stored but never perform a fresh unbind
+of a subsequently rebound target.
 Any already-persisted completed failure (including receipts from older code)
 also retains strict readback; this change never clears or reinterprets it.
 
-The existing `status`, `bind`, and cwd-bearing `unbind` contracts are unchanged.
+The existing `status`, `bind`, and cwd-bearing `unbind` request shapes are unchanged.
 Legacy non-module-managed profiles still refuse mutations with
-`LEGACY_ADOPTION_REQUIRED`; this hook is not implicit legacy migration.
+`LEGACY_ADOPTION_REQUIRED`; this action is not implicit legacy migration.
 
 ## Fences and retained history
 
@@ -360,6 +431,8 @@ discarding terminal deduplication could replay old WeChat input. This version
 does not implement that migration decision. Old native history checkpoints stay
 in the old directory and are never reused as the new target's checkpoint.
 Empty bindings/checkpoint-only history can rebind safely to fresh state.
+Archived bind-readiness checks use the same immutable inspection as status;
+they never create WAL/SHM files or checkpoint retained business data.
 
 Important status/mutation fences:
 

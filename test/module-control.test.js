@@ -11,7 +11,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { control, moduleStatus } from '../src/module-control.js';
 import { CockpitClient } from '../src/cockpit.js';
 import { loadConfig, validateConfig } from '../src/config.js';
-import { acquireModuleGate, assertCurrentConfig, controlFile, readControl } from '../src/module-state.js';
+import { acquireModuleGate, assertActiveBinding, assertCurrentConfig, controlFile, readControl } from '../src/module-state.js';
 import { readPrivate, RunLock, Store, writePrivate } from '../src/storage.js';
 
 const root = path.resolve(import.meta.dirname, '..');
@@ -33,7 +33,7 @@ async function fixture(t) {
   const dir = path.join(root, `.module-test-${randomUUID()}`);
   fs.mkdirSync(dir, { mode: 0o700 });
   const requests = [];
-  let hold;
+  let hold, nativeResult, nativeStatus = 200, batch = [];
   const server = http.createServer(async (req, res) => {
     const chunks = [];
     for await (const chunk of req) chunks.push(chunk);
@@ -42,6 +42,11 @@ async function fixture(t) {
     if (hold && req.url === '/intent/session/get') await hold;
     res.setHeader('content-type', 'application/json');
     if (req.url === '/intent/session/get') {
+      if (nativeResult !== undefined) {
+        res.statusCode = nativeStatus;
+        res.end(JSON.stringify(nativeResult));
+        return;
+      }
       res.end(JSON.stringify({ meta: { sessionId: body.sessionId, cwd: '/fixture/workspace',
         loaded: true, status: 'idle', queue: [], ask: null } }));
     } else if (req.url.startsWith('/capabilities?')) {
@@ -55,7 +60,8 @@ async function fixture(t) {
         cursorStatus: 'ok', liveCursor: 'fixture-live', hasMore: false,
         source: body.source, direction: body.direction }));
     } else if (req.url === '/weixin/ilink/bot/getupdates') {
-      res.end(JSON.stringify({ ret: 0, msgs: [], get_updates_buf: 'fixture-inbox-cursor' }));
+      res.end(JSON.stringify({ ret: 0, msgs: batch, get_updates_buf: 'fixture-inbox-cursor' }));
+      batch = [];
     } else { res.statusCode = 500; res.end('{}'); }
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
@@ -74,7 +80,9 @@ async function fixture(t) {
     await new Promise(resolve => server.close(resolve));
     fs.rmSync(dir, { recursive: true, force: true });
   });
-  return { dir, file, raw, requests, port, hold: promise => { hold = promise; } };
+  return { dir, file, raw, requests, port, hold: promise => { hold = promise; },
+    native: (result, status = 200) => { nativeResult = result; nativeStatus = status; },
+    incoming: messages => { batch = messages; } };
 }
 
 function cli(file, args = ['status'], options = {}) {
@@ -122,7 +130,9 @@ test('official manifest, validated paths and unchanged legacy defaults', () => {
   assert.equal(manifest.version, pkg.version);
   assert.deepEqual(manifest.roles.map(role => Object.keys(role).sort()), [['description', 'id', 'name']]);
   assert.equal(manifest.binding, 'wechat');
-  assert.deepEqual(manifest.sessionLifecycle, { unbind: { entry: 'src/module-control.js' } });
+  assert.deepEqual(manifest.sessionLifecycle, {
+    unbind: { entry: 'src/module-control.js' }, canBind: { entry: 'src/module-control.js' },
+  });
   const raw = JSON.parse(fs.readFileSync(path.join(root, 'config.example.json')));
   const config = validateConfig(raw, '/fixture/config.json');
   assert.equal(config.stateDir, '/fixture/.bridge-state');
@@ -166,6 +176,266 @@ test('offline status, unique binding, durable idempotent receipts and exact nati
   const failed = await control(f.file, { ...bind('wrong-cwd'), cwd: '/wrong' });
   assert.equal(failed.error.code, 'TARGET_CWD_CHANGED');
   assert.equal((await control(f.file, { operation: 'status' })).status.boundSessionId, null);
+});
+
+test('explicit can-bind uses no prospective identity and preserves an existing unloaded target', async t => {
+  const f = await fixture(t);
+  const before = fileSnapshot(f.dir);
+  const fresh = await wire(f.file, { operation: 'can-bind' });
+  assert.equal(fresh.code, 0);
+  assert.deepEqual(JSON.parse(fresh.stdout), {
+    ok: true, status: (await control(f.file, { operation: 'status' })).status,
+    checkedSessionId: null, exists: null, cleared: false,
+  });
+  assert.equal(f.requests.length, 0);
+  assert.deepEqual(fileSnapshot(f.dir), before);
+  for (const extra of [{ sessionId: 'prospective' }, { operationId: 'reservation-0001' }]) {
+    assert.equal((await wire(f.file, { operation: 'can-bind', ...extra })).code, 2);
+  }
+  await control(f.file, bind());
+  f.native({ meta: { sessionId: 'session-one', cwd: '/fixture/workspace',
+    loaded: false, status: 'unloaded', ask: null } });
+  const bound = fileSnapshot(f.dir), checked = await control(f.file, { operation: 'can-bind' });
+  assert.equal(checked.exists, true);
+  assert.equal(checked.cleared, false);
+  assert.equal(checked.checkedSessionId, 'session-one');
+  assert.equal(checked.status.available, false);
+  assert.equal(checked.status.reason, 'ALREADY_BOUND');
+  assert.equal(checked.status.boundSessionId, 'session-one');
+  assert.equal(checked.status.revision, 1);
+  assert.deepEqual(fileSnapshot(f.dir), bound);
+  assert.deepEqual(f.requests.map(request => request.url), ['/intent/session/get', '/intent/session/get']);
+});
+
+test('authoritative absence retires only the active route while retaining unknown outbox/history and its replay fences', async t => {
+  const f = await fixture(t);
+  await control(f.file, bind());
+  const captured = loadConfig(f.file), original = readControl(captured);
+  const store = new Store(captured.stateDir);
+  store.set('binding', storedBinding(captured));
+  store.set('cursor', 'retained-inbox-cursor');
+  store.set('historyCheckpoint', { id: 'retained-native-event' });
+  store.db.prepare('INSERT INTO jobs VALUES (?,?,?)').run('unknown-job', 1, JSON.stringify({
+    id: 'unknown-job', status: 'blocked', reason: 'WEIXIN_OUTCOME_UNKNOWN',
+    outbox: [{ clientId: 'retained-client-id', status: 'unknown' }], original: 'private retained input',
+  }));
+  store.close();
+  const business = fileSnapshot(captured.stateDir);
+  const account = fs.readFileSync(f.raw.credentialFile);
+  f.native({ meta: null });
+  const checked = await control(f.file, { operation: 'can-bind' });
+  assert.equal(checked.exists, false);
+  assert.equal(checked.cleared, true);
+  assert.equal(checked.status.available, false);
+  assert.equal(checked.status.reason, 'UNKNOWN_OUTCOMES');
+  assert.equal(checked.status.boundSessionId, null);
+  assert.equal(checked.status.bindingConfirmed, false);
+  assert.equal(checked.status.revision, 2);
+  assert.equal(checked.status.retainedMissingBindings, 1);
+  assert.deepEqual(fileSnapshot(captured.stateDir), business);
+  assert.deepEqual(fs.readFileSync(f.raw.credentialFile), account);
+  const retired = readControl(loadConfig(f.file));
+  assert.equal(retired.active, null);
+  assert.deepEqual(retired.operations, original.operations);
+  assert.deepEqual(retired.history, [{ ...original.active, retiredReason: 'TARGET_SESSION_MISSING' }]);
+  assert.throws(() => assertActiveBinding(captured), { code: 'TARGET_SESSION_MISSING' });
+  const replay = await control(f.file, bind());
+  assert.equal(replay.ok, false);
+  assert.equal(replay.error.code, 'OPERATION_STATE_CHANGED');
+  assert.equal(replay.boundSessionId, null);
+  assert.equal(replay.revision, 2);
+  const requests = f.requests.length;
+  assert.equal((await control(f.file, { operation: 'can-bind' })).status.reason, 'UNKNOWN_OUTCOMES');
+  assert.equal(f.requests.length, requests, 'a second explicit check does not scan retired bindings');
+  f.native(undefined);
+  const next = await control(f.file, bind('bind-after-missing', 'session-two'));
+  assert.equal(next.ok, false);
+  assert.equal(next.error.code, 'UNKNOWN_OUTCOMES');
+  assert.equal(next.boundSessionId, null);
+  assert.deepEqual(fileSnapshot(captured.stateDir), business);
+  assert.deepEqual(f.requests.map(request => request.url), ['/intent/session/get', '/intent/session/get']);
+});
+
+test('can-bind frees an absent target with no inbox history and actual bind rechecks native identity in a fresh directory', async t => {
+  const f = await fixture(t);
+  await control(f.file, bind());
+  const config = loadConfig(f.file);
+  const store = new Store(config.stateDir);
+  store.set('binding', storedBinding(config));
+  store.set('historyCheckpoint', { id: 'retained-checkpoint' });
+  store.close();
+  const original = fileSnapshot(config.stateDir);
+  f.native({ meta: null });
+  const checked = await control(f.file, { operation: 'can-bind' });
+  assert.equal(checked.status.available, true);
+  assert.equal(checked.status.reason, null);
+  assert.equal(checked.status.boundSessionId, null);
+  assert.equal(checked.cleared, true);
+  f.native(undefined);
+  const next = await control(f.file, bind('bind-after-missing', 'session-two'));
+  assert.equal(next.ok, true);
+  assert.equal(next.boundSessionId, 'session-two');
+  assert.notEqual(loadConfig(f.file).stateDir, config.stateDir);
+  assert.deepEqual(fs.readdirSync(loadConfig(f.file).stateDir), []);
+  assert.deepEqual(fileSnapshot(config.stateDir), original);
+  assert.deepEqual(f.requests.map(request => request.url),
+    ['/intent/session/get', '/intent/session/get', '/intent/session/get']);
+});
+
+for (const [result, status, code] of [
+  [{}, 200, 'COCKPIT_SESSION_SCHEMA'],
+  [{ meta: false }, 200, 'COCKPIT_SESSION_SCHEMA'],
+  [{ meta: { sessionId: 'different-id', loaded: false } }, 200, 'COCKPIT_SESSION_SCHEMA'],
+  [{ ok: false, meta: null }, 200, 'COCKPIT_SESSION_SCHEMA'],
+  [{ ok: 'true', meta: null }, 200, 'COCKPIT_SESSION_SCHEMA'],
+  [{ error: 'not a native response', meta: null }, 200, 'COCKPIT_SESSION_SCHEMA'],
+  [{ meta: null }, 403, 'HTTP_403'],
+  [{ meta: null }, 404, 'HTTP_404'],
+  [{ meta: null }, 500, 'HTTP_500'],
+]) {
+  test(`can-bind never treats ${status}/${JSON.stringify(result)} as authoritative absence`, async t => {
+    const f = await fixture(t);
+    await control(f.file, bind());
+    f.native(result, status);
+    const before = fileSnapshot(f.dir);
+    const checked = await control(f.file, { operation: 'can-bind' });
+    assert.equal(checked.exists, null);
+    assert.equal(checked.cleared, false);
+    assert.equal(checked.status.available, false);
+    assert.equal(checked.status.reason, code);
+    assert.equal(checked.status.boundSessionId, 'session-one');
+    assert.deepEqual(fileSnapshot(f.dir), before);
+    assert.equal(f.requests.length, 2);
+  });
+}
+
+test('can-bind timeout keeps the exact active route and is not retried', async t => {
+  const f = await fixture(t);
+  await control(f.file, bind());
+  const before = fileSnapshot(f.dir);
+  const hold = Promise.withResolvers();
+  f.hold(hold.promise);
+  try {
+    const checked = await control(f.file, { operation: 'can-bind' });
+    assert.equal(checked.exists, null);
+    assert.equal(checked.status.reason, 'REQUEST_TIMEOUT');
+    assert.equal(checked.status.boundSessionId, 'session-one');
+    assert.equal(checked.cleared, false);
+    assert.deepEqual(fileSnapshot(f.dir), before);
+    assert.equal(f.requests.length, 2);
+  } finally { hold.resolve(); }
+});
+
+for (const nextSession of ['session-one', 'session-two']) {
+  test(`late missing response cannot clear a new ${nextSession} binding generation`, async t => {
+    const f = await fixture(t);
+    await control(f.file, bind());
+    const requested = Promise.withResolvers(), held = Promise.withResolvers();
+    const checking = control(f.file, { operation: 'can-bind' }, { fetchImpl: async (url, init) => {
+      assert.equal(new URL(url).pathname, '/intent/session/get');
+      assert.deepEqual(JSON.parse(init.body), { sessionId: 'session-one' });
+      requested.resolve();
+      await held.promise;
+      return Response.json({ meta: null });
+    } });
+    await requested.promise;
+    await control(f.file, unbind());
+    await control(f.file, bind('bind-new-generation', nextSession));
+    const newer = new RunLock(loadConfig(f.file).lockDir, { drain: true });
+    try {
+      const before = fileSnapshot(f.dir);
+      held.resolve();
+      const checked = await checking;
+      assert.equal(checked.exists, false);
+      assert.equal(checked.cleared, false);
+      assert.equal(checked.status.available, false);
+      assert.equal(checked.status.reason, 'BINDING_CHANGED_DURING_CHECK');
+      assert.equal(checked.status.boundSessionId, nextSession);
+      assert.equal(checked.status.revision, 3);
+      assert.equal(newer.stopRequested(), false);
+      assert.deepEqual(fileSnapshot(f.dir), before);
+    } finally { held.resolve(); newer.release(); }
+  });
+}
+
+test('changed configuration authority during a missing lookup cannot clear or stop the captured route', async t => {
+  const f = await fixture(t);
+  await control(f.file, bind());
+  const config = loadConfig(f.file), before = fs.readFileSync(controlFile(config));
+  const runner = new RunLock(config.lockDir, { drain: true });
+  try {
+    await assert.rejects(control(f.file, { operation: 'can-bind' }, { fetchImpl: async () => {
+      writePrivate(f.file, { ...f.raw, limits: { ...f.raw.limits, statusIntervalMs: 30 } });
+      return Response.json({ meta: null });
+    } }), { code: 'MODULE_CONFIG_CHANGED' });
+    assert.deepEqual(fs.readFileSync(controlFile(config)), before);
+    assert.equal(runner.stopRequested(), false);
+  } finally { runner.release(); }
+});
+
+test('missing cleanup write uncertainty is explicit and cannot authorize a new binding', async t => {
+  const f = await fixture(t);
+  await control(f.file, bind());
+  const config = loadConfig(f.file), before = fs.readFileSync(controlFile(config));
+  f.native({ meta: null });
+  const rename = fs.renameSync;
+  const fault = t.mock.method(fs, 'renameSync', (source, target) => {
+    if (target === controlFile(config)) throw new Error('Injected private control write failure');
+    return rename(source, target);
+  });
+  try {
+    const checked = await control(f.file, { operation: 'can-bind' });
+    assert.equal(checked.exists, false);
+    assert.equal(checked.cleared, false);
+    assert.equal(checked.status.available, false);
+    assert.equal(checked.status.reason, 'BINDING_CLEANUP_OUTCOME_UNKNOWN');
+    assert.equal(checked.status.boundSessionId, 'session-one');
+    assert.deepEqual(fs.readFileSync(controlFile(config)), before);
+    assert.equal(f.requests.length, 2);
+  } finally { fault.mock.restore(); }
+});
+
+test('missing cleanup while running never opens or recovers the old WAL and never claims an active binding', async t => {
+  const f = await fixture(t);
+  await control(f.file, bind());
+  const config = loadConfig(f.file), store = new Store(config.stateDir), lock = new RunLock(config.lockDir, { drain: true });
+  try {
+    store.set('binding', storedBinding(config));
+    store.db.prepare('INSERT INTO jobs VALUES (?,?,?)').run('sending', 1,
+      JSON.stringify({ id: 'sending', status: 'replying', outbox: [{ status: 'sending' }] }));
+    const before = fileSnapshot(config.stateDir);
+    f.native({ meta: null });
+    const checked = await control(f.file, { operation: 'can-bind' });
+    assert.equal(checked.cleared, true);
+    assert.equal(checked.status.boundSessionId, null);
+    assert.equal(checked.status.bindingConfirmed, false);
+    assert.equal(checked.status.available, false);
+    assert.equal(checked.status.reason, 'RUNNING');
+    assert.equal(checked.status.pendingJobs, null);
+    assert.equal(checked.status.unknownJobs, null);
+    assert.equal(lock.stopRequested(), true, 'existing 0.1.4 drain protocol also stops its original generation');
+    assert.deepEqual(fileSnapshot(config.stateDir), before);
+    assert.equal(store.job('sending').outbox[0].status, 'sending');
+    await assert.rejects(control(f.file, bind('bind-while-draining', 'session-two')), { code: 'RUNNING' });
+  } finally { lock.release(); store.close(); }
+  assert.equal((await control(f.file, { operation: 'can-bind' })).status.reason, 'UNKNOWN_OUTCOMES');
+});
+
+test('missing cleanup refuses to force a runner without drain support but still retires its active reference', async t => {
+  const f = await fixture(t);
+  await control(f.file, bind());
+  const config = loadConfig(f.file), lock = new RunLock(config.lockDir);
+  try {
+    f.native({ meta: null });
+    const checked = await control(f.file, { operation: 'can-bind' });
+    assert.equal(checked.cleared, true);
+    assert.equal(checked.status.boundSessionId, null);
+    assert.equal(checked.status.bindingConfirmed, false);
+    assert.equal(checked.status.available, false);
+    assert.equal(checked.status.reason, 'RUNNER_DRAIN_UNAVAILABLE');
+    assert.equal(lock.stopRequested(), false);
+    assert.equal(readControl(loadConfig(f.file)).active, null);
+  } finally { lock.release(); }
 });
 
 test('binding inconsistency takes precedence over business blockers without changing files or control identity', async t => {
@@ -852,7 +1122,10 @@ test('session-unbind receipt never unbinds a later generation even for the same 
   const config = loadConfig(f.file);
   const before = readControl(config);
   assert.notEqual(before.active.id, before.history[0].id);
-  assert.deepEqual(await control(f.file, sessionUnbind()), { ...receipt, replayed: true });
+  assert.deepEqual(await control(f.file, sessionUnbind()), {
+    ok: false, operationId: receipt.operationId, sessionId: receipt.sessionId,
+    error: { code: 'OPERATION_STATE_CHANGED' }, replayed: true,
+  });
   assert.deepEqual(readControl(config), before);
   assert.equal(config.cockpit.sessionId, 'session-one');
   assert.equal(f.requests.length, 2);
@@ -949,8 +1222,10 @@ test('unbind retains Store binding/checkpoints and config backup; clean rebind c
   writePrivate(f.file, state.configBackup);
   assert.equal(loadConfig(f.file).cockpit.sessionId, 'session-two');
   const replay = await control(f.file, bind());
-  assert.equal(replay.boundSessionId, 'session-one');
-  assert.equal(replay.revision, 1);
+  assert.equal(replay.ok, false);
+  assert.equal(replay.error.code, 'OPERATION_STATE_CHANGED');
+  assert.equal(replay.boundSessionId, 'session-two');
+  assert.equal(replay.revision, 3);
   assert.equal(loadConfig(f.file).cockpit.sessionId, 'session-two');
 });
 
@@ -1231,3 +1506,65 @@ test('real managed CLI runner shares stable lock with offline mutations, status,
   assert.equal((await cli(f.file, ['run']).done).code, 2);
   assert.ok(!f.requests.some(req => /sendmessage|\/intent\/prompt$|interrupt|cancel/.test(req.url)));
 });
+
+for (const trigger of ['can-bind', 'incoming']) {
+  test(`real managed runner stops its retired route after ${trigger}, preserving data and making no prompt or send`, async t => {
+    const f = await fixture(t);
+    await control(f.file, bind());
+    const config = loadConfig(f.file), account = fs.readFileSync(config.credentialFile);
+    const runner = cli(f.file, ['run'], { preload: true, env: {
+      TEST_MOCK_PORT: String(f.port), COCKPIT_MODULE_ID: undefined, COCKPIT_MODULE_VERSION: undefined,
+      COCKPIT_MODULE_DIGEST: undefined, COCKPIT_MODULE_INSTANCE: undefined,
+      COCKPIT_MODULE_PORT: undefined, SERVICE_DELIVERY_PORT: undefined,
+      SERVICE_DELIVERY_SHA: undefined, SERVICE_DELIVERY_ARTIFACT: undefined,
+      SERVICE_DELIVERY_REQUEST: undefined, SERVICE_DELIVERY_INSTANCE: undefined,
+    } });
+    t.after(async () => {
+      if (runner.child.exitCode === null && runner.child.signalCode === null) {
+        runner.child.kill('SIGTERM');
+        await runner.done;
+      }
+    });
+    const deadline = Date.now() + 5000;
+    while (!f.requests.some(req => req.url === '/weixin/ilink/bot/getupdates')) {
+      if (runner.child.exitCode !== null) assert.fail(JSON.stringify(await runner.done));
+      assert.ok(Date.now() < deadline, 'isolated runner did not become responsive');
+      await delay(10);
+    }
+    f.native({ meta: null });
+    if (trigger === 'can-bind') {
+      const checked = await control(f.file, { operation: 'can-bind' });
+      assert.equal(checked.cleared, true);
+      assert.equal(checked.status.boundSessionId, null);
+      assert.equal(checked.status.bindingConfirmed, false);
+      if (checked.status.running) assert.equal(checked.status.available, false);
+    } else f.incoming([{
+      message_id: 123, from_user_id: credentials.peer, to_user_id: credentials.account,
+      message_type: 1, message_state: 2, context_token: 'FAKE_PRIVATE_CONTEXT',
+      item_list: [{ type: 1, text_item: { text: 'Fresh isolated input' } }],
+    }]);
+    const stopped = await Promise.race([runner.done, delay(5000).then(() => {
+      throw new Error('retired runner did not finish its safe drain');
+    })]);
+    assert.equal(stopped.code, 2, stopped.stderr);
+    assert.match(stopped.stderr, /TARGET_SESSION_MISSING/);
+    assert.equal(fs.existsSync(path.join(config.lockDir, 'run.lock')), false);
+    const status = (await control(f.file, { operation: 'status' })).status;
+    assert.equal(status.boundSessionId, null);
+    assert.equal(status.bindingConfirmed, false);
+    assert.equal(status.available, false);
+    assert.equal(status.reason, trigger === 'incoming' ? 'PENDING_INBOX_BATCH' : 'REBIND_HISTORY_REVIEW_REQUIRED');
+    assert.equal(status.retainedMissingBindings, 1);
+    assert.deepEqual(fs.readFileSync(config.credentialFile), account);
+    const state = readControl(loadConfig(f.file));
+    assert.equal(state.active, null);
+    assert.equal(state.history[0].stateDir, config.stateDir);
+    const store = new Store(config.stateDir);
+    try {
+      assert.equal(store.get('binding').sessionId, 'session-one');
+      assert.ok(store.get('historyCheckpoint'));
+      if (trigger === 'incoming') assert.equal(store.get('pendingBatch').msgs[0].message_id, 123);
+    } finally { store.close(); }
+    assert.ok(f.requests.every(req => !/sendmessage|\/intent\/prompt$|interrupt|reload|session\/new/.test(req.url)));
+  });
+}

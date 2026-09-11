@@ -4,7 +4,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { createHash } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
 import { BridgeError, object, requireThat } from './common.js';
-import { privateDirectory, readPrivate, RunLock, secureExisting } from './storage.js';
+import { privateDirectory, readPrivate, RunLock, secureExisting, writePrivate } from './storage.js';
 
 export const controlFile = config => path.join(config.lockDir, 'module-binding.json');
 export const gateDir = config => path.join(config.lockDir, 'module-control');
@@ -51,17 +51,20 @@ export function readControl(config) {
   for (const binding of [...state.history, ...(state.active ? [state.active] : [])]) {
     requireThat(typeof binding.id === 'string' && /^[a-f0-9-]{36}$/.test(binding.id)
       && typeof binding.sessionId === 'string' && typeof binding.cwd === 'string'
-      && binding.stateDir === path.join(config.moduleStateRoot, binding.id), 'MODULE_STATE_INVALID');
+      && binding.stateDir === path.join(config.moduleStateRoot, binding.id)
+      && (binding.retiredReason === undefined || binding.retiredReason === 'TARGET_SESSION_MISSING'),
+    'MODULE_STATE_INVALID');
     requireThat(fs.existsSync(binding.stateDir), 'MODULE_BINDING_STATE_MISSING');
     secureExisting(binding.stateDir, true);
   }
+  requireThat(!state.active?.retiredReason, 'MODULE_STATE_INVALID');
   return state;
 }
 
 export function routeConfig(config, state = config.moduleManaged ? readControl(config) : null) {
   if (!config.moduleManaged) return config;
   return {
-    ...config, moduleRevision: state?.revision ?? 0,
+    ...config, moduleRevision: state?.revision ?? 0, moduleBindingId: state?.active?.id ?? null,
     stateDir: state?.active?.stateDir ?? config.moduleStateRoot,
     cockpit: { ...config.cockpit, sessionId: state?.active?.sessionId ?? '', cwd: state?.active?.cwd ?? '' },
   };
@@ -81,13 +84,61 @@ export function acquireModuleGate(config, { unlockStale = false } = {}) {
   }
 }
 
-export function assertCurrentConfig(config) {
+function assertConfigAuthority(config) {
   let raw;
   try { raw = JSON.parse(fs.readFileSync(config.configPath, 'utf8')); }
   catch { throw new BridgeError('CONFIG_READ_FAILED'); }
   requireThat(createHash('sha256').update(JSON.stringify(raw)).digest('hex') === config.configDigest,
     'MODULE_CONFIG_CHANGED');
-  requireThat((readControl(config)?.revision ?? 0) === config.moduleRevision, 'MODULE_CONFIG_STALE');
+}
+
+function currentBinding(config, state) {
+  return (state?.revision ?? 0) === config.moduleRevision
+    && (state?.active?.id ?? null) === config.moduleBindingId
+    && (state?.active?.sessionId ?? '') === config.cockpit.sessionId
+    && (state?.active?.cwd ?? '') === config.cockpit.cwd
+    && (state?.active?.stateDir ?? config.moduleStateRoot) === config.stateDir;
+}
+
+export function assertCurrentConfig(config) {
+  assertConfigAuthority(config);
+  requireThat(currentBinding(config, readControl(config)), 'MODULE_CONFIG_STALE');
+}
+
+export function assertActiveBinding(config) {
+  if (!config.moduleManaged) return;
+  assertConfigAuthority(config);
+  const state = readControl(config);
+  if (!currentBinding(config, state)) {
+    const missing = state?.history.some(binding => binding.id === config.moduleBindingId
+      && binding.sessionId === config.cockpit.sessionId && binding.cwd === config.cockpit.cwd
+      && binding.retiredReason === 'TARGET_SESSION_MISSING');
+    throw new BridgeError(missing ? 'TARGET_SESSION_MISSING' : 'MODULE_CONFIG_STALE');
+  }
+  requireThat(state?.active, 'MODULE_NOT_BOUND');
+}
+
+// Only the caller that read authoritative absence for this exact route may retire it.
+export function retireMissingBinding(config) {
+  if (!config.moduleManaged || !config.moduleBindingId) return { cleared: false };
+  const gate = acquireModuleGate(config);
+  try {
+    assertConfigAuthority(config);
+    const state = readControl(config);
+    if (!currentBinding(config, state) || !state?.active) return { cleared: false };
+    state.history.push({ ...state.active, retiredReason: 'TARGET_SESSION_MISSING' });
+    state.active = null;
+    state.revision++;
+    try { writePrivate(controlFile(config), state); }
+    catch { throw new BridgeError('BINDING_CLEANUP_OUTCOME_UNKNOWN'); }
+    try {
+      if (readPrivate(path.join(config.lockDir, 'run.lock'))) RunLock.requestStop(config.lockDir, { requireDrain: true });
+    } catch (error) {
+      if (error.code !== 'NOT_RUNNING') return { cleared: true,
+        cleanupCode: error instanceof BridgeError ? error.code : 'BINDING_DRAIN_OUTCOME_UNKNOWN' };
+    }
+    return { cleared: true };
+  } finally { gate.release(); }
 }
 
 export function runnerState(config, { snapshot = false } = {}) {

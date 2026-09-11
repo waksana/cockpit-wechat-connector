@@ -12,7 +12,7 @@ import { Store, RunLock, privateDirectory, readPrivate, writePrivate } from './s
 import { WeixinClient, login } from './weixin.js';
 import { deliverPublishedPng } from './image.js';
 import { lifecycleConfig, startLifecycle } from './lifecycle.js';
-import { acquireModuleGate, assertCurrentConfig, readControl } from './module-state.js';
+import { acquireModuleGate, assertActiveBinding, assertCurrentConfig, readControl } from './module-state.js';
 import { moduleStatus } from './module-control.js';
 
 function options(argv) {
@@ -166,8 +166,14 @@ export async function main(argv = process.argv.slice(2)) {
       return;
     }
     timer = setInterval(() => {
-      try { if (lock.stopRequested()) abort.abort(); }
-      catch { abort.abort(); process.stderr.write('STOP_CONTROL_READ_FAILED\n'); process.exitCode = 1; }
+      try {
+        assertActiveBinding(config);
+        if (lock.stopRequested()) abort.abort();
+      } catch (error) {
+        abort.abort();
+        process.stderr.write(`${error instanceof BridgeError ? error.code : 'STOP_CONTROL_READ_FAILED'}\n`);
+        process.exitCode = error instanceof BridgeError ? 2 : 1;
+      }
     }, 250);
     if (delivery) lifecycle = await startLifecycle(delivery, {
       state: () => ({ running, ready: bridge.draining === false,
