@@ -309,7 +309,7 @@ test('read-only status never ignores or checkpoints an unconsumed WAL, and keeps
       const { status } = JSON.parse(result.stdout);
       assert.equal(status.boundSessionId, 'session-one');
       assert.equal(status.reason, 'STATE_SNAPSHOT_UNAVAILABLE');
-      assert.equal(status.bindingConfirmed, true);
+      assert.equal(status.bindingConfirmed, false);
       assert.equal(status.available, false);
       assert.equal(status.detailsAvailable, false);
       assert.equal(status.unknownJobs, null);
@@ -324,7 +324,7 @@ test('read-only status never ignores or checkpoints an unconsumed WAL, and keeps
   assert.equal(f.requests.length, 1);
 });
 
-test('binding proof sees committed WAL identity changes independently of business counts without source writes', async t => {
+test('running confirmation is control-only and unavailable stopped WAL inspection remains unconfirmed', async t => {
   const f = await fixture(t);
   await control(f.file, bind());
   const config = loadConfig(f.file), store = new Store(config.stateDir);
@@ -347,7 +347,7 @@ test('binding proof sees committed WAL identity changes independently of busines
           assert.equal(response.code, 0, response.stdout);
           const { status } = JSON.parse(response.stdout);
           assert.equal(status.reason, running ? 'RUNNING' : 'STATE_SNAPSHOT_UNAVAILABLE');
-          assert.equal(status.bindingConfirmed, false);
+          assert.equal(status.bindingConfirmed, running, 'running status must not claim to have inspected this changed WAL binding');
           assert.equal(status.boundSessionId, 'session-one');
           assert.equal(status.revision, 1);
           assert.equal(status.pendingJobs, null);
@@ -356,15 +356,44 @@ test('binding proof sees committed WAL identity changes independently of busines
         }
         store.set('binding', expected);
         const before = fileSnapshot(f.dir);
-        assert.equal((await control(f.file, { operation: 'status' })).status.bindingConfirmed, true);
+        assert.equal((await control(f.file, { operation: 'status' })).status.bindingConfirmed, running);
         assert.deepEqual(fileSnapshot(f.dir), before);
         store.db.prepare('DELETE FROM kv WHERE key=?').run('binding');
-        assert.equal((await control(f.file, { operation: 'status' })).status.bindingConfirmed, false);
+        assert.equal((await control(f.file, { operation: 'status' })).status.bindingConfirmed, running);
       } finally { runner?.release(); }
     }
     assert.equal(store.job('fixture-pending').status, 'prompting');
   } finally { store.close(); }
   assert.equal(f.requests.length, 1, 'identity status never performs another native or WeChat request');
+});
+
+test('stopped confirmation requires the complete established Store binding even with an ALREADY_BOUND reason', async t => {
+  const f = await fixture(t);
+  await control(f.file, bind());
+  const config = loadConfig(f.file), store = new Store(config.stateDir);
+  const expected = storedBinding(config);
+  try {
+    for (const binding of [
+      null, { sessionId: 'session-one', cwd: '/fixture/workspace' },
+      { ...expected, account: 'different-account' }, { ...expected, peer: 'different-peer' },
+      { ...expected, apiUrl: 'http://127.0.0.1:1' }, { ...expected, tokenFile: '/different/reference' },
+    ]) {
+      if (binding) store.set('binding', binding);
+      else store.db.prepare('DELETE FROM kv WHERE key=?').run('binding');
+      store.db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
+      const before = fileSnapshot(f.dir);
+      const { status } = await control(f.file, { operation: 'status' });
+      assert.equal(status.reason, 'ALREADY_BOUND');
+      assert.equal(status.bindingConfirmed, false);
+      assert.equal(status.pendingJobs, 0);
+      assert.equal(status.unknownJobs, 0);
+      assert.deepEqual(fileSnapshot(f.dir), before);
+    }
+    store.set('binding', expected);
+    store.db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
+    assert.equal((await control(f.file, { operation: 'status' })).status.bindingConfirmed, true);
+  } finally { store.close(); }
+  assert.equal(f.requests.length, 1);
 });
 
 test('confirmed identity cannot be borrowed from missing Stores, mismatched authority or ambiguous control receipts', async t => {
@@ -377,7 +406,7 @@ test('confirmed identity cannot be borrowed from missing Stores, mismatched auth
   store.close();
   assert.equal(moduleStatus(config).bindingConfirmed, true);
   const original = readControl(config);
-  for (const mutate of [
+  const mutations = [
     state => { state.revision++; },
     state => { state.operations['bind-first'].request.cwd = '/other'; },
     state => { state.operations['bind-first'].result.boundSessionId = 'other'; },
@@ -387,59 +416,64 @@ test('confirmed identity cannot be borrowed from missing Stores, mismatched auth
       state.operations['duplicate-bind'].result.operationId = 'duplicate-bind';
     },
     state => { state.history.push(structuredClone(state.active)); },
-  ]) {
-    const state = structuredClone(original);
-    mutate(state);
-    writePrivate(controlFile(config), state);
-    const before = fileSnapshot(f.dir);
-    assert.equal(moduleStatus(config).bindingConfirmed, false);
-    assert.deepEqual(fileSnapshot(f.dir), before);
+    state => { state.active = null; },
+  ];
+  for (const running of [false, true]) {
+    const runner = running ? new RunLock(config.lockDir) : null;
+    try {
+      for (const mutate of mutations) {
+        const state = structuredClone(original);
+        mutate(state);
+        writePrivate(controlFile(config), state);
+        const before = fileSnapshot(f.dir);
+        assert.equal(moduleStatus(config).bindingConfirmed, false);
+        assert.deepEqual(fileSnapshot(f.dir), before);
+      }
+      writePrivate(controlFile(config), original);
+      writePrivate(f.file, { ...f.raw, limits: { ...f.raw.limits, statusIntervalMs: 25 } });
+      assert.equal(moduleStatus(config).bindingConfirmed, false, 'stale loaded config cannot prove the current file authority');
+      writePrivate(f.file, f.raw);
+    } finally { runner?.release(); }
   }
-  writePrivate(controlFile(config), original);
-  writePrivate(f.file, { ...f.raw, limits: { ...f.raw.limits, statusIntervalMs: 25 } });
-  assert.equal(moduleStatus(config).bindingConfirmed, false, 'stale loaded config cannot prove the current file authority');
-  writePrivate(f.file, f.raw);
   fs.unlinkSync(path.join(config.stateDir, 'bridge.sqlite'));
   assert.equal(moduleStatus(config).bindingConfirmed, false, 'deleted Store cannot fall back to the control record');
   assert.equal(f.requests.length, 1);
 });
 
-test('binding snapshot rejects racing or oversized sources and always removes its private temporary copy', async t => {
+test('running association confirmation never copies or opens business files or creates temporary directories', async t => {
   const f = await fixture(t);
   await control(f.file, bind());
-  const config = loadConfig(f.file), store = new Store(config.stateDir);
-  store.set('binding', storedBinding(config));
+  const config = loadConfig(f.file);
+  const main = path.join(config.stateDir, 'bridge.sqlite');
+  fs.writeFileSync(main, 'unreadable synthetic business database', { mode: 0o600 });
   const runner = new RunLock(config.lockDir);
-  const main = path.join(config.stateDir, 'bridge.sqlite'), copies = [];
-  const makeTemp = fs.mkdtempSync, read = fs.readSync;
-  const tempMock = t.mock.method(fs, 'mkdtempSync', (...args) => {
-    const directory = makeTemp(...args);
-    copies.push(directory);
-    assert.equal(fs.statSync(directory).mode & 0o777, 0o700);
-    return directory;
+  const open = fs.openSync, read = fs.readFileSync;
+  const checkPath = file => {
+    assert.ok(typeof file !== 'string' || !file.startsWith(`${config.stateDir}/`), 'must not open any business file');
+  };
+  const openMock = t.mock.method(fs, 'openSync', (file, ...args) => {
+    checkPath(file);
+    return open(file, ...args);
   });
-  let changed = false;
-  const readMock = t.mock.method(fs, 'readSync', (fd, ...args) => {
-    const bytes = read(fd, ...args);
-    if (!changed && fs.fstatSync(fd).ino === fs.statSync(main).ino) {
-      changed = true;
-      store.set('binding', { ...storedBinding(config), sessionId: 'changed-during-copy' });
-    }
-    return bytes;
+  const readMock = t.mock.method(fs, 'readFileSync', (file, ...args) => {
+    checkPath(file);
+    return read(file, ...args);
+  });
+  const tempMock = t.mock.method(fs, 'mkdtempSync', () => {
+    assert.fail('status must not create a temporary database copy');
   });
   try {
-    try {
-      assert.equal(moduleStatus(config).bindingConfirmed, false);
-      assert.equal(changed, true);
-      assert.equal(copies.length, 1);
-      assert.ok(copies.every(directory => !fs.existsSync(directory)));
-    } finally {
-      readMock.mock.restore(); tempMock.mock.restore(); store.close();
-    }
-    fs.truncateSync(main, 128 * 1024 * 1024 + 1);
-    assert.equal(moduleStatus(config).bindingConfirmed, false);
-    assert.equal(fs.statSync(main).size, 128 * 1024 * 1024 + 1);
-  } finally { runner.release(); }
+    const status = moduleStatus(config);
+    assert.equal(status.bindingConfirmed, true);
+    assert.equal(status.reason, 'RUNNING');
+    assert.equal(status.detailsAvailable, false);
+    assert.equal(status.pendingJobs, null);
+    assert.equal(status.unknownJobs, null);
+    assert.equal(f.requests.length, 1);
+  } finally {
+    openMock.mock.restore(); readMock.mock.restore(); tempMock.mock.restore();
+    runner.release();
+  }
 });
 
 test('parallel status cannot interfere with unique bind native validation or persist partial routing', async t => {

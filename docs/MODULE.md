@@ -142,35 +142,37 @@ mismatch. In 0.1.2, partial running/WAL snapshots do not inspect the historical
 Store binding: their control ID/revision is not a claim of Store consistency.
 Mutation fences and recovery behavior are unchanged.
 
-Starting in 0.1.3, `bindingConfirmed` requires the current managed configuration
-authority, one active routing identity, its unique successful bind receipt at
-the current revision, known runner/control state, and an exactly matching
-persisted Store `binding` (account, peer and all Cockpit configuration fields).
-The routing record is reread after inspection. Pending control operations,
-duplicate active/archive identity, changed or missing bindings, and unknown
-runner/control state cannot produce true. Invalid private control/configuration
-records still fail explicitly.
+Starting in 0.1.3, `bindingConfirmed` means **the original control association
+was checked**, not business database health or permission to replay work. It
+requires the current managed configuration authority, one active routing
+identity, its unique successful bind receipt at the current revision, ready
+configuration/credentials, and known runner/control state. The routing record
+is reread before returning. Pending control operations, missing active identity,
+duplicate active/archive identity, unknown runner state and configuration drift
+cannot produce true. Invalid private control/configuration records fail explicitly.
 
-Business blockers and unknown/null job counts do not negate a valid identity
-proof. For live runners or nonempty WAL, only the binding is queried from an
-owner-private temporary copy of the main database and WAL, at most 128 MiB
-combined. Source inode/size/mtime/ctime must remain unchanged across the copy
-and query. SQLite never opens the original live database, WAL or SHM for this
-proof; the temporary directory is removed in `finally`. A nonempty rollback
-journal, exceeded bound, changing snapshot or unreadable binding cannot be
-confirmed. Detailed job diagnostics remain null and no recovery/checkpoint or
-business mutation runs. This is a point-in-time identity proof, not a promise
-that state cannot change afterward.
+For `running:true,runnerUnknown:false`, this flag uses only the verified control
+active/receipt and current configuration authority. It does **not** open or copy
+the running business database, WAL or SHM. `detailsAvailable:false` and null job
+counts remain truthful indications that business details were not inspected.
+The flag cannot detect or attest to unobserved changes inside a running Store.
 
-A fresh bind can succeed before the runner creates its Store. Until a matching
-Store binding exists, `bindingConfirmed` is false, including an empty/deleted
-Store or a missing binding row. The exact successful bind response authorizes
-first initialization; it must not be replaced by a fake Store proof. Subsequent
-cold/same-binding apply requires the existing identity proof. Consumers must
-also compare the original session/revision and require managed/config/credential
-readiness. An explicit false cannot fall back to `RUNNING`/`ALREADY_BOUND`.
-The flag grants no permission to start, send, unbind, rebind or bypass their
-existing fences; it does not validate all historical jobs or checkpoints.
+When stopped, confirmation additionally requires the existing safe immutable
+inspection and an exactly matching Store `binding` in its established format
+(account, peer and all Cockpit configuration fields). Missing/changed bindings
+are false even when `reason` is `ALREADY_BOUND` or a business blocker. If WAL or
+journal prevents safe stopped inspection, confirmation is conservatively false,
+with counts still null. No alternate database copy, recovery, checkpoint or
+business mutation is performed. Pending/unknown business jobs alone do not
+negate a valid control association when inspection is safely available.
+
+A fresh bind may succeed before the runner creates its Store: its exact success
+receipt authorizes first initialization. A stopped fresh/missing Store cannot
+be treated as confirmed for later cold/apply. Consumers must also compare the
+original session/revision and require managed/config/credential readiness.
+An explicit false cannot fall back to `RUNNING`/`ALREADY_BOUND`; legacy blocker
+reasons without this field must not be guessed safe. The flag grants no
+permission to start, send, unbind, rebind or bypass their existing fences.
 
 Status success:
 

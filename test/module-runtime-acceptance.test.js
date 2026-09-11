@@ -59,6 +59,10 @@ test('committed WeChat archive runs its real service entry, attests identity, an
   assert.equal(manifest.service.entry, 'src/cli.js');
   assert.equal(fs.existsSync(path.join(release, 'test')), false);
   assert.equal(manifest.version, JSON.parse(fs.readFileSync(path.join(release, 'package.json'))).version);
+  const controlSource = fs.readFileSync(path.join(release, 'src/module-control.js'), 'utf8');
+  assert.equal(controlSource.includes('bindingSnapshot'), false);
+  assert.equal(controlSource.includes('node:sqlite'), false);
+  assert.equal(controlSource.includes('node:os'), false);
   const cliHash = sha256(path.join(release, manifest.service.entry));
   assert.equal(cliHash, createHash('sha256')
     .update(execFileSync('git', ['show', `${commit}:src/cli.js`], { cwd: root })).digest('hex'));

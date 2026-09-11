@@ -3,8 +3,6 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
-import { tmpdir } from 'node:os';
-import { DatabaseSync } from 'node:sqlite';
 import { isDeepStrictEqual } from 'node:util';
 import { loadConfig, assertBinding } from './config.js';
 import { CockpitClient, cockpitToken } from './cockpit.js';
@@ -14,7 +12,6 @@ import { acquireModuleGate, assertCurrentConfig, blocker, controlFile, gateDir, 
   readControl, routeConfig, runnerState } from './module-state.js';
 
 const MAX_BYTES = 16384;
-const MAX_BINDING_SNAPSHOT_BYTES = 128 * 1024 * 1024;
 const sessionValid = sessionId => typeof sessionId === 'string'
   && /^[A-Za-z0-9_-]{1,200}(?![\s\S])/.test(sessionId);
 const targetValid = (sessionId, cwd) => sessionValid(sessionId) && typeof cwd === 'string'
@@ -33,59 +30,6 @@ function readiness(config) {
   }
 }
 
-function bindingSnapshot(config) {
-  const file = path.join(config.stateDir, 'bridge.sqlite');
-  const identity = () => ['', '-wal', '-journal'].map(suffix => {
-    const source = file + suffix;
-    if (!fs.existsSync(source)) return null;
-    secureExisting(source);
-    const stat = fs.statSync(source, { bigint: true });
-    return { suffix, size: Number(stat.size),
-      stamp: [stat.dev, stat.ino, stat.size, stat.mtimeNs, stat.ctimeNs].join(':') };
-  });
-  const before = identity();
-  if (!before[0]) return null;
-  requireThat(!before[2]?.size, 'BINDING_SNAPSHOT_UNAVAILABLE');
-  requireThat(before.reduce((bytes, entry) => bytes + (entry?.size ?? 0), 0) <= MAX_BINDING_SNAPSHOT_BYTES,
-    'BINDING_SNAPSHOT_UNAVAILABLE');
-  const scratch = fs.mkdtempSync(path.join(tmpdir(), 'wechat-binding-read-'));
-  try {
-    const target = path.join(scratch, 'bridge.sqlite');
-    const buffer = Buffer.alloc(64 * 1024);
-    for (const entry of before.filter(entry => entry && entry.suffix !== '-journal')) {
-      const source = fs.openSync(file + entry.suffix, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
-      try {
-        const stat = fs.fstatSync(source, { bigint: true });
-        requireThat(stat.isFile() && stat.nlink === 1n && stat.uid === BigInt(process.getuid())
-          && (stat.mode & 0o077n) === 0n
-          && [stat.dev, stat.ino, stat.size, stat.mtimeNs, stat.ctimeNs].join(':') === entry.stamp,
-        'BINDING_SNAPSHOT_UNAVAILABLE');
-        const destination = fs.openSync(target + entry.suffix, 'wx', 0o600);
-        try {
-          let offset = 0;
-          while (offset < entry.size) {
-            const bytes = fs.readSync(source, buffer, 0, Math.min(buffer.length, entry.size - offset), offset);
-            requireThat(bytes > 0, 'BINDING_SNAPSHOT_UNAVAILABLE');
-            fs.writeFileSync(destination, buffer.subarray(0, bytes));
-            offset += bytes;
-          }
-        } finally { fs.closeSync(destination); }
-      } finally { fs.closeSync(source); }
-    }
-    requireThat(isDeepStrictEqual(before, identity()), 'BINDING_SNAPSHOT_UNAVAILABLE');
-    // SQLite may update this private copy's SHM, never the source database/WAL/SHM.
-    const db = new DatabaseSync(target, { readOnly: true });
-    let binding;
-    try {
-      db.exec('PRAGMA query_only=ON; PRAGMA trusted_schema=OFF; BEGIN;');
-      const row = db.prepare('SELECT value FROM kv WHERE key=?').get('binding');
-      binding = row ? JSON.parse(row.value) : null;
-    } finally { db.close(); }
-    requireThat(isDeepStrictEqual(before, identity()), 'BINDING_SNAPSHOT_UNAVAILABLE');
-    return binding;
-  } finally { fs.rmSync(scratch, { recursive: true, force: true }); }
-}
-
 function bindingConfirmed(config, state, runner, ready, inspection) {
   if (!config.moduleManaged || !state?.active || !Number.isSafeInteger(state.revision) || state.revision < 1
     || !ready.configReady || !ready.credentialsPresent || runner.runnerUnknown !== false
@@ -98,18 +42,14 @@ function bindingConfirmed(config, state, runner, ready, inspection) {
     && op.result.ok && op.result.revision === state.revision);
   if (binds.length !== 1 || binds[0].request.sessionId !== active.sessionId || binds[0].request.cwd !== active.cwd
     || binds[0].result.boundSessionId !== active.sessionId) return false;
-  try {
-    const currentAuthority = () => createHash('sha256').update(JSON.stringify(readPrivate(config.configPath))).digest('hex') === config.configDigest;
-    if (!currentAuthority()) return false;
-    const binding = inspection ? inspection.binding : bindingSnapshot(config);
-    const expected = JSON.parse(JSON.stringify({ account: config.weixin.allowedAccount, peer: config.weixin.allowedPeer,
-      ...config.cockpit }));
-    return isDeepStrictEqual(binding, expected) && currentAuthority();
-  } catch (error) {
-    if (error instanceof BridgeError && error.code === 'BINDING_SNAPSHOT_UNAVAILABLE') return false;
-    if (error.code === 'ENOENT' || error.code === 'ERR_SQLITE_ERROR') return false;
-    throw error;
-  }
+  const currentDigest = createHash('sha256').update(JSON.stringify(readPrivate(config.configPath))).digest('hex');
+  if (currentDigest !== config.configDigest) return false;
+  // A live known runner proves control association, not the contents of its business database.
+  if (runner.running === true) return true;
+  if (runner.running !== false || !inspection?.binding) return false;
+  const expected = JSON.parse(JSON.stringify({ account: config.weixin.allowedAccount, peer: config.weixin.allowedPeer,
+    ...config.cockpit }));
+  return isDeepStrictEqual(inspection.binding, expected);
 }
 
 export function moduleStatus(config) {
