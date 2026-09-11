@@ -5,7 +5,7 @@
   "validation": [["npm", "test"]],
   "build": {
     "argv": ["node", "--check", "src/cli.js"],
-    "artifactPaths": ["src", "package.json", "package-lock.json"]
+    "artifactPaths": ["src", "module.json", "package.json", "package-lock.json"]
   },
   "delivery": {
     "adapter": "github-actions-v1",

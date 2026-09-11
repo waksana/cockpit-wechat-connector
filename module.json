@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "id": "wechat",
+  "version": "0.1.0",
+  "name": "WeChat",
+  "description": "Explicit, unique WeChat session binding and connector lifecycle.",
+  "compatibility": { "cockpitApi": 1, "nodeMajor": 24, "platform": "linux", "arch": "x64" },
+  "configVersion": 1,
+  "roles": [{ "id": "wechat", "name": "WeChat", "description": "Bind the configured WeChat connector to this session." }],
+  "service": {
+    "entry": "src/cli.js",
+    "args": ["run"],
+    "healthPath": "/health",
+    "versionPath": "/version",
+    "drainPath": "/admin/restart"
+  },
+  "binding": "wechat"
+}

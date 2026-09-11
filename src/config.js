@@ -1,6 +1,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { BridgeError, object, requireThat, text } from './common.js';
+import { createHash } from 'node:crypto';
+import { routeConfig } from './module-state.js';
 
 export const DEFAULT_ORIGIN = 'https://ilinkai.weixin.qq.com';
 
@@ -57,6 +59,21 @@ export function validateConfig(raw, configPath) {
     ['statusIntervalMs', 20, 60000], ['maxQueued', 1, 1000],
     ['textBytes', 128, 4000], ['maxReplyParts', 1, 100],
   ]) requireThat(Number.isInteger(limits[key]) && limits[key] >= min && limits[key] <= max, 'INVALID_LIMITS');
+  for (const key of ['stateDir', 'credentialFile', 'lockDir']) {
+    requireThat(raw[key] === undefined || (text(raw[key], 4096) && path.isAbsolute(raw[key])
+      && path.resolve(raw[key]) === raw[key] && !/[\0\r\n]/.test(raw[key])), 'INVALID_STATE_PATH');
+  }
+  requireThat(raw.moduleManaged === undefined || typeof raw.moduleManaged === 'boolean', 'INVALID_MODULE_MODE');
+  const stateDir = raw.stateDir ?? path.join(path.dirname(path.resolve(configPath)), '.bridge-state');
+  const credentialFile = raw.credentialFile ?? path.join(stateDir, 'credentials.json');
+  const lockDir = raw.lockDir ?? stateDir;
+  if (raw.moduleManaged) {
+    requireThat(raw.stateDir && raw.credentialFile && raw.lockDir
+      && raw.cockpit.sessionId === '' && raw.cockpit.cwd === '', 'MODULE_REFERENCE_REQUIRED');
+    const overlaps = (a, b) => a === b || a.startsWith(`${b}/`) || b.startsWith(`${a}/`);
+    requireThat(!overlaps(stateDir, lockDir) && !overlaps(stateDir, credentialFile)
+      && !overlaps(lockDir, credentialFile), 'MODULE_PATHS_OVERLAP');
+  }
   return {
     deliveryMode: raw.deliveryMode ?? 'correlated',
     nativeInterruptFollowup: raw.nativeInterruptFollowup ?? false,
@@ -65,7 +82,11 @@ export function validateConfig(raw, configPath) {
     cockpit: { ...raw.cockpit, apiUrl: origin(raw.cockpit.apiUrl, true), webUrl: origin(raw.cockpit.webUrl, true) },
     weixin: { ...raw.weixin, approvedApiOrigins: approved },
     limits,
-    stateDir: path.join(path.dirname(path.resolve(configPath)), '.bridge-state'),
+    stateDir, credentialFile, lockDir,
+    ...(raw.moduleManaged ? {
+      moduleManaged: true, moduleStateRoot: stateDir, configPath: path.resolve(configPath),
+      configDigest: createHash('sha256').update(JSON.stringify(raw)).digest('hex'),
+    } : {}),
   };
 }
 
@@ -73,7 +94,7 @@ export function loadConfig(file) {
   let raw;
   try { raw = JSON.parse(fs.readFileSync(file, 'utf8')); }
   catch { throw new BridgeError('CONFIG_READ_FAILED', 'Cannot read config; see config.example.json.'); }
-  return validateConfig(raw, file);
+  return routeConfig(validateConfig(raw, file));
 }
 
 export function assertBinding(config, credentials) {

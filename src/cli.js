@@ -12,6 +12,8 @@ import { Store, RunLock, privateDirectory, readPrivate, writePrivate } from './s
 import { WeixinClient, login } from './weixin.js';
 import { deliverPublishedPng } from './image.js';
 import { lifecycleConfig, startLifecycle } from './lifecycle.js';
+import { acquireModuleGate, assertCurrentConfig, readControl } from './module-state.js';
+import { moduleStatus } from './module-control.js';
 
 function options(argv) {
   const args = [...argv];
@@ -62,18 +64,10 @@ export async function main(argv = process.argv.slice(2)) {
   requireThat(['status', 'check', 'trust-history', 'login', 'run', 'stop', 'unlock', 'resolve', 'send-image'].includes(command), 'UNKNOWN_COMMAND');
   requireThat(rest.length === (command === 'resolve' ? 2 : command === 'send-image' ? 1 : 0), 'UNKNOWN_ARGUMENT');
   const config = loadConfig(file);
-  privateDirectory(config.stateDir);
-  const credentialFile = path.join(config.stateDir, 'credentials.json');
-  if (command === 'stop') {
-    RunLock.requestStop(config.stateDir, { requireDrain: true });
-    console.log('Drain requested; wait for runner exit and lock release. Cockpit work is unchanged.');
-    return;
-  }
-  if (command === 'unlock') {
-    requireThat(confirm, 'CONFIRM_REQUIRED'); RunLock.unlock(config.stateDir); console.log('Removed stale bridge lock.'); return;
-  }
-  const store = new Store(config.stateDir);
+  const credentialFile = config.credentialFile;
+  let store;
   let lock;
+  let gate;
   let timer;
   let lifecycle;
   let running = false;
@@ -82,19 +76,46 @@ export async function main(argv = process.argv.slice(2)) {
   process.on('SIGINT', onSignal);
   process.on('SIGTERM', onSignal);
   try {
+    if (config.moduleManaged) {
+      gate = acquireModuleGate(config, { unlockStale: command === 'unlock' && confirm });
+      assertCurrentConfig(config);
+      if (command === 'status') {
+        console.log(JSON.stringify(moduleStatus(config), null, 2));
+        return;
+      }
+    }
+    if (command === 'stop') {
+      RunLock.requestStop(config.lockDir, { requireDrain: true });
+      console.log('Drain requested; wait for runner exit and lock release. Cockpit work is unchanged.');
+      return;
+    }
+    if (command === 'unlock') {
+      requireThat(confirm, 'CONFIRM_REQUIRED');
+      if (!config.moduleManaged || fs.existsSync(path.join(config.lockDir, 'run.lock'))) RunLock.unlock(config.lockDir);
+      console.log('Removed stale bridge lock.'); return;
+    }
+    if (config.moduleManaged) {
+      requireThat(config.cockpit.sessionId, 'MODULE_NOT_BOUND');
+      requireThat(!Object.values(readControl(config)?.operations ?? {}).some(op => op.phase === 'pending'),
+        'OPERATION_OUTCOME_UNKNOWN');
+      lock = new RunLock(config.lockDir, { drain: command === 'run' });
+      gate.release(); gate = null;
+    }
+    privateDirectory(config.stateDir);
+    store = new Store(config.stateDir);
     if (command === 'status') {
       const credentials = readPrivate(credentialFile);
-      const running = readPrivate(path.join(config.stateDir, 'run.lock'));
+      const running = readPrivate(path.join(config.lockDir, 'run.lock'));
       console.log(JSON.stringify({
         configuredTarget: Boolean(config.cockpit.sessionId && config.cockpit.cwd),
         credentialsPresent: Boolean(credentials), runningPid: running?.pid ?? null,
         drainSupported: running?.drainProtocol === 1,
-        drainRequested: Boolean(running && readPrivate(path.join(config.stateDir, 'stop.json'))?.nonce === running.nonce),
+        drainRequested: Boolean(running && readPrivate(path.join(config.lockDir, 'stop.json'))?.nonce === running.nonce),
         ...store.summary(),
       }, null, 2));
       return;
     }
-    lock = new RunLock(config.stateDir, { drain: command === 'run' });
+    lock ??= new RunLock(config.lockDir, { drain: command === 'run' });
     if (command === 'resolve') {
       requireThat(confirm, 'CONFIRM_REQUIRED');
       store.recover();
@@ -162,7 +183,10 @@ export async function main(argv = process.argv.slice(2)) {
     process.removeListener('SIGINT', onSignal);
     process.removeListener('SIGTERM', onSignal);
     try { await lifecycle?.close(); }
-    finally { try { lock?.release(); } finally { store.close(); } }
+    finally {
+      try { store?.close(); }
+      finally { try { lock?.release(); } finally { gate?.release(); } }
+    }
   }
 }
 
