@@ -222,6 +222,11 @@ Success is exactly:
 For the exact active session, this uses the existing unbind fences and archives
 the old binding reference. A running/stale runner, pending/unknown jobs,
 unresolved followup/batch/typing state or uncertain operation can refuse it.
+Runner and read-only archive/blocker validation happen under the module gate
+**before** reserving this hook's operation identity. Ordinary preflight refusals
+therefore leave no receipt: after a separately authorized safe stop/settlement,
+the parent may explicitly continue with the same operation ID. There is no
+automatic continuation or retry, and no business state is changed by validation.
 There is no implicit drain, force-stop, task/send replay or account change.
 Historical Store binding, checkpoints, jobs, credentials and config backups
 remain untouched.
@@ -241,6 +246,8 @@ operation/session under that ID fails with `OPERATION_ID_CONFLICT`. A pending
 receipt returns `OPERATION_OUTCOME_UNKNOWN` and is never retried, resolved or
 replaced automatically. Historical successful receipts describe their original
 operation, not a fresh unbind of a subsequently rebound target.
+Any already-persisted completed failure (including receipts from older code)
+also retains strict readback; this change never clears or reinterprets it.
 
 The existing `status`, `bind`, and cwd-bearing `unbind` contracts are unchanged.
 Legacy non-module-managed profiles still refuse mutations with

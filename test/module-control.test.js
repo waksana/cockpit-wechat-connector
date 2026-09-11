@@ -244,9 +244,8 @@ test('session-unbind applies existing exact-target pending/unknown and safe-runn
     assert.equal(JSON.parse(result.stdout).error.code, 'RUNNING');
     assert.equal(runner.stopRequested(), false);
   } finally { runner.release(); }
-  assert.deepEqual(JSON.parse((await wire(f.file, sessionUnbind('session-busy'))).stdout),
-    { ok: false, operationId: 'session-busy', sessionId: 'session-one',
-      error: { code: 'RUNNING' }, replayed: true });
+  const originalState = readControl(config);
+  assert.equal(originalState.operations['session-busy'], undefined);
   const store = new Store(config.stateDir);
   t.after(() => store.close());
   store.set('binding', { sessionId: 'session-one', cwd: '/fixture/workspace' });
@@ -258,13 +257,11 @@ test('session-unbind applies existing exact-target pending/unknown and safe-runn
   ]) {
     store.db.prepare('INSERT INTO jobs VALUES (?,?,?)').run(job.id, 1, JSON.stringify(job));
     const request = sessionUnbind(`session-refuse-${job.id}`);
-    const result = await control(f.file, request);
-    assert.deepEqual(result, { ok: false, operationId: request.operationId,
-      error: { code }, sessionId: request.sessionId, replayed: false });
-    assert.deepEqual(await control(f.file, request), { ...result, replayed: true });
+    await assert.rejects(control(f.file, request), { code });
+    await assert.rejects(control(f.file, request), { code });
     assert.deepEqual(store.job(job.id), job);
+    assert.deepEqual(readControl(config), originalState);
     store.db.prepare('DELETE FROM jobs').run();
-    assert.deepEqual(await control(f.file, request), { ...result, replayed: true });
   }
   for (const [key, value, code] of [
     ['pendingBatch', { msgs: [] }, 'PENDING_INBOX_BATCH'],
@@ -272,12 +269,69 @@ test('session-unbind applies existing exact-target pending/unknown and safe-runn
     ['statusDisplay', { typingMayBeActive: true }, 'TYPING_STATE_UNRESOLVED'],
   ]) {
     store.set(key, value);
-    assert.equal((await control(f.file, sessionUnbind(`session-refuse-${key}`))).error.code, code);
+    await assert.rejects(control(f.file, sessionUnbind(`session-refuse-${key}`)), { code });
     assert.deepEqual(store.get(key), value);
+    assert.deepEqual(readControl(config), originalState);
     store.set(key, null);
   }
   assert.equal(readControl(config).active.sessionId, 'session-one');
   assert.equal(readControl(config).revision, 1);
+  assert.equal(f.requests.length, 1);
+});
+
+for (const reason of ['RUNNING', 'PENDING_JOBS']) {
+  test(`session-unbind ${reason} preflight permits explicit same-ID continuation after safe settlement`, async t => {
+    const f = await fixture(t);
+    await control(f.file, bind());
+    const config = loadConfig(f.file);
+    const stateBefore = fs.readFileSync(controlFile(config));
+    const request = sessionUnbind('session-continue');
+    const store = new Store(config.stateDir);
+    t.after(() => store.close());
+    store.set('binding', { sessionId: 'session-one', cwd: '/fixture/workspace' });
+    let runner;
+    if (reason === 'RUNNING') runner = new RunLock(config.lockDir, { drain: true });
+    else store.db.prepare('INSERT INTO jobs VALUES (?,?,?)').run('pending', 1,
+      JSON.stringify({ id: 'pending', status: 'queued', original: 'retained input' }));
+    try {
+      const refused = await wire(f.file, request);
+      assert.equal(refused.code, 2);
+      assert.deepEqual(JSON.parse(refused.stdout), { ok: false, error: { code: reason } });
+      assert.deepEqual(fs.readFileSync(controlFile(config)), stateBefore);
+      if (runner) assert.equal(runner.stopRequested(), false);
+      else assert.equal(store.job('pending').status, 'queued');
+    } finally { runner?.release(); }
+    // Model a separately authorized, known completion; the adapter never settles jobs.
+    if (reason === 'PENDING_JOBS') store.save({ ...store.job('pending'), status: 'done' });
+    const continued = await wire(f.file, request);
+    assert.equal(continued.code, 0, continued.stdout);
+    const expected = { ok: true, operationId: request.operationId,
+      sessionId: 'session-one', unbound: true, replayed: false };
+    assert.deepEqual(JSON.parse(continued.stdout), expected);
+    assert.deepEqual(JSON.parse((await wire(f.file, request)).stdout), { ...expected, replayed: true });
+    const state = readControl(config);
+    assert.equal(state.active, null);
+    assert.equal(state.history[0].stateDir, config.stateDir);
+    assert.equal(state.revision, 2);
+    assert.equal(state.operations[request.operationId].phase, 'complete');
+    assert.deepEqual(store.get('binding'), { sessionId: 'session-one', cwd: '/fixture/workspace' });
+    if (reason === 'PENDING_JOBS') assert.equal(store.job('pending').status, 'done');
+    assert.equal(f.requests.length, 1);
+  });
+}
+
+test('session-unbind preserves strict readback for failures already durably recorded by older code', async t => {
+  const f = await fixture(t);
+  await control(f.file, bind());
+  const config = loadConfig(f.file);
+  const request = sessionUnbind('session-old-failure');
+  const result = { ok: false, operationId: request.operationId,
+    sessionId: request.sessionId, error: { code: 'RUNNING' } };
+  const state = readControl(config);
+  state.operations[request.operationId] = { phase: 'complete', request, result };
+  writePrivate(controlFile(config), state);
+  assert.deepEqual(await control(f.file, request), { ...result, replayed: true });
+  assert.deepEqual(readControl(config), state);
   assert.equal(f.requests.length, 1);
 });
 

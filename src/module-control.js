@@ -72,13 +72,16 @@ function validateRequest(request) {
   }
 }
 
-function archiveBinding(state, sessionId, cwd) {
+function validateArchiveBinding(state, sessionId, cwd) {
   requireThat(state.active, 'NOT_BOUND');
   requireThat(state.active.sessionId === sessionId && state.active.cwd === cwd, 'BINDING_MISMATCH');
   const inspection = inspectBinding(state.active.stateDir);
   requireThat(!inspection.binding || (inspection.binding.sessionId === sessionId
     && inspection.binding.cwd === cwd), 'PERSISTED_BINDING_CHANGED');
   requireThat(!blocker(inspection), blocker(inspection));
+}
+
+function archiveBinding(state) {
   state.history.push(state.active);
   state.active = null;
 }
@@ -126,6 +129,10 @@ export async function control(configPath, request, { fetchImpl } = {}) {
       state = { schemaVersion: 1, revision: 0, configPath: config.configPath, configDigest: config.configDigest,
         configBackup: JSON.parse(fs.readFileSync(config.configPath, 'utf8')), active: null, history: [], operations: {} };
     }
+    if (sessionUnbind && state.active?.sessionId === request.sessionId) {
+      assertStopped(config);
+      validateArchiveBinding(state, request.sessionId, state.active.cwd);
+    }
     state.operations[request.operationId] = { phase: 'pending', request: identity };
     try { writePrivate(controlFile(config), state); }
     catch { throw new BridgeError('OPERATION_OUTCOME_UNKNOWN'); }
@@ -133,8 +140,7 @@ export async function control(configPath, request, { fetchImpl } = {}) {
     try {
       if (sessionUnbind) {
         if (state.active?.sessionId === request.sessionId) {
-          assertStopped(config);
-          archiveBinding(state, request.sessionId, state.active.cwd);
+          archiveBinding(state);
           state.revision++;
         }
         result = { ok: true, operationId: request.operationId, sessionId: request.sessionId, unbound: true };
@@ -162,7 +168,8 @@ export async function control(configPath, request, { fetchImpl } = {}) {
         }
         state.active = { id, stateDir, sessionId: request.sessionId, cwd: request.cwd };
       } else {
-        archiveBinding(state, request.sessionId, request.cwd);
+        validateArchiveBinding(state, request.sessionId, request.cwd);
+        archiveBinding(state);
       }
       if (!sessionUnbind) {
         state.revision++;
