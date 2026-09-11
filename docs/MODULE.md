@@ -187,6 +187,65 @@ Reusing an ID with different fields returns `OPERATION_ID_CONFLICT`.
 The protected log retains up to 10,000 operation identities, then refuses with
 `OPERATION_LOG_FULL`; it does not evict identities and permit replay.
 
+## Optional session-unbind capability
+
+The official manifest explicitly opts into this session-deletion hook:
+
+```json
+{"sessionLifecycle":{"unbind":{"entry":"src/module-control.js"}}}
+```
+
+This is optional module metadata, not a generic hook platform. The parent owns
+the explicit delete-modal selection and sequencing: invoke selected declared
+unbind capabilities, then delete the native session. Absence of this manifest
+field means no hook/no notification. This adapter does not delete native
+sessions, initialize them, create first messages, or implement prebinding.
+
+Invoke the same trusted Node entry with `--config /absolute/config.json`, using
+the same bounded stdin/stdout and exit-code rules:
+
+```json
+{"operation":"session-unbind","operationId":"session-delete-0001","sessionId":"native-session-id"}
+```
+
+`cwd` is deliberately absent (and rejected as an unknown field): the module
+owns the saved binding's exact cwd, and the native target might already have
+been deleted externally. The operation performs **no network requests** and
+does not load/create the target or read account/API credentials.
+
+Success is exactly:
+
+```json
+{"ok":true,"operationId":"session-delete-0001","sessionId":"native-session-id","unbound":true,"replayed":false}
+```
+
+For the exact active session, this uses the existing unbind fences and archives
+the old binding reference. A running/stale runner, pending/unknown jobs,
+unresolved followup/batch/typing state or uncertain operation can refuse it.
+There is no implicit drain, force-stop, task/send replay or account change.
+Historical Store binding, checkpoints, jobs, credentials and config backups
+remain untouched.
+
+If the requested session is already unbound or the current target is a
+**different** session, success confirms no current association to the requested
+session. It saves only the operation receipt, without changing routing revision,
+the newer binding or its state. A running/newer target's jobs are not inspected
+or interrupted. An unresolved control operation still blocks this confirmation
+because the association outcome is uncertain.
+
+Completed failures carry `ok:false`, `operationId`, `sessionId`,
+`error:{code:"..."}` and `replayed:false`; preflight failures retain the existing
+bounded `{ok:false,error:{code:"..."}}` shape. Recorded successes/failures return
+unchanged on identical-ID readback, except `replayed:true`; changing the
+operation/session under that ID fails with `OPERATION_ID_CONFLICT`. A pending
+receipt returns `OPERATION_OUTCOME_UNKNOWN` and is never retried, resolved or
+replaced automatically. Historical successful receipts describe their original
+operation, not a fresh unbind of a subsequently rebound target.
+
+The existing `status`, `bind`, and cwd-bearing `unbind` contracts are unchanged.
+Legacy non-module-managed profiles still refuse mutations with
+`LEGACY_ADOPTION_REQUIRED`; this hook is not implicit legacy migration.
+
 ## Fences and retained history
 
 `lockDir/module-binding.json` atomically stores the config digest, exact protected

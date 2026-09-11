@@ -23,18 +23,28 @@ export function readControl(config) {
     requireThat(/^[A-Za-z0-9_-]{8,120}$/.test(id) && object(operation)
       && ['pending', 'complete'].includes(operation.phase)
       && object(operation.request) && operation.request.operationId === id
-      && ['bind', 'unbind'].includes(operation.request.operation)
-      && typeof operation.request.sessionId === 'string' && typeof operation.request.cwd === 'string',
+      && ['bind', 'unbind', 'session-unbind'].includes(operation.request.operation)
+      && typeof operation.request.sessionId === 'string'
+      && (operation.request.operation === 'session-unbind' ? operation.request.cwd === undefined
+        : typeof operation.request.cwd === 'string'),
     'MODULE_STATE_INVALID');
     if (operation.phase === 'complete') {
       const result = operation.result;
       requireThat(object(result) && typeof result.ok === 'boolean' && result.operationId === id
-        && Number.isSafeInteger(result.revision) && result.revision >= 0 && result.revision <= state.revision
-        && (result.boundSessionId === null || typeof result.boundSessionId === 'string')
-        && Object.keys(result).every(key => ['ok', 'operationId', 'revision', 'boundSessionId', 'error'].includes(key))
         && (result.ok ? result.error === undefined : object(result.error)
           && Object.keys(result.error).length === 1 && /^[A-Z][A-Z0-9_]{0,100}$/.test(result.error.code)),
       'MODULE_STATE_INVALID');
+      if (operation.request.operation === 'session-unbind') {
+        requireThat(result.sessionId === operation.request.sessionId
+          && (result.ok ? result.unbound === true : result.unbound === undefined)
+          && Object.keys(result).every(key => ['ok', 'operationId', 'sessionId', 'unbound', 'error'].includes(key)),
+        'MODULE_STATE_INVALID');
+      } else {
+        requireThat(Number.isSafeInteger(result.revision) && result.revision >= 0 && result.revision <= state.revision
+          && (result.boundSessionId === null || typeof result.boundSessionId === 'string')
+          && Object.keys(result).every(key => ['ok', 'operationId', 'revision', 'boundSessionId', 'error'].includes(key)),
+        'MODULE_STATE_INVALID');
+      }
     }
   }
   for (const binding of [...state.history, ...(state.active ? [state.active] : [])]) {

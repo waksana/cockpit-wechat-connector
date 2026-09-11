@@ -11,8 +11,9 @@ import { acquireModuleGate, assertCurrentConfig, blocker, controlFile, inspectBi
   readControl, runnerState } from './module-state.js';
 
 const MAX_BYTES = 16384;
-const targetValid = (sessionId, cwd) => typeof sessionId === 'string'
-  && /^[A-Za-z0-9_-]{1,200}(?![\s\S])/.test(sessionId) && typeof cwd === 'string'
+const sessionValid = sessionId => typeof sessionId === 'string'
+  && /^[A-Za-z0-9_-]{1,200}(?![\s\S])/.test(sessionId);
+const targetValid = (sessionId, cwd) => sessionValid(sessionId) && typeof cwd === 'string'
   && cwd.length <= 4096 && path.isAbsolute(cwd) && !/[\0\r\n]/.test(cwd);
 const codeOf = error => error instanceof BridgeError && /^[A-Z][A-Z0-9_]{0,100}$/.test(error.code)
   ? error.code : 'MODULE_CONTROL_FAILED';
@@ -57,16 +58,35 @@ export function moduleStatus(config) {
 }
 
 function validateRequest(request) {
-  requireThat(object(request) && ['status', 'bind', 'unbind'].includes(request.operation), 'INVALID_REQUEST');
+  requireThat(object(request) && ['status', 'bind', 'unbind', 'session-unbind'].includes(request.operation), 'INVALID_REQUEST');
   const allowed = request.operation === 'status' ? ['operation']
-    : ['operation', 'operationId', 'sessionId', 'cwd'];
+    : request.operation === 'session-unbind' ? ['operation', 'operationId', 'sessionId']
+      : ['operation', 'operationId', 'sessionId', 'cwd'];
   requireThat(Object.keys(request).every(key => allowed.includes(key)), 'INVALID_REQUEST');
   if (request.operation !== 'status') {
     requireThat(typeof request.operationId === 'string' && /^[A-Za-z0-9_-]{8,120}(?![\s\S])/.test(request.operationId)
       && !['__proto__', 'prototype', 'constructor'].includes(request.operationId),
       'OPERATION_ID_REQUIRED');
-    requireThat(targetValid(request.sessionId, request.cwd), 'INVALID_TARGET');
+    requireThat(request.operation === 'session-unbind' ? sessionValid(request.sessionId)
+      : targetValid(request.sessionId, request.cwd), 'INVALID_TARGET');
   }
+}
+
+function archiveBinding(state, sessionId, cwd) {
+  requireThat(state.active, 'NOT_BOUND');
+  requireThat(state.active.sessionId === sessionId && state.active.cwd === cwd, 'BINDING_MISMATCH');
+  const inspection = inspectBinding(state.active.stateDir);
+  requireThat(!inspection.binding || (inspection.binding.sessionId === sessionId
+    && inspection.binding.cwd === cwd), 'PERSISTED_BINDING_CHANGED');
+  requireThat(!blocker(inspection), blocker(inspection));
+  state.history.push(state.active);
+  state.active = null;
+}
+
+function assertStopped(config) {
+  const runner = runnerState(config);
+  requireThat(!runner.running, 'RUNNING');
+  requireThat(!runner.runnerUnknown, 'RUNNER_STATE_UNKNOWN');
 }
 
 export async function control(configPath, request, { fetchImpl } = {}) {
@@ -82,22 +102,22 @@ export async function control(configPath, request, { fetchImpl } = {}) {
   try {
     assertCurrentConfig(config);
     if (request.operation === 'status') return { ok: true, status: moduleStatus(config) };
+    const sessionUnbind = request.operation === 'session-unbind';
+    const identity = { operation: request.operation, operationId: request.operationId,
+      sessionId: request.sessionId, ...(sessionUnbind ? {} : { cwd: request.cwd }) };
     let state = readControl(config);
     const previous = state?.operations[request.operationId];
     if (previous) {
-      requireThat(JSON.stringify(previous.request) === JSON.stringify({
-        operation: request.operation, operationId: request.operationId, sessionId: request.sessionId, cwd: request.cwd,
-      }), 'OPERATION_ID_CONFLICT');
+      requireThat(JSON.stringify(previous.request) === JSON.stringify(identity), 'OPERATION_ID_CONFLICT');
       if (previous.phase === 'pending') throw new BridgeError('OPERATION_OUTCOME_UNKNOWN');
       return { ...previous.result, replayed: true };
     }
     requireThat(!state || !Object.values(state.operations).some(op => op.phase === 'pending'),
       'OPERATION_OUTCOME_UNKNOWN');
     requireThat(Object.keys(state?.operations ?? {}).length < 10000, 'OPERATION_LOG_FULL');
-    const runner = runnerState(config);
-    requireThat(!runner.running, 'RUNNING');
-    requireThat(!runner.runnerUnknown, 'RUNNER_STATE_UNKNOWN');
-    const initial = inspectBinding(config.stateDir);
+    // A receipt for an unrelated/absent target must not inspect or interrupt a newer runner.
+    if (!sessionUnbind || !state) assertStopped(config);
+    const initial = !sessionUnbind || !state ? inspectBinding(config.stateDir) : null;
     if (!state) {
       requireThat(!initial.binding && !initial.inboxHistory && !blocker(initial), 'LEGACY_ADOPTION_REQUIRED');
       // An existing nonempty root may contain unrecognized historical data. Never adopt it.
@@ -106,14 +126,19 @@ export async function control(configPath, request, { fetchImpl } = {}) {
       state = { schemaVersion: 1, revision: 0, configPath: config.configPath, configDigest: config.configDigest,
         configBackup: JSON.parse(fs.readFileSync(config.configPath, 'utf8')), active: null, history: [], operations: {} };
     }
-    const identity = { operation: request.operation, operationId: request.operationId,
-      sessionId: request.sessionId, cwd: request.cwd };
     state.operations[request.operationId] = { phase: 'pending', request: identity };
     try { writePrivate(controlFile(config), state); }
     catch { throw new BridgeError('OPERATION_OUTCOME_UNKNOWN'); }
     let result;
     try {
-      if (request.operation === 'bind') {
+      if (sessionUnbind) {
+        if (state.active?.sessionId === request.sessionId) {
+          assertStopped(config);
+          archiveBinding(state, request.sessionId, state.active.cwd);
+          state.revision++;
+        }
+        result = { ok: true, operationId: request.operationId, sessionId: request.sessionId, unbound: true };
+      } else if (request.operation === 'bind') {
         requireThat(!state.active, 'ALREADY_BOUND');
         const ready = readiness(config);
         requireThat(ready.configReady, ready.configReason ?? 'NOT_CONFIGURED');
@@ -137,22 +162,17 @@ export async function control(configPath, request, { fetchImpl } = {}) {
         }
         state.active = { id, stateDir, sessionId: request.sessionId, cwd: request.cwd };
       } else {
-        requireThat(state.active, 'NOT_BOUND');
-        requireThat(state.active.sessionId === request.sessionId && state.active.cwd === request.cwd,
-          'BINDING_MISMATCH');
-        const inspection = inspectBinding(state.active.stateDir);
-        requireThat(!inspection.binding || (inspection.binding.sessionId === request.sessionId
-          && inspection.binding.cwd === request.cwd), 'PERSISTED_BINDING_CHANGED');
-        requireThat(!blocker(inspection), blocker(inspection));
-        state.history.push(state.active);
-        state.active = null;
+        archiveBinding(state, request.sessionId, request.cwd);
       }
-      state.revision++;
-      result = { ok: true, operationId: request.operationId, revision: state.revision,
-        boundSessionId: state.active?.sessionId ?? null };
+      if (!sessionUnbind) {
+        state.revision++;
+        result = { ok: true, operationId: request.operationId, revision: state.revision,
+          boundSessionId: state.active?.sessionId ?? null };
+      }
     } catch (error) {
-      result = { ok: false, operationId: request.operationId, error: { code: codeOf(error) },
-        boundSessionId: state.active?.sessionId ?? null, revision: state.revision };
+      result = { ok: false, operationId: request.operationId, error: { code: codeOf(error) }, ...(sessionUnbind
+        ? { sessionId: request.sessionId }
+        : { boundSessionId: state.active?.sessionId ?? null, revision: state.revision }) };
     }
     state.operations[request.operationId] = { phase: 'complete', request: identity, result };
     try { writePrivate(controlFile(config), state); }

@@ -23,6 +23,9 @@ const bind = (operationId = 'bind-first', sessionId = 'session-one') => ({
 const unbind = (operationId = 'unbind-first', sessionId = 'session-one') => ({
   operation: 'unbind', operationId, sessionId, cwd: '/fixture/workspace',
 });
+const sessionUnbind = (operationId = 'session-unbind-first', sessionId = 'session-one') => ({
+  operation: 'session-unbind', operationId, sessionId,
+});
 
 async function fixture(t) {
   const dir = path.join(root, `.module-test-${randomUUID()}`);
@@ -102,6 +105,7 @@ test('official manifest, validated paths and unchanged legacy defaults', () => {
   assert.equal(manifest.version, pkg.version);
   assert.deepEqual(manifest.roles.map(role => Object.keys(role).sort()), [['description', 'id', 'name']]);
   assert.equal(manifest.binding, 'wechat');
+  assert.deepEqual(manifest.sessionLifecycle, { unbind: { entry: 'src/module-control.js' } });
   const raw = JSON.parse(fs.readFileSync(path.join(root, 'config.example.json')));
   const config = validateConfig(raw, '/fixture/config.json');
   assert.equal(config.stateDir, '/fixture/.bridge-state');
@@ -154,6 +158,195 @@ test('concurrent child mutations have one authority; repeated IDs are readback, 
     parsed.find(result => !result.ok).error.code));
   assert.equal(f.requests.length, 1);
   assert.ok(!JSON.stringify(results).includes(credentials.token));
+});
+
+test('optional session-unbind uses saved cwd, retains all history and needs no native/credential access', async t => {
+  const f = await fixture(t);
+  await control(f.file, bind());
+  const config = loadConfig(f.file);
+  const store = new Store(config.stateDir);
+  const binding = { sessionId: 'session-one', cwd: '/fixture/workspace' };
+  store.set('binding', binding);
+  store.set('historyCheckpoint', { id: 'old-message', fingerprint: 'retained' });
+  store.set('cursor', 'old-inbox-cursor');
+  store.db.prepare('INSERT INTO jobs VALUES (?,?,?)').run('done-job', 1,
+    JSON.stringify({ id: 'done-job', status: 'done', original: 'PRIVATE_OLD_MESSAGE' }));
+  store.close();
+  const originalConfig = fs.readFileSync(f.file);
+  const dbBefore = fs.readFileSync(path.join(config.stateDir, 'bridge.sqlite'));
+  const credentialBackup = path.join(f.dir, 'retained-credential.json');
+  fs.renameSync(config.credentialFile, credentialBackup);
+  const request = sessionUnbind();
+  const result = await wire(f.file, request);
+  assert.equal(result.code, 0, result.stdout);
+  const expected = { ok: true, operationId: request.operationId,
+    sessionId: request.sessionId, unbound: true, replayed: false };
+  assert.deepEqual(JSON.parse(result.stdout), expected);
+  assert.deepEqual(JSON.parse((await wire(f.file, request)).stdout), { ...expected, replayed: true });
+  const state = readControl(config);
+  assert.equal(state.active, null);
+  assert.equal(state.revision, 2);
+  assert.equal(state.history[0].cwd, binding.cwd);
+  assert.equal(state.history[0].stateDir, config.stateDir);
+  assert.deepEqual(fs.readFileSync(path.join(config.stateDir, 'bridge.sqlite')), dbBefore);
+  assert.deepEqual(fs.readFileSync(f.file), originalConfig);
+  assert.deepEqual(readPrivate(credentialBackup), credentials);
+  assert.equal(fs.existsSync(config.credentialFile), false);
+  assert.equal(f.requests.length, 1);
+  assert.ok(!result.stdout.includes('PRIVATE') && !result.stdout.includes('fixture/workspace'));
+});
+
+test('session-unbind records absent and different-target receipts without changing newer binding or revision', async t => {
+  const f = await fixture(t);
+  const absent = sessionUnbind('session-absent');
+  const expected = { ok: true, operationId: absent.operationId, sessionId: absent.sessionId,
+    unbound: true, replayed: false };
+  assert.deepEqual(await control(f.file, absent), expected);
+  const config = loadConfig(f.file);
+  assert.equal(readControl(config).revision, 0);
+  assert.equal(fs.existsSync(f.raw.stateDir), false);
+  assert.equal(f.requests.length, 0);
+  await control(f.file, bind('bind-new-target', 'session-two'));
+  const activeConfig = loadConfig(f.file);
+  const before = readControl(activeConfig);
+  const store = new Store(activeConfig.stateDir);
+  store.db.prepare('INSERT INTO jobs VALUES (?,?,?)').run('new-unknown', 1,
+    JSON.stringify({ id: 'new-unknown', status: 'prompting' }));
+  store.close();
+  const newData = fs.readFileSync(path.join(activeConfig.stateDir, 'bridge.sqlite'));
+  const runner = new RunLock(activeConfig.lockDir, { drain: true });
+  try {
+    const other = sessionUnbind('session-other-target');
+    assert.deepEqual(await control(f.file, other), { ...expected, operationId: other.operationId });
+    assert.deepEqual(await control(f.file, other), { ...expected, operationId: other.operationId, replayed: true });
+    assert.deepEqual(await control(f.file, absent), { ...expected, replayed: true });
+    assert.equal(runner.stopRequested(), false);
+  } finally { runner.release(); }
+  const after = readControl(activeConfig);
+  assert.deepEqual(after.active, before.active);
+  assert.deepEqual(after.history, before.history);
+  assert.equal(after.revision, before.revision);
+  assert.deepEqual(fs.readFileSync(path.join(activeConfig.stateDir, 'bridge.sqlite')), newData);
+  await assert.rejects(control(f.file, sessionUnbind(absent.operationId, 'session-two')),
+    { code: 'OPERATION_ID_CONFLICT' });
+  await assert.rejects(control(f.file, unbind(absent.operationId)), { code: 'OPERATION_ID_CONFLICT' });
+  assert.equal(f.requests.length, 1);
+});
+
+test('session-unbind applies existing exact-target pending/unknown and safe-runner fences', async t => {
+  const f = await fixture(t);
+  await control(f.file, bind());
+  const config = loadConfig(f.file);
+  const runner = new RunLock(config.lockDir, { drain: true });
+  try {
+    const result = await wire(f.file, sessionUnbind('session-busy'));
+    assert.equal(result.code, 2);
+    assert.equal(JSON.parse(result.stdout).error.code, 'RUNNING');
+    assert.equal(runner.stopRequested(), false);
+  } finally { runner.release(); }
+  assert.deepEqual(JSON.parse((await wire(f.file, sessionUnbind('session-busy'))).stdout),
+    { ok: false, operationId: 'session-busy', sessionId: 'session-one',
+      error: { code: 'RUNNING' }, replayed: true });
+  const store = new Store(config.stateDir);
+  t.after(() => store.close());
+  store.set('binding', { sessionId: 'session-one', cwd: '/fixture/workspace' });
+  for (const [job, code] of [
+    [{ id: 'queued', status: 'queued' }, 'PENDING_JOBS'],
+    [{ id: 'prompting', status: 'prompting' }, 'UNKNOWN_OUTCOMES'],
+    [{ id: 'sending', status: 'replying', outbox: [{ status: 'sending' }] }, 'UNKNOWN_OUTCOMES'],
+    [{ id: 'unknown', status: 'blocked', outbox: [{ status: 'unknown' }] }, 'UNKNOWN_OUTCOMES'],
+  ]) {
+    store.db.prepare('INSERT INTO jobs VALUES (?,?,?)').run(job.id, 1, JSON.stringify(job));
+    const request = sessionUnbind(`session-refuse-${job.id}`);
+    const result = await control(f.file, request);
+    assert.deepEqual(result, { ok: false, operationId: request.operationId,
+      error: { code }, sessionId: request.sessionId, replayed: false });
+    assert.deepEqual(await control(f.file, request), { ...result, replayed: true });
+    assert.deepEqual(store.job(job.id), job);
+    store.db.prepare('DELETE FROM jobs').run();
+    assert.deepEqual(await control(f.file, request), { ...result, replayed: true });
+  }
+  for (const [key, value, code] of [
+    ['pendingBatch', { msgs: [] }, 'PENDING_INBOX_BATCH'],
+    ['nativeFollowup', { phase: 'requesting' }, 'NATIVE_FOLLOWUP_UNRESOLVED'],
+    ['statusDisplay', { typingMayBeActive: true }, 'TYPING_STATE_UNRESOLVED'],
+  ]) {
+    store.set(key, value);
+    assert.equal((await control(f.file, sessionUnbind(`session-refuse-${key}`))).error.code, code);
+    assert.deepEqual(store.get(key), value);
+    store.set(key, null);
+  }
+  assert.equal(readControl(config).active.sessionId, 'session-one');
+  assert.equal(readControl(config).revision, 1);
+  assert.equal(f.requests.length, 1);
+});
+
+test('session-unbind racing a rebind cannot remove or reinterpret the newer target', async t => {
+  const f = await fixture(t);
+  await control(f.file, bind());
+  await control(f.file, sessionUnbind());
+  let release;
+  f.hold(new Promise(resolve => { release = resolve; }));
+  t.after(() => release());
+  const rebinding = control(f.file, bind('bind-second', 'session-two'));
+  const until = Date.now() + 5000;
+  while (f.requests.length < 2 && Date.now() < until) await delay(5);
+  assert.equal(f.requests.length, 2);
+  const request = sessionUnbind('session-after-rebind');
+  const busy = await wire(f.file, request);
+  assert.equal(JSON.parse(busy.stdout).error.code, 'MODULE_CONTROL_BUSY');
+  release();
+  assert.equal((await rebinding).ok, true);
+  const config = loadConfig(f.file);
+  const before = readControl(config);
+  const result = await wire(f.file, request);
+  assert.deepEqual(JSON.parse(result.stdout), { ok: true, operationId: request.operationId,
+    sessionId: 'session-one', unbound: true, replayed: false });
+  const after = readControl(config);
+  assert.deepEqual(after.active, before.active);
+  assert.deepEqual(after.history, before.history);
+  assert.equal(after.revision, before.revision);
+  assert.deepEqual(await control(f.file, sessionUnbind()), { ok: true, operationId: 'session-unbind-first',
+    sessionId: 'session-one', unbound: true, replayed: true });
+  assert.equal(f.requests.length, 2);
+});
+
+test('session-unbind receipt never unbinds a later generation even for the same session ID', async t => {
+  const f = await fixture(t);
+  await control(f.file, bind());
+  const receipt = await control(f.file, sessionUnbind());
+  await control(f.file, bind('bind-same-session-again'));
+  const config = loadConfig(f.file);
+  const before = readControl(config);
+  assert.notEqual(before.active.id, before.history[0].id);
+  assert.deepEqual(await control(f.file, sessionUnbind()), { ...receipt, replayed: true });
+  assert.deepEqual(readControl(config), before);
+  assert.equal(config.cockpit.sessionId, 'session-one');
+  assert.equal(f.requests.length, 2);
+});
+
+test('session-unbind unknown receipts never replay or resolve, and its wire rejects cwd or missing identity', async t => {
+  const f = await fixture(t);
+  await control(f.file, bind());
+  const config = loadConfig(f.file);
+  const state = readControl(config);
+  const request = sessionUnbind('session-uncertain');
+  state.operations[request.operationId] = { phase: 'pending', request };
+  writePrivate(controlFile(config), state);
+  for (const input of [request, sessionUnbind('session-another'), sessionUnbind('session-other', 'session-two')]) {
+    const result = await wire(f.file, input);
+    assert.equal(result.code, 2);
+    assert.equal(JSON.parse(result.stdout).error.code, 'OPERATION_OUTCOME_UNKNOWN');
+  }
+  assert.deepEqual(readControl(config), state);
+  for (const input of [{ ...request, cwd: '/unnecessary' }, { operation: 'session-unbind' },
+    { ...request, sessionId: 'bad/session' }, { ...request, operationId: 'short' }]) {
+    const result = await wire(f.file, input);
+    assert.equal(result.code, 2);
+    assert.equal(JSON.parse(result.stdout).ok, false);
+    assert.ok(result.stdout.length < 16384);
+  }
+  assert.equal(f.requests.length, 1);
 });
 
 test('status never recovers old jobs, and unbind refuses every unresolved work category', async t => {

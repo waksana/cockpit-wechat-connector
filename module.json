@@ -14,5 +14,6 @@
     "versionPath": "/version",
     "drainPath": "/admin/restart"
   },
+  "sessionLifecycle": { "unbind": { "entry": "src/module-control.js" } },
   "binding": "wechat"
 }
