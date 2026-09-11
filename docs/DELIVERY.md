@@ -1,9 +1,13 @@
 # Connector delivery is separate from enabling chat
 
-This private project's integration ref remains **master**. Thin workflows reuse
-fixed-commit build and restricted artifact transfer implementations from
-`waksana/cockpit`; push is build-only. `service-delivery.json` packages source and
-locked dependency metadata, not profiles, credentials, messages or checkpoints.
+This public source project's integration ref remains **master**. Publisher-side
+workflows reuse fixed-commit build and restricted artifact transfer
+implementations from `waksana/cockpit`; their CI authentication is not an
+ordinary-user installation requirement. Push is build-only.
+`service-delivery.json` packages source and locked dependency metadata, not
+profiles, credentials, messages or checkpoints. Public source/release
+distribution does not expose the connector's loopback runtime, private profile,
+credentials, messages or checkpoints.
 
 Project `wechat` is registered with the shared service-delivery runner. An
 authenticated build-only request can produce a verified immutable package while
