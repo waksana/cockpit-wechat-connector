@@ -1,0 +1,30 @@
+name: Delivery CI
+run-name: ${{ github.event_name == 'workflow_dispatch' && format('delivery:{0}:{1}', inputs.request_id, inputs.source_sha) || format('build:{0}', github.sha) }}
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        required: true
+        type: string
+      request_id:
+        required: true
+        type: string
+      config_path:
+        required: true
+        type: string
+      config_sha256:
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  build:
+    uses: waksana/cockpit/.github/workflows/shared-delivery-ci.yml@0f6e2e136df9a40d15376f23b0a5aec808d018ef
+    with:
+      source_sha: ${{ inputs.source_sha || github.sha }}
+      request_id: ${{ inputs.request_id || github.sha }}
+      config_path: ${{ inputs.config_path || 'service-delivery.json' }}
+      config_sha256: ${{ inputs.config_sha256 || '' }}
+      target_branch: master
