@@ -2,6 +2,7 @@ import { BridgeError, object, requireThat, text } from './common.js';
 import { createHash } from 'node:crypto';
 import { requestJson } from './http.js';
 import fs from 'node:fs';
+import { secureExisting } from './storage.js';
 import { nativeMessages } from './native-messages.js';
 
 export function historyCheckpoint(message) {
@@ -58,8 +59,25 @@ export function quiescent(meta) {
       'activeSubagents', 'activeMcpOperations', 'activeOperations'].some(key => Boolean(meta[key]));
 }
 
+export function cockpitToken(config, token = process.env.COCKPIT_API_TOKEN) {
+  if (config.cockpit.tokenFile !== undefined) {
+    requireThat(token === undefined, 'COCKPIT_TOKEN_AUTHORITY_CONFLICT');
+    try {
+      secureExisting(config.cockpit.tokenFile);
+      requireThat(fs.statSync(config.cockpit.tokenFile).size <= 16384, 'COCKPIT_TOKEN_FILE_INVALID');
+      token = fs.readFileSync(config.cockpit.tokenFile, 'utf8').replace(/\r?\n$/, '');
+      requireThat(/^[\x21-\x7e]{1,16384}(?![\s\S])/.test(token), 'COCKPIT_TOKEN_FILE_INVALID');
+    } catch (error) {
+      if (error instanceof BridgeError) throw error;
+      throw new BridgeError('COCKPIT_TOKEN_FILE_READ_FAILED');
+    }
+  }
+  return token;
+}
+
 export class CockpitClient {
   constructor(config, { fetchImpl = fetch, token = process.env.COCKPIT_API_TOKEN } = {}) {
+    token = cockpitToken(config, token);
     this.config = config; this.fetchImpl = fetchImpl;
     this.headers = { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) };
   }

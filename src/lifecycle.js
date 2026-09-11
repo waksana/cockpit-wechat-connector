@@ -3,6 +3,31 @@ import http from 'node:http';
 import { requireThat } from './common.js';
 
 export function lifecycleConfig(env = process.env) {
+  const moduleMode = ['COCKPIT_MODULE_ID', 'COCKPIT_MODULE_VERSION', 'COCKPIT_MODULE_DIGEST',
+    'COCKPIT_MODULE_INSTANCE', 'COCKPIT_MODULE_PORT'].some(name => env[name] !== undefined);
+  if (moduleMode) {
+    requireThat(!['SERVICE_DELIVERY_SHA', 'SERVICE_DELIVERY_ARTIFACT', 'SERVICE_DELIVERY_REQUEST',
+      'SERVICE_DELIVERY_INSTANCE'].some(name => env[name] !== undefined), 'LIFECYCLE_IDENTITY_CONFLICT');
+    requireThat(env.COCKPIT_MODULE_PORT === undefined || env.SERVICE_DELIVERY_PORT === undefined
+      || env.COCKPIT_MODULE_PORT === env.SERVICE_DELIVERY_PORT, 'COCKPIT_MODULE_PORT_CONFLICT');
+    const port = env.COCKPIT_MODULE_PORT ?? env.SERVICE_DELIVERY_PORT;
+    requireThat(/^[1-9][0-9]{0,4}(?![\s\S])/.test(port ?? '') && Number(port) <= 65535,
+      'COCKPIT_MODULE_PORT_INVALID');
+    const manifest = JSON.parse(fs.readFileSync(new URL('../module.json', import.meta.url), 'utf8'));
+    const pkg = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+    requireThat(manifest.schemaVersion === 1 && manifest.id === 'wechat'
+      && typeof manifest.version === 'string' && manifest.version === pkg.version,
+    'COCKPIT_MODULE_MANIFEST_INVALID');
+    requireThat(env.COCKPIT_MODULE_ID === manifest.id
+      && /^[a-f0-9]{64}(?![\s\S])/.test(env.COCKPIT_MODULE_DIGEST ?? '')
+      && /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}(?![\s\S])/
+        .test(env.COCKPIT_MODULE_INSTANCE ?? ''), 'COCKPIT_MODULE_IDENTITY_INVALID');
+    requireThat(env.COCKPIT_MODULE_VERSION === manifest.version, 'COCKPIT_MODULE_VERSION_MISMATCH');
+    return Object.freeze({ port: Number(port), identity: Object.freeze({
+      moduleApi: 1, moduleId: manifest.id, moduleDigest: env.COCKPIT_MODULE_DIGEST,
+      instanceId: env.COCKPIT_MODULE_INSTANCE, version: manifest.version,
+    }) });
+  }
   if (env.SERVICE_DELIVERY_PORT === undefined) return null;
   const port = env.SERVICE_DELIVERY_PORT;
   requireThat(/^[1-9][0-9]{0,4}(?![\s\S])/.test(port ?? '') && Number(port) <= 65535,
@@ -24,11 +49,12 @@ export function lifecycleConfig(env = process.env) {
 
 export async function startLifecycle(config, { state, requestDrain }) {
   const { port, identity } = config;
+  const runtimeIdentity = identity.moduleApi === 1 ? identity : { instanceId: identity.instanceId };
   let closed = false;
   const snapshot = () => {
     const current = state();
     const draining = current.drainRequested || current.draining;
-    return { instanceId: identity.instanceId, drainProtocol: 1,
+    return { ...runtimeIdentity, drainProtocol: 1,
       running: !closed && current.running,
       restartPending: Boolean(draining),
       phase: draining ? 'draining' : current.ready ? 'running' : 'starting',
@@ -50,7 +76,7 @@ export async function startLifecycle(config, { state, requestDrain }) {
     }
     if (req.method === 'GET' && req.url === '/health') {
       const current = snapshot();
-      reply(200, { instanceId: identity.instanceId, running: current.running,
+      reply(200, { ...runtimeIdentity, running: current.running,
         ok: current.running && current.phase === 'running', phase: current.phase }); return;
     }
     if (req.method === 'GET' && req.url === '/status') {

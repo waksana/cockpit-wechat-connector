@@ -13,6 +13,45 @@ const env = {
   SERVICE_DELIVERY_REQUEST: 'fixture-request',
   SERVICE_DELIVERY_INSTANCE: 'fixture-instance',
 };
+const moduleEnv = {
+  COCKPIT_MODULE_ID: 'wechat', COCKPIT_MODULE_VERSION: '0.1.0',
+  COCKPIT_MODULE_DIGEST: 'd'.repeat(64),
+  COCKPIT_MODULE_INSTANCE: '93e7f5a2-26f1-4d48-bfa5-f8f08250661a',
+  COCKPIT_MODULE_PORT: '39124',
+};
+
+test('independent module identity uses actual manifest version, no fabricated CD identity, and one authority', () => {
+  const input = { ...moduleEnv };
+  const config = lifecycleConfig(input);
+  input.COCKPIT_MODULE_DIGEST = 'a'.repeat(64);
+  assert.deepEqual(config.identity, { moduleApi: 1, moduleId: 'wechat',
+    moduleDigest: moduleEnv.COCKPIT_MODULE_DIGEST, instanceId: moduleEnv.COCKPIT_MODULE_INSTANCE, version: '0.1.0' });
+  assert.ok(Object.isFrozen(config) && Object.isFrozen(config.identity));
+  assert.equal('sha' in config.identity, false);
+  assert.equal(lifecycleConfig({ ...moduleEnv, COCKPIT_MODULE_PORT: undefined,
+    SERVICE_DELIVERY_PORT: '39125' }).port, 39125);
+  assert.equal(lifecycleConfig({ ...moduleEnv, SERVICE_DELIVERY_PORT: moduleEnv.COCKPIT_MODULE_PORT }).port, 39124);
+  assert.throws(() => lifecycleConfig({ ...moduleEnv, SERVICE_DELIVERY_PORT: '39126' }),
+    { code: 'COCKPIT_MODULE_PORT_CONFLICT' });
+  for (const key of ['SERVICE_DELIVERY_SHA', 'SERVICE_DELIVERY_ARTIFACT', 'SERVICE_DELIVERY_REQUEST',
+    'SERVICE_DELIVERY_INSTANCE']) {
+    for (const value of [env[key], '']) {
+      assert.throws(() => lifecycleConfig({ ...moduleEnv, [key]: value }), { code: 'LIFECYCLE_IDENTITY_CONFLICT' });
+    }
+  }
+  for (const port of [undefined, '', '0', '65536', '0123', '123\n']) {
+    assert.throws(() => lifecycleConfig({ ...moduleEnv, COCKPIT_MODULE_PORT: port }),
+      { code: 'COCKPIT_MODULE_PORT_INVALID' });
+  }
+  for (const [key, value] of [['COCKPIT_MODULE_ID', 'other'], ['COCKPIT_MODULE_DIGEST', 'e'.repeat(63)],
+    ['COCKPIT_MODULE_DIGEST', 'D'.repeat(64)], ['COCKPIT_MODULE_INSTANCE', 'not-a-uuid']]) {
+    assert.throws(() => lifecycleConfig({ ...moduleEnv, [key]: value }), { code: 'COCKPIT_MODULE_IDENTITY_INVALID' });
+  }
+  for (const version of [undefined, '', '9.9.9', '0.1.0\n']) {
+    assert.throws(() => lifecycleConfig({ ...moduleEnv, COCKPIT_MODULE_VERSION: version }),
+      { code: 'COCKPIT_MODULE_VERSION_MISMATCH' });
+  }
+});
 
 test('lifecycle is optional and strictly captures identity without repository fallbacks', () => {
   assert.equal(lifecycleConfig({ SERVICE_DELIVERY_SHA: 'invalid' }), null);
@@ -112,4 +151,30 @@ test('lifecycle bind failure is explicit and does not request drain', async t =>
   const config = lifecycleConfig({ ...env, SERVICE_DELIVERY_PORT: String(occupied.address().port) });
   await assert.rejects(startLifecycle(config, { state: () => ({}), requestDrain: () => assert.fail() }),
     { code: 'EADDRINUSE' });
+});
+
+test('independent module health/version/status/drain return the same immutable module instance', async t => {
+  const reserved = net.createServer();
+  await new Promise(resolve => reserved.listen(0, '127.0.0.1', resolve));
+  const port = reserved.address().port;
+  await new Promise(resolve => reserved.close(resolve));
+  const config = lifecycleConfig({ ...moduleEnv, COCKPIT_MODULE_PORT: String(port) });
+  const state = { running: true, ready: true };
+  const facade = await startLifecycle(config, { state: () => state,
+    requestDrain: () => { state.drainRequested = true; } });
+  t.after(() => facade.close());
+  const url = `http://127.0.0.1:${port}`;
+  const version = await (await fetch(`${url}/version`)).json();
+  assert.deepEqual(version, config.identity);
+  const health = await (await fetch(`${url}/health`)).json();
+  assert.deepEqual(health, { ...version, running: true, ok: true, phase: 'running' });
+  const draining = await (await fetch(`${url}/admin/restart`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: '{"pending":true}',
+  })).json();
+  assert.deepEqual(draining, { ...version, drainProtocol: 1, running: true,
+    restartPending: true, phase: 'draining', reason: 'bridge-draining' });
+  assert.deepEqual(await (await fetch(`${url}/status`)).json(), draining);
+  assert.deepEqual(await (await fetch(`${url}/health`)).json(),
+    { ...version, running: true, ok: false, phase: 'draining' });
+  assert.deepEqual(await (await fetch(`${url}/version`)).json(), version);
 });

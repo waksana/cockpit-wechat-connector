@@ -4,7 +4,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
 import { loadConfig, assertBinding } from './config.js';
-import { CockpitClient } from './cockpit.js';
+import { CockpitClient, cockpitToken } from './cockpit.js';
 import { BridgeError, object, requireThat } from './common.js';
 import { privateDirectory, readPrivate, secureExisting, writePrivate } from './storage.js';
 import { acquireModuleGate, assertCurrentConfig, blocker, controlFile, inspectBinding,
@@ -12,7 +12,7 @@ import { acquireModuleGate, assertCurrentConfig, blocker, controlFile, inspectBi
 
 const MAX_BYTES = 16384;
 const targetValid = (sessionId, cwd) => typeof sessionId === 'string'
-  && /^[A-Za-z0-9_-]{1,200}$/.test(sessionId) && typeof cwd === 'string'
+  && /^[A-Za-z0-9_-]{1,200}(?![\s\S])/.test(sessionId) && typeof cwd === 'string'
   && cwd.length <= 4096 && path.isAbsolute(cwd) && !/[\0\r\n]/.test(cwd);
 const codeOf = error => error instanceof BridgeError && /^[A-Z][A-Z0-9_]{0,100}$/.test(error.code)
   ? error.code : 'MODULE_CONTROL_FAILED';
@@ -21,6 +21,7 @@ function readiness(config) {
   const credentials = readPrivate(config.credentialFile);
   try {
     assertBinding({ ...config, cockpit: { ...config.cockpit, sessionId: 'validation', cwd: '/' } }, credentials);
+    cockpitToken(config);
     return { credentialsPresent: Boolean(credentials), configReady: true };
   } catch (error) {
     return { credentialsPresent: Boolean(credentials), configReady: false, configReason: codeOf(error) };
@@ -61,7 +62,7 @@ function validateRequest(request) {
     : ['operation', 'operationId', 'sessionId', 'cwd'];
   requireThat(Object.keys(request).every(key => allowed.includes(key)), 'INVALID_REQUEST');
   if (request.operation !== 'status') {
-    requireThat(typeof request.operationId === 'string' && /^[A-Za-z0-9_-]{8,120}$/.test(request.operationId)
+    requireThat(typeof request.operationId === 'string' && /^[A-Za-z0-9_-]{8,120}(?![\s\S])/.test(request.operationId)
       && !['__proto__', 'prototype', 'constructor'].includes(request.operationId),
       'OPERATION_ID_REQUIRED');
     requireThat(targetValid(request.sessionId, request.cwd), 'INVALID_TARGET');

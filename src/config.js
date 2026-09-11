@@ -32,6 +32,9 @@ export function validateConfig(raw, configPath) {
   const approved = allowed.map(value => validateApiOrigin(value));
   requireThat(approved.includes(DEFAULT_ORIGIN), 'LOGIN_ORIGIN_REQUIRED');
   for (const field of ['sessionId', 'cwd']) requireThat(typeof raw.cockpit[field] === 'string', 'INVALID_CONFIG');
+  requireThat(raw.cockpit.tokenFile === undefined || (text(raw.cockpit.tokenFile, 4096)
+    && path.isAbsolute(raw.cockpit.tokenFile) && path.resolve(raw.cockpit.tokenFile) === raw.cockpit.tokenFile
+    && !/[\0\r\n]/.test(raw.cockpit.tokenFile)), 'INVALID_COCKPIT_TOKEN_FILE');
   for (const field of ['allowedAccount', 'allowedPeer']) requireThat(typeof raw.weixin[field] === 'string', 'INVALID_CONFIG');
   requireThat(raw.deliveryMode === undefined || ['correlated', 'session'].includes(raw.deliveryMode), 'INVALID_DELIVERY_MODE');
   requireThat(raw.nativeInterruptFollowup === undefined || typeof raw.nativeInterruptFollowup === 'boolean',

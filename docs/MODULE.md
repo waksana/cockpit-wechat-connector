@@ -3,9 +3,50 @@
 `module.json` is schema/config version 1, module/package version 0.1.0, Linux x64,
 Node 24, Cockpit API 1. Its sole role `wechat` provides binding only: no injected
 instructions, skills or MCP. The existing lifecycle service remains
-`node src/cli.js run`: `/health`, `/version`, `/admin/restart`. It still requires
-the existing launcher identity/port environment; the manifest does not start,
-log in, recover, drain or send messages.
+`node src/cli.js run`: `/health`, `/version`, `/admin/restart`. It requires one
+of the explicit launcher identity/port environments below; the manifest does
+not start, log in, recover, drain or send messages.
+
+## Independent module-runner lifecycle
+
+Launch the fixed service entry with the selected config reference, only when
+runtime startup is separately authorized:
+
+```text
+node src/cli.js run --config /absolute/private/module-config.json
+COCKPIT_MODULE_ID=wechat
+COCKPIT_MODULE_VERSION=0.1.0
+COCKPIT_MODULE_DIGEST=<64 lowercase hexadecimal catalog digest>
+COCKPIT_MODULE_INSTANCE=<canonical lowercase UUID for this process>
+COCKPIT_MODULE_PORT=<loopback port, integer 1..65535>
+```
+
+`SERVICE_DELIVERY_PORT` is also accepted in place of `COCKPIT_MODULE_PORT`.
+If both are set they must match. Module version must match the actual installed
+`module.json` **and** `package.json`; it is not copied blindly from environment.
+The digest is the trusted parent's selected catalog identity, never Git HEAD or
+an invented CD artifact identity.
+
+The host **must remove inherited** `SERVICE_DELIVERY_SHA`,
+`SERVICE_DELIVERY_ARTIFACT`, `SERVICE_DELIVERY_REQUEST` and
+`SERVICE_DELIVERY_INSTANCE` from a module child's environment (not set them to
+empty strings). Any simultaneous CD and module identity is rejected with
+`LIFECYCLE_IDENTITY_CONFLICT`. Partial/invalid module identity and mismatched
+version/ports fail before config or business-state access. Existing private-CD
+identity validation and all its response shapes remain unchanged.
+
+Module `/version`:
+
+```json
+{"moduleApi":1,"moduleId":"wechat","moduleDigest":"<digest64>","instanceId":"<uuid>","version":"0.1.0"}
+```
+
+Module `/health` returns those **same five identity fields** plus
+`{"running":true,"ok":true,"phase":"running"}` (actual current state, not a
+startup guarantee). `/status` and `/admin/restart` also carry the same module
+identity. There is no `sha`, `artifactSha256` or fabricated delivery request.
+The facade remains loopback-only; drain semantics are unchanged. Offline
+`src/module-control.js` binding commands do not need any lifecycle environment.
 
 ## Explicit configuration reference
 
@@ -78,6 +119,20 @@ the exact session ID and cwd through `CockpitClient.meta()`'s native
 `POST /intent/session/get` **read-only intent**. It does not create/load a
 session, prompt, interrupt, send WeChat requests or log in. Optional
 `COCKPIT_API_TOKEN` uses the existing client environment mechanism.
+
+Alternatively, set optional `cockpit.tokenFile` to a normalized absolute
+**protected file path**, not token contents. This is supported by native bind
+reads and the normal runner's Cockpit client. The file must be a regular
+non-symlink, single-link file owned by the process UID, with no group/other
+permissions (normally 0600), at most 16 KiB. Contents are one nonempty printable
+ASCII token with no whitespace; one trailing LF or CRLF is allowed. It is read
+in place, never copied into the routing record, manifest or result. An explicit
+file reference and `COCKPIT_API_TOKEN` together fail with
+`COCKPIT_TOKEN_AUTHORITY_CONFLICT`; the host must remove an inherited token
+environment variable when selecting the file authority. Missing/insecure/
+malformed files make status `configReady:false` with a stable `configReason`;
+status still makes no network requests. File ownership/permissions are checked,
+but token validity is only evaluated by the native server.
 
 Status success:
 

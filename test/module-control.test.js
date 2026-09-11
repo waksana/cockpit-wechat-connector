@@ -3,11 +3,13 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import http from 'node:http';
+import net from 'node:net';
 import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { setTimeout as delay } from 'node:timers/promises';
 import { control } from '../src/module-control.js';
+import { CockpitClient } from '../src/cockpit.js';
 import { loadConfig, validateConfig } from '../src/config.js';
 import { acquireModuleGate, assertCurrentConfig, controlFile, readControl } from '../src/module-state.js';
 import { readPrivate, RunLock, Store, writePrivate } from '../src/storage.js';
@@ -31,7 +33,7 @@ async function fixture(t) {
     const chunks = [];
     for await (const chunk of req) chunks.push(chunk);
     const body = JSON.parse(Buffer.concat(chunks).toString() || '{}');
-    requests.push({ method: req.method, url: req.url, body });
+    requests.push({ method: req.method, url: req.url, body, authorization: req.headers.authorization });
     if (hold && req.url === '/intent/session/get') await hold;
     res.setHeader('content-type', 'application/json');
     if (req.url === '/intent/session/get') {
@@ -404,11 +406,63 @@ test('bounded strict wire responses and configuration-not-ready do not leak priv
   assert.equal(f.requests.length, 0);
 });
 
+test('protected Cockpit token-file reference authenticates native bind reads without copying or exposing tokens', async t => {
+  const f = await fixture(t);
+  const inherited = process.env.COCKPIT_API_TOKEN;
+  delete process.env.COCKPIT_API_TOKEN;
+  t.after(() => {
+    if (inherited === undefined) delete process.env.COCKPIT_API_TOKEN;
+    else process.env.COCKPIT_API_TOKEN = inherited;
+  });
+  const token = 'FAKE_GATEWAY_FILE_TOKEN';
+  const tokenFile = path.join(f.dir, 'gateway-token.txt');
+  fs.writeFileSync(tokenFile, `${token}\n`, { mode: 0o600 });
+  f.raw.cockpit.tokenFile = tokenFile;
+  writePrivate(f.file, f.raw);
+  assert.equal((await control(f.file, { operation: 'status' })).status.configReady, true);
+  assert.equal(f.requests.length, 0);
+  const result = await wire(f.file, bind());
+  assert.equal(result.code, 0, result.stdout);
+  assert.equal(f.requests[0].authorization, `Bearer ${token}`);
+  assert.equal(f.requests[0].url, '/intent/session/get');
+  assert.ok(!result.stdout.includes(token) && !result.stderr.includes(token));
+  assert.ok(!fs.readFileSync(controlFile(loadConfig(f.file)), 'utf8').includes(token));
+  assert.equal(fs.readFileSync(tokenFile, 'utf8'), `${token}\n`);
+  assert.throws(() => new CockpitClient(loadConfig(f.file), { token: 'FAKE_SECOND_AUTHORITY' }),
+    { code: 'COCKPIT_TOKEN_AUTHORITY_CONFLICT' });
+  for (const content of ['', 'has spaces', 'two\nlines', 'extra-newline\n\n', 'x'.repeat(16385)]) {
+    fs.writeFileSync(tokenFile, content);
+    const status = (await control(f.file, { operation: 'status' })).status;
+    assert.equal(status.configReady, false);
+    assert.equal(status.configReason, 'COCKPIT_TOKEN_FILE_INVALID');
+  }
+  fs.writeFileSync(tokenFile, token);
+  fs.chmodSync(tokenFile, 0o644);
+  assert.equal((await control(f.file, { operation: 'status' })).status.configReason, 'INSECURE_STATE_PERMISSIONS');
+  fs.chmodSync(tokenFile, 0o600);
+  const linked = path.join(f.dir, 'gateway-token-link.txt');
+  fs.symlinkSync(tokenFile, linked);
+  assert.throws(() => new CockpitClient({ ...loadConfig(f.file),
+    cockpit: { ...f.raw.cockpit, tokenFile: linked } }), { code: 'UNSAFE_STATE_PATH' });
+  fs.unlinkSync(tokenFile);
+  assert.equal((await control(f.file, { operation: 'status' })).status.configReason, 'COCKPIT_TOKEN_FILE_READ_FAILED');
+  assert.equal(f.requests.length, 1);
+});
+
 test('real managed CLI runner shares stable lock with offline mutations, status, stop and unlock', async t => {
   const f = await fixture(t);
   await control(f.file, bind());
   const config = loadConfig(f.file);
-  const runner = cli(f.file, ['run'], { preload: true, env: { TEST_MOCK_PORT: String(f.port) } });
+  const reserved = net.createServer();
+  await new Promise(resolve => reserved.listen(0, '127.0.0.1', resolve));
+  const lifecyclePort = reserved.address().port;
+  await new Promise(resolve => reserved.close(resolve));
+  const moduleEnv = { COCKPIT_MODULE_ID: 'wechat', COCKPIT_MODULE_VERSION: '0.1.0',
+    COCKPIT_MODULE_DIGEST: 'c'.repeat(64), COCKPIT_MODULE_INSTANCE: randomUUID(),
+    COCKPIT_MODULE_PORT: String(lifecyclePort), SERVICE_DELIVERY_PORT: undefined,
+    SERVICE_DELIVERY_SHA: undefined, SERVICE_DELIVERY_ARTIFACT: undefined,
+    SERVICE_DELIVERY_REQUEST: undefined, SERVICE_DELIVERY_INSTANCE: undefined };
+  const runner = cli(f.file, ['run'], { preload: true, env: { TEST_MOCK_PORT: String(f.port), ...moduleEnv } });
   t.after(async () => {
     if (runner.child.exitCode === null && runner.child.signalCode === null) {
       runner.child.kill('SIGTERM');
@@ -421,6 +475,12 @@ test('real managed CLI runner shares stable lock with offline mutations, status,
     await delay(10);
   }
   assert.ok(f.requests.some(req => req.url === '/weixin/ilink/bot/getupdates'));
+  const lifecycleUrl = `http://127.0.0.1:${lifecyclePort}`;
+  const version = await (await fetch(`${lifecycleUrl}/version`)).json();
+  assert.deepEqual(version, { moduleApi: 1, moduleId: 'wechat', moduleDigest: moduleEnv.COCKPIT_MODULE_DIGEST,
+    instanceId: moduleEnv.COCKPIT_MODULE_INSTANCE, version: '0.1.0' });
+  assert.deepEqual(await (await fetch(`${lifecycleUrl}/health`)).json(),
+    { ...version, running: true, ok: true, phase: 'running' });
   assert.ok(readPrivate(path.join(config.lockDir, 'run.lock')));
   assert.equal(fs.existsSync(path.join(config.stateDir, 'run.lock')), false);
   assert.equal((await control(f.file, { operation: 'status' })).status.running, true);
@@ -431,6 +491,7 @@ test('real managed CLI runner shares stable lock with offline mutations, status,
   assert.equal((await cli(f.file, ['stop']).done).code, 0);
   const stopped = await runner.done;
   assert.equal(stopped.code, 0, stopped.stderr);
+  await assert.rejects(fetch(`${lifecycleUrl}/version`));
   assert.equal(fs.existsSync(path.join(config.lockDir, 'run.lock')), false);
   assert.equal((await control(f.file, unbind())).ok, true);
   assert.equal((await cli(f.file, ['run']).done).code, 2);
