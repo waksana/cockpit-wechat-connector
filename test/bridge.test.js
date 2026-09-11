@@ -171,13 +171,10 @@ for (const kind of ['ask', 'planRequest', 'elicitation']) {
   });
 }
 
-test('correlated mode waits for known native state; missing or changed target fails closed', async t => {
+test('correlated queued input explicitly loads its original target; missing or changed target fails closed', async t => {
   const f = await fixture(t, { status: 'unloaded', loaded: false });
   await f.bridge.receive(); await f.bridge.step();
-  assert.equal(f.prompts.length, 0, 'unknown unloaded queue is not a quiescent target');
-  assert.equal(f.store.jobs()[0].status, 'queued');
-  f.state.loaded = true; f.state.status = 'idle';
-  await f.bridge.step();
+  assert.equal(f.requests.filter(row => row.url === '/intent/session/load').length, 1);
   assert.equal(f.prompts.length, 1);
   f.state.missing = true;
   await assert.rejects(f.bridge.step(), { code: 'TARGET_SESSION_MISSING' });

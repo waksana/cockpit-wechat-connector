@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import http from 'node:http';
+import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import { validateConfig } from '../src/config.js';
 import { Store } from '../src/storage.js';
@@ -82,7 +83,7 @@ export async function fixture(t, options = {}) {
     if (req.url.startsWith('/capabilities?')) {
       const name = new URL(req.url, 'http://mock').searchParams.get('name');
       const fields = name === 'prompt' ? ['sessionId', 'text', 'mode'] :
-        ['session/get', 'session/interrupt'].includes(name) ? ['sessionId'] : ['sessionId', 'cursor', 'max', 'source', 'direction'];
+        ['session/get', 'session/load', 'session/interrupt'].includes(name) ? ['sessionId'] : ['sessionId', 'cursor', 'max', 'source', 'direction'];
       return reply({ name, inputSchema: { type: 'object', properties: Object.fromEntries(fields.map(field =>
         [field, field === 'mode' ? { type: 'string', enum: ['enqueue', 'immediate'] } : { type: 'string' }])) },
       resultSchema: { type: 'object' } });
@@ -101,6 +102,18 @@ export async function fixture(t, options = {}) {
         closing: state.closing ?? false, cancelling: state.cancelling ?? false,
         loading: state.loading ?? false, compacting: state.compacting ?? false,
       } });
+    }
+    if (req.url === '/intent/session/load') {
+      assert.equal(data.sessionId, 'test-session');
+      if (state.onLoad) await state.onLoad();
+      if (state.missing) return reply({ error: 'Unknown session' }, 404);
+      state.loaded = true;
+      state.status = state.loadStatus ?? 'idle';
+      if (state.expireCursorsOnLoad) nativeCursors.clear();
+      if (state.loadFault === 'disconnect') return res.destroy();
+      if (state.loadFault === 'schema') return reply({ ok: true, sessionId: 'different-session' });
+      if (state.loadFault === 'reject') return reply({ error: 'Readiness failed' }, 409);
+      return reply({ ok: true, sessionId: 'test-session' });
     }
     if (req.url === '/intent/session/chat') {
       const marker = attachment => `<cockpit-attachment version="2" ${['kind', 'name', 'url', 'size', 'mime']
@@ -135,7 +148,8 @@ export async function fixture(t, options = {}) {
       const events = nativeLog.map(row => row.event);
       const prior = data.cursor ? nativeCursors.get(data.cursor) : undefined;
       const anchor = prior?.id ? events.findIndex(event => event.id === prior.id) : -1;
-      const expired = !!data.cursor && (!prior || (prior.id && anchor < 0));
+      const expired = !!data.cursor && (!prior || prior.source !== data.source || prior.direction !== data.direction
+        || (prior.id && anchor < 0));
       const direction = prior?.direction ?? data.direction;
       const boundary = prior ? (prior.id ? anchor + (direction === 'forward' ? 1 : 0) : 0)
         : direction === 'backward' ? events.length : 0;
@@ -145,11 +159,11 @@ export async function fixture(t, options = {}) {
       const selected = direction === 'backward' ? candidates.slice(-data.max) : candidates.slice(0, data.max);
       const nextId = direction === 'backward' ? selected[0]?.event.id : selected.at(-1)?.event.id;
       const cursor = `fixture-native-${++nativeCursorSequence}`;
-      nativeCursors.set(cursor, { id: nextId ?? prior?.id, direction });
+      nativeCursors.set(cursor, { id: nextId ?? prior?.id, direction, source: data.source });
       let liveCursor;
       if (data.bootstrap) {
         liveCursor = `fixture-native-${++nativeCursorSequence}`;
-        nativeCursors.set(liveCursor, { id: events.at(-1)?.id, direction: 'forward' });
+        nativeCursors.set(liveCursor, { id: events.at(-1)?.id, direction: 'forward', source: 'live' });
       }
       return reply({
         sessionId: 'test-session', source: data.source, direction: data.direction,

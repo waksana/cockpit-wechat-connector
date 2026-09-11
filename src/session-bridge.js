@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { Bridge, createOutbox } from './bridge.js';
-import { errorCode, requireThat, sessionLink, sleep } from './common.js';
+import { errorCode, requireThat, retryableRead, sessionLink, sleep } from './common.js';
 import { deliveryCheckpoint, quiescent, verifyCheckpoint } from './cockpit.js';
 import { StatusDisplay } from './status-display.js';
 import { replyRunId } from './reply-run.js';
@@ -136,14 +136,28 @@ export class SessionBridge extends Bridge {
     if (queued) {
       if (queued.kind !== 'text') await this.processJob(queued, signal);
       else {
-        const meta = this.deliveryMeta = await this.cockpit.meta(signal);
-        this.ingressPaused = Boolean(meta.closing || meta.cancelling || meta.loading || meta.compacting);
+        const meta = this.deliveryMeta = await this.ensureInputTarget(queued, signal);
+        this.ingressPaused = Boolean(!meta.loaded || meta.closing || meta.cancelling || meta.loading || meta.compacting);
         if (this.draining) return;
+        if (!this.ingressPaused) {
+          if (!this.store.get('historyCheckpoint')) {
+            if (!quiescent(meta)) { this.ingressPaused = true; return; }
+            await this.establishCheckpoint(signal);
+          }
+          try {
+            const verified = await this.readWindow(this.store.get('historyCheckpoint'), signal);
+            this.store.set('historyCheckpoint', verified.checkpoint);
+          } catch (error) {
+            if (retryableRead(errorCode(error))) throw error;
+            this.block(queued, errorCode(error));
+          }
+        }
         const following = await this.followup.step(queued, meta, signal);
         if (!following && !this.ingressPaused) {
           if (!await this.prepareInput(queued, signal)) return;
           await submitInputs(this, [queued], queued.prompt, signal, undefined, queued.promptParts);
         }
+        if (!meta.loaded) return;
       }
       if (this.draining) return;
     }

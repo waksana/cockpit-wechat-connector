@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "id": "wechat",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "name": "WeChat",
   "description": "Explicit, unique WeChat session binding and connector lifecycle.",
   "compatibility": { "cockpitApi": 1, "nodeMajor": 24, "platform": "linux", "arch": "x64" },

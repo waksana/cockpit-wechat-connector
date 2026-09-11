@@ -41,7 +41,7 @@ node src/cli.js run
 node src/cli.js run --once
 node src/cli.js stop
 node src/cli.js unlock --confirm
-node src/cli.js resolve JOB_ID observe|sent|abandon|enqueue|retry-media --confirm
+node src/cli.js resolve JOB_ID observe|sent|abandon|enqueue|retry-media|retry-load --confirm
 node src/cli.js send-image /uploads/PUBLISHED_FILE.png --confirm
 All commands accept --config /absolute/config.json.
 login performs REAL Weixin authorization. run sends REAL messages when configured.

@@ -116,6 +116,17 @@ export class CockpitClient {
     requireThat(meta.cwd === this.config.cockpit.cwd, 'TARGET_CWD_CHANGED');
     return meta;
   }
+  async ensureLoaded(signal) {
+    const result = await this.call('session/load', { sessionId: this.config.cockpit.sessionId }, signal);
+    requireThat(result.ok === true && result.sessionId === this.config.cockpit.sessionId, 'COCKPIT_LOAD_SCHEMA');
+  }
+  async positionSource(position, signal) {
+    requireThat(object(position) && text(position.cursor, 16384)
+      && ['live', 'persisted'].includes(position.source), 'NATIVE_CHECKPOINT_INVALID');
+    const meta = await this.meta(signal);
+    requireThat(position.source !== 'live' || meta.loaded, 'SESSION_OUTPUT_BUSY');
+    return position.source;
+  }
   async nativePage(query, signal) {
     const result = await this.call('session/chat', {
       sessionId: this.config.cockpit.sessionId, max: 64, waitMs: 0, bootstrap: false,
@@ -159,9 +170,8 @@ export class CockpitClient {
       return page.messages.slice(index + (includeBaseline && index >= 0 ? 0 : 1));
     }
     const events = [];
-    const meta = await this.meta(signal);
-    const source = meta.loaded ? 'live' : 'persisted';
-    let cursor = position.cursor || undefined;
+    const source = await this.positionSource(position, signal);
+    let cursor = position.cursor;
     for (let pageNo = 0; pageNo < 10; pageNo++) {
       const page = await this.nativePage({
         source, direction: 'forward', cursor, max: 256, ...(source === 'live' ? this.liveFilter() : {}),
@@ -179,10 +189,9 @@ export class CockpitClient {
   }
   async deliveryPage(checkpoint, signal) {
     requireThat(checkpoint?.position, 'NATIVE_CHECKPOINT_REQUIRED');
-    const meta = await this.meta(signal);
-    const source = meta.loaded ? 'live' : 'persisted';
+    const source = await this.positionSource(checkpoint.position, signal);
     const query = {
-      source, direction: 'forward', cursor: checkpoint.position.cursor || undefined, max: 64,
+      source, direction: 'forward', cursor: checkpoint.position.cursor, max: 64,
       ...(source === 'live' ? this.liveFilter() : {}),
     };
     let page = await this.nativePage(query, signal);

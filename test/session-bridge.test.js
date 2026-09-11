@@ -333,18 +333,19 @@ test('bounded forward pages skip empty tool messages and preserve output order d
   assert.ok(reads.every(row => row.data.direction === 'forward' && row.data.max <= 64));
 });
 
-test('passive events without a visible message advance the native cursor without losing user ownership', async t => {
+test('passive delivery retains a live cursor while unloaded and never switches its source or loads the target', async t => {
   const f = await setup(t);
   await f.bridge.receive(); await f.bridge.step();
   const before = f.store.get('historyCheckpoint');
   assert.ok(before.position);
   f.state.loaded = false;
   f.state.nativeEvents = [{ id: 'shutdown', type: 'session.shutdown', data: {} }];
-  await f.bridge.step();
+  const requests = f.requests.length;
+  await assert.rejects(f.bridge.step(), { code: 'SESSION_OUTPUT_BUSY' });
   const after = f.store.get('historyCheckpoint');
-  assert.notEqual(after.position.cursor, before.position.cursor);
-  assert.equal(after.id, before.id);
-  assert.equal(after.userMessageId, before.userMessageId);
+  assert.deepEqual(after, before);
+  assert.ok(f.requests.slice(requests).every(row => row.url !== '/intent/session/load' && row.url !== '/intent/session/chat'));
+  f.state.loaded = true;
   f.finish('Later durable reply');
   await f.settle(6);
   assert.equal(f.sent[0].msg.item_list[0].text_item.text, 'Later durable reply');

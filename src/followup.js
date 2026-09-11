@@ -26,9 +26,8 @@ export class NativeFollowup {
     const { store, config, cockpit } = this.bridge;
     let round = store.get('nativeFollowup');
     if (!round && (!config.nativeInterruptFollowup || first.followupEpoch !== this.epoch || !this.textOnly(first))) return false;
-    // Cold metadata does not prove an empty queue. Fresh input can use native
-    // enqueue/resume, but it cannot complete an already-started interrupt drain.
-    if (!round && !meta.loaded) return false;
+    // Restoring a cold target does not authorize interrupting its recovered work.
+    if (!round && (!meta.loaded || first.targetLoad)) return false;
     if (!round) {
       round = { id: randomUUID(), epoch: this.epoch, leaderId: first.id,
         startedAt: Date.now(), phase: 'draining', attempts: 0 };

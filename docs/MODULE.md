@@ -1,6 +1,6 @@
 # Official WeChat module (opt-in, offline control)
 
-`module.json` is schema/config version 1, module/package version 0.1.3, Linux x64,
+`module.json` is schema/config version 1, module/package version 0.1.4, Linux x64,
 Node 24, Cockpit API 1. Its sole role `wechat` provides binding only: no injected
 instructions, skills or MCP. The existing lifecycle service remains
 `node src/cli.js run`: `/health`, `/version`, `/admin/restart`. It requires one
@@ -15,7 +15,7 @@ runtime startup is separately authorized:
 ```text
 node src/cli.js run --config /absolute/private/module-config.json
 COCKPIT_MODULE_ID=wechat
-COCKPIT_MODULE_VERSION=0.1.3
+COCKPIT_MODULE_VERSION=0.1.4
 COCKPIT_MODULE_DIGEST=<64 lowercase hexadecimal catalog digest>
 COCKPIT_MODULE_INSTANCE=<canonical lowercase UUID for this process>
 COCKPIT_MODULE_PORT=<loopback port, integer 1..65535>
@@ -38,7 +38,7 @@ identity validation and all its response shapes remain unchanged.
 Module `/version`:
 
 ```json
-{"moduleApi":1,"moduleId":"wechat","moduleDigest":"<digest64>","instanceId":"<uuid>","version":"0.1.3","moduleVersion":"0.1.3"}
+{"moduleApi":1,"moduleId":"wechat","moduleDigest":"<digest64>","instanceId":"<uuid>","version":"0.1.4","moduleVersion":"0.1.4"}
 ```
 
 `moduleVersion` aliases the already validated actual `version`; both are retained.
@@ -48,6 +48,36 @@ startup guarantee). `/status` and `/admin/restart` also carry the same module
 identity. There is no `sha`, `artifactSha256` or fabricated delivery request.
 The facade remains loopback-only; drain semantics are unchanged. Offline
 `src/module-control.js` binding commands do not need any lifecycle environment.
+
+## Cold input admission
+
+Starting in 0.1.4, already-received supported input explicitly ensures its
+original configured session is loaded before checkpoint validation and prompt.
+This requires `POST /intent/session/load` with `{sessionId}` and the receipt
+`{ok:true,sessionId}`. The host restores only that existing ID and its pinned
+roles; an already-loaded handle is not closed, replaced or prompted. This is
+not `session/reload` and does not repair a partial-load readiness failure.
+Both correlated and shared-session ingress use this path. A restored target's
+previous native work is not an authorization to interrupt it.
+
+Startup without queued input, status, binding checks and passive output
+observation do not load sessions. Unknown load outcomes are persisted before
+any prompt; restart does not retry them. After explicitly establishing that
+the previous load has settled (and safely repairing failed native readiness
+if needed), an operator may use
+`resolve JOB_ID retry-load --confirm --config /absolute/private/module-config.json`.
+This only authorizes another original-target readiness attempt for that same
+unprompted input. It cannot retry an unknown prompt/send, interrupted handoff,
+or expired history, and makes no network call itself.
+
+Saved forward cursors retain their original source and value. A live cursor
+pauses passive delivery while unloaded and must be accepted by the native
+reader after load **before** ingress can prompt. Expired or malformed cursors
+block without replacement, latest-tail bootstrap, source switching or history
+rescan. This does not promise that a native live cursor survives cold resume;
+an expired cursor still requires an explicit history-review decision.
+Legacy checkpoints without a cursor retain their existing bounded migration
+rules. Business counts, binding confirmation and mutation gates are unchanged.
 
 ## Explicit configuration reference
 

@@ -91,12 +91,15 @@ account/peer/session/cwd/API origin；另一个绑定用独立配置目录和重
 首次在空闲 session 上 `check`/`run` 建立历史检查点；以后跨任务、跨重启保留，不补发绑定前的历史。
 `session` 模式允许同一用户在 Web 输入和 owner 回报进入同一个会话，不因外部正常输入而停机。
 同一会话此后产生的可见 assistant 正文也会镜像给唯一绑定用户，而不限于逐条微信请求的答复。
-此工具不会创建 session、切换 cwd、加载原生 SDK、注册 MCP/skill、自动重放队列或保持 session 常驻。
+此工具不会创建 session、切换 cwd、在连接器进程内加载原生 SDK、注册 MCP/skill、
+自动重放队列或保持 session 常驻；原目标的按需加载交给 Cockpit。
 `session/get` 在 unloaded 时可以省略 `queue`；省略表示未知，不补成空队列。新后端即使 loaded
 也不提供 last-error getter，因此 `error` 可以省略，不伪造 `error:null`。当前空闲只依据已加载的
 原生 status/processing/activity/queue/选择状态；兼容响应若显式提供错误仍阻止空闲判断。
 持久化 `session.error` 从原生事件读取，生成去重的脱敏 Web 提示，不依赖 metadata 的旧 error 字段。
-已有检查点的共享 `session` 模式仍可把新输入交给原生 enqueue/resume，完整持久正文也可继续交付。
+两种模式只在处理已接收输入时，通过 `session/load {sessionId}` 确认原目标和 pinned 角色已加载，
+再核对原检查点并 enqueue；不会用关闭 handle 的 reload 代替。已有 live cursor 的被动出站在
+unloaded 时暂停，不将游标换成 persisted 来源，也不自动加载目标。无游标的旧检查点保留有界迁移规则。
 独占 `correlated` 模式的发送/最终回复判断以及新检查点绑定仍需要已知空闲状态。
 `lastActivitySource` 是可选元数据；聊天页无需重复 title/cwd，绑定只信任 `session/get`。
 
@@ -291,8 +294,15 @@ token 等退出码 2 **不自动重启**，需按下文核对或重新登录。�
 
 下面的原文原样保留（多个 text item 用换行连接）。编号用于确认输入确实出现在权威历史中，
 不是隐藏指令，也不要求模型承诺归属。SQLite 的 inbox 是投递记录，不再另建一个等待模型完成的
-执行队列：连续微信输入可以直接进入 Cockpit 原生 Q。目标 unloaded 时由原生 prompt 自动恢复，
+执行队列：连续微信输入可以直接进入 Cockpit 原生 Q。目标 unloaded 时先显式确保原 ID 已加载，
+原 cursor 经后端验证后才 prompt；过期明确阻断，不重新 bootstrap 最新历史。
 不做 keepalive、复制 session 数据库或自动重放被 Web Stop 清掉的队列。
+
+加载结果不确定时保存 `TARGET_LOAD_OUTCOME_UNKNOWN`，不在轮询或重启后自动重试。
+操作员先确认上一加载已结束，必要时安全修复 partial-load readiness，再执行
+`resolve JOB_ID retry-load --confirm --config /absolute/private/config.json`。
+该操作只授权同一未 prompt 收件再次确认原目标就绪，不改检查点、不放行过期历史，
+不能用于重发未知 prompt/send 或未完成的 interrupt 交接。
 
 ### 新微信消息打断续答试用
 
@@ -319,7 +329,8 @@ Web 恰好在空闲确认后先启动时，本次微信仍安全 enqueue，可�
 被打断的 ask/plan/elicitation 不会被连接器当作批准或代选答案；原生清理旧 turn 的等待
 请求，模型可以针对新输入重新询问。plan 模式仍保持 plan。没有新微信时原有 Web 选择通知
 及行为不变。`interrupted:false` 只表示当时没有可中断主 turn，不代表全 session 空闲。
-新输入到达 unloaded 目标时直接使用原生 enqueue/resume，不根据未知队列发起或完成中断。
+新输入到达 unloaded 目标时先调用原目标的幂等 `session/load`，验证原 cursor 后 enqueue；
+加载后也不据此授权中断已恢复的工作，不根据未知队列发起或完成中断。
 若中断已经开始，随后只读到 unloaded 元数据，则继续有界等待已加载的权威状态；
 不能把 unloaded 的未知队列当作 drain 完成，也不会发送新的 interrupt 或提前提交交接输入；
 已加载且当前控制状态确认空闲时，不要求存在旧版 error 字段。
@@ -441,13 +452,14 @@ outbox 按序发送，后面的 assistant 消息不越过前面的回复；每�
 不能根据消息 ID 拼造游标。只有当前页全部消费（包括空页）才保存下一位置。
 后端冷启动为 unloaded，而旧 v3 检查点尚无 native position 时，继续使用单个最多 256 事件的
 被动后向窗口验证锚点；没有新正文就原样保留检查点，有新正文则按序交付并更新消息级锚点。
-被动后向游标不当作前向 tail，也不从头扫描补造位置。正常新输入触发原生 enqueue/resume 或用户
+被动后向游标不当作前向 tail，也不从头扫描补造位置。已接收输入触发原 ID 的 `session/load` 或用户
 明确恢复会话后，才在完整消费可见输出后采用后端提供的 live forward tail；读取本身不恢复会话。
 锚点不在有界窗口内或正文变化仍明确停止核对，不用冷启动为理由跳过未交付输出。
 旧游标在一个有界迁移窗口按旧指纹验证后继续原位迁移；不重置历史起点，不重建已有 outbox。
 旧版回复记录必须原文一致才迁移，保留既有分片状态及 client ID；不能静默补发旧版未交付的
 结构化附件。超出既有有界历史读取窗口、来源消失或内容被改写时仍明确停止核对。
-原生 epoch/来源变化导致游标过期时明确报告 `NATIVE_CURSOR_EXPIRED`，不静默跳到最新位置。
+已保存的游标始终使用原 source；原生 epoch 变化导致游标过期时明确报告 `NATIVE_CURSOR_EXPIRED`，
+不静默跳到最新位置。自然 unload 后旧 live cursor 是否仍有效由原生读取结果决定，不假定跨加载有效。
 最旧的无版本检查点只保存 folded 消息的哈希，工具 title/args/status 也在哈希内，并没有另存正文；
 不能把原生事件重建出来的不同工具字段直接当作正文被改写，也不能忽略旧哈希自动放行。
 若同一消息有已结束的旧出站记录，且其原始完整哈希与检查点完全相同，可用该记录冻结的正文验证
@@ -490,7 +502,7 @@ outbox 按序发送，后面的 assistant 消息不越过前面的回复；每�
 | 引用、部分引用 | ref_msg.svr_id / message_item.msg_id、partial_text | 已接入精确本地 ID/真实原文降级；缺失明确提示，部分选区仅提供未验证元数据，不下载媒体 |
 | 分块回复 | 官方 blockStreaming，把内容分块发送 | 当前发送完成态文本/图文分片；非逐 token 修改同一气泡 |
 | 客户端启动/停止通知 | msg/notifystart、msg/notifystop | 未接入；不是取消 Copilot 当前任务 |
-| 同一会话原生排队/恢复 | Cockpit 原生 enqueue/resume，不是微信端的执行能力 | 已接入；本地只保留传输状态 |
+| 同一会话原生排队/恢复 | Cockpit `session/load` 与原生 enqueue，不是微信端的执行能力 | 已接入；本地只保留传输状态 |
 | 群聊 | 官方 capabilities 只声明 direct；group_id 字段不足以证明群聊已开放 | 明确拒绝群消息 |
 | 主动消息 | 官方有明确目标的消息工具/cron 路由，但依赖账号与上下文 | 无通用主动推送入口；不能承诺陌生人或无限期推送 |
 | 编辑、撤回、reaction、已读、按钮菜单、位置、联系人、群管理 | 本次固定公开接口中没有足够证据 | 未接入，不把“未证实”写成服务端绝不支持 |

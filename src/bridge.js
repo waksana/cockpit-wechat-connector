@@ -131,6 +131,26 @@ export class Bridge {
     this.store.save(job);
     return !this.draining;
   }
+  async ensureInputTarget(job, signal) {
+    if (job.targetLoad !== undefined && !['confirmed', 'retry-authorized'].includes(job.targetLoad?.phase)) {
+      this.block(job, 'TARGET_LOAD_OUTCOME_UNKNOWN');
+    }
+    const meta = await this.cockpit.meta(signal);
+    if ((meta.loaded && job.targetLoad?.phase !== 'retry-authorized') || this.draining || this.store.get('nativeFollowup')
+      || meta.loading || meta.closing || meta.cancelling || meta.compacting) return meta;
+    if (meta.status === 'error' || meta.error) this.block(job, 'TARGET_ERROR');
+    // A lost load response must not become an automatic lifecycle retry after restart.
+    job.targetLoad = { phase: 'requested' };
+    this.store.save(job);
+    try { await this.cockpit.ensureLoaded(signal); }
+    catch (error) {
+      job.lastError = errorCode(error);
+      this.block(job, 'TARGET_LOAD_OUTCOME_UNKNOWN');
+    }
+    job.targetLoad = { phase: 'confirmed' };
+    this.store.save(job);
+    return this.cockpit.meta(signal);
+  }
   async processJob(job, signal) {
     if (this.draining) return;
     if (job.status === 'blocked') throw new BridgeError(job.reason ?? 'JOB_BLOCKED');
@@ -139,7 +159,8 @@ export class Bridge {
         this.outbox(job, '此消息含不支持的项目（例如语音）；未向模型转发，也未下载。支持文本、JPEG/PNG 图片、MP4/MOV 视频和普通文件。', 'unsupported');
         return;
       }
-      const first = await this.cockpit.meta(signal);
+      const first = await this.ensureInputTarget(job, signal);
+      if (this.draining) return;
       if (first.status === 'error' || first.error) this.block(job, 'TARGET_ERROR');
       if (!quiescent(first)) {
         if (Date.now() - job.receivedAt > this.config.limits.resultTimeoutMs) this.block(job, 'TARGET_NOT_QUIESCENT');
@@ -296,8 +317,8 @@ export class Bridge {
     }
     try {
       await this.cockpit.capabilities(signal);
-      await this.cockpit.meta(signal);
-      await this.establishCheckpoint(signal);
+      const meta = await this.cockpit.meta(signal);
+      if (this.store.get('historyCheckpoint') || quiescent(meta)) await this.establishCheckpoint(signal);
     } catch (error) {
       if (signal.aborted && (errorCode(error) === 'STOPPED' || error.name === 'AbortError')) return;
       throw error;
@@ -390,6 +411,17 @@ export function resolveJob(store, id, action) {
   const job = store.job(id);
   requireThat(job?.status === 'blocked', 'BLOCKED_JOB_REQUIRED');
   const round = store.get('nativeFollowup');
+  if (action === 'retry-load') {
+    requireThat(job.reason === 'TARGET_LOAD_OUTCOME_UNKNOWN' && job.targetLoad?.phase === 'requested'
+      && !job.prompt && !job.submissionId && !job.userMessageId && !job.outbox && !round,
+    'LOAD_RETRY_NOT_APPLICABLE');
+    job.targetLoad = { phase: 'retry-authorized' };
+    job.status = 'queued';
+    job.resolution = action;
+    delete job.reason;
+    store.save(job);
+    return;
+  }
   if (action === 'retry-media') {
     requireThat(job.reason === 'MEDIA_SIZE_MISMATCH' && job.media?.length
       && !job.prompt && !job.submissionId && !job.userMessageId && !job.outbox
