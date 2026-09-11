@@ -187,6 +187,29 @@ token 等退出码 2 **不自动重启**，需按下文核对或重新登录。�
 
 ### 安全发布：先确认运行中进程的 drain 能力
 
+#### 可选本机部署生命周期接口（仅 `run`）
+
+`node src/cli.js run --config /absolute/config.json` 仅在设置 `SERVICE_DELIVERY_PORT` 时监听
+`127.0.0.1`。端口必须为 1–65535；同时要求 `SERVICE_DELIVERY_SHA`（完整小写 SHA）、
+`SERVICE_DELIVERY_ARTIFACT`（64 位小写 SHA-256）、`SERVICE_DELIVERY_REQUEST`（8–120 位安全标识）
+和 `SERVICE_DELIVERY_INSTANCE`（1–120 位安全标识）。身份在启动时捕获；无效配置拒绝启动，
+不读取 Git HEAD 补造版本。其它 CLI 命令不启动接口，也不要求这些变量。
+
+- `GET /version` 返回捕获的 `sha/artifactSha256/requestId/instanceId` 与 package `version`。
+- `GET /health` 返回同一 `instanceId`、`running/phase/ok`；初始化或 draining 时 `ok=false`。
+- `GET /status` 仅返回进程阶段、`running/restartPending/drainProtocol:1/reason` 和实例标识，
+  不暴露会话、正文、任务或私有状态。不会虚构在途数量或以“当前空闲”证明可切换。
+- `POST /admin/restart` 要求 `Content-Type: application/json` 和精确的 `{"pending":true}`；
+  委托当前进程与 SIGTERM/stop 相同的 drain 信号，不启动替代进程、不取消 Cockpit 工作。
+  ACK 的 `restartPending:true/reason:"bridge-draining"` 只是停止入口已请求，不是 outbox 排空。
+  在途变更仍按原超时自然完成并落盘，unknown 恢复规则不变；run 自然结束后接口关闭，
+  停止状态不能从仓库 HEAD 冒充在线版本。重复请求不升级为强停，也不支持撤销 drain。
+
+接口只接受精确的 `Host: 127.0.0.1:PORT`，拒绝 Origin 和浏览器 Fetch Metadata 请求，
+无 CORS 或浏览器认证特权。它信任本机进程边界；不得经反向代理公开。
+`service-delivery.json` 仅声明验证、构建产物和生命周期契约，未授权生产启动或部署；
+当前接入应保持 `activationEnabled:false`、build-only。本节不是实际微信上线或首轮旧进程交接完成的证明。
+
 **磁盘上的新代码不能追溯改变已运行的旧 Node 进程。** 新 runner 在其私有 `run.lock` 中声明
 `drainProtocol: 1`；`status` 展示 `drainSupported`/`drainRequested`。新的 `stop` 命令在旧锁
 未声明支持时明确拒绝 `RUNNER_DRAIN_UNAVAILABLE`，不会写旧进程会立即 abort 的 stop 控制文件。

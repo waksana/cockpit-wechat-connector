@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "projectId": "wechat",
+  "targetRef": "refs/heads/master",
+  "validation": [["npm", "test"]],
+  "build": {
+    "argv": ["node", "--check", "src/cli.js"],
+    "artifactPaths": ["src", "package.json", "package-lock.json"]
+  },
+  "delivery": {
+    "adapter": "github-actions-v1",
+    "environment": "production",
+    "busyPolicy": "wait-no-force",
+    "healthPath": "/health",
+    "versionPath": "/version"
+  }
+}

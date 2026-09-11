@@ -11,6 +11,7 @@ import { BridgeError, errorCode, requireThat, retryableRead, sessionLink } from 
 import { Store, RunLock, privateDirectory, readPrivate, writePrivate } from './storage.js';
 import { WeixinClient, login } from './weixin.js';
 import { deliverPublishedPng } from './image.js';
+import { lifecycleConfig, startLifecycle } from './lifecycle.js';
 
 function options(argv) {
   const args = [...argv];
@@ -49,6 +50,7 @@ Unknown mutations are never replayed. See README before resolving.`;
 export async function main(argv = process.argv.slice(2)) {
   process.umask(0o077);
   const { command, rest, file, confirm, once } = options(argv);
+  const delivery = command === 'run' ? lifecycleConfig() : null;
   if (command === 'help') { console.log(help); return; }
   if (command === 'init') {
     requireThat(rest.length === 0, 'UNKNOWN_ARGUMENT');
@@ -73,6 +75,8 @@ export async function main(argv = process.argv.slice(2)) {
   const store = new Store(config.stateDir);
   let lock;
   let timer;
+  let lifecycle;
+  let running = false;
   const abort = new AbortController();
   const onSignal = () => abort.abort();
   process.on('SIGINT', onSignal);
@@ -144,13 +148,21 @@ export async function main(argv = process.argv.slice(2)) {
       try { if (lock.stopRequested()) abort.abort(); }
       catch { abort.abort(); process.stderr.write('STOP_CONTROL_READ_FAILED\n'); process.exitCode = 1; }
     }, 250);
+    if (delivery) lifecycle = await startLifecycle(delivery, {
+      state: () => ({ running, ready: bridge.draining === false,
+        draining: bridge.draining === true, drainRequested: abort.signal.aborted }),
+      requestDrain: onSignal,
+    });
+    running = true;
     await bridge.run(abort.signal, { once });
     console.log('Bridge stopped; Cockpit work and queue unchanged.');
   } finally {
+    running = false;
     if (timer) clearInterval(timer);
     process.removeListener('SIGINT', onSignal);
     process.removeListener('SIGTERM', onSignal);
-    try { lock?.release(); } finally { store.close(); }
+    try { await lifecycle?.close(); }
+    finally { try { lock?.release(); } finally { store.close(); } }
   }
 }
 

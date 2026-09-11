@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
+import net from 'node:net';
 import { spawn, execFile } from 'node:child_process';
 import { once } from 'node:events';
 import { promisify } from 'node:util';
@@ -32,7 +33,7 @@ function pendingNativeJob(f) {
   return job;
 }
 
-for (const stop of ['control', 'SIGTERM']) {
+for (const stop of ['control', 'SIGTERM', 'http']) {
   test(`real CLI ${stop} drains an in-flight native send without abort, replay or next-part send`, async t => {
     const f = await fixture(t, { sendFault: 'hold' });
     await f.bridge.receive();
@@ -42,10 +43,21 @@ for (const stop of ['control', 'SIGTERM']) {
     f.raw.limits.requestTimeoutMs = 2000;
     fs.writeFileSync(f.configFile, JSON.stringify(f.raw), { mode: 0o600 });
     writePrivate(path.join(f.config.stateDir, 'credentials.json'), credentials);
+    const reserved = net.createServer();
+    await new Promise(resolve => reserved.listen(0, '127.0.0.1', resolve));
+    const lifecyclePort = reserved.address().port;
+    await new Promise(resolve => reserved.close(resolve));
+    const identityEnv = {
+      SERVICE_DELIVERY_PORT: String(lifecyclePort),
+      SERVICE_DELIVERY_SHA: 'a'.repeat(40),
+      SERVICE_DELIVERY_ARTIFACT: 'b'.repeat(64),
+      SERVICE_DELIVERY_REQUEST: 'fixture-drain-request',
+      SERVICE_DELIVERY_INSTANCE: 'fixture-drain-instance',
+    };
     const args = ['--import', './test/cli-preload.js', 'src/cli.js', 'run', '--config', f.configFile];
     const child = spawn(process.execPath, args, {
       cwd: path.resolve(import.meta.dirname, '..'),
-      env: { ...process.env, TEST_MOCK_PORT: String(f.port), COCKPIT_API_TOKEN: 'FAKE_GATE_TOKEN' },
+      env: { ...process.env, ...identityEnv, TEST_MOCK_PORT: String(f.port), COCKPIT_API_TOKEN: 'FAKE_GATE_TOKEN' },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     let output = '';
@@ -60,14 +72,29 @@ for (const stop of ['control', 'SIGTERM']) {
     });
     await waitFor(() => f.heldSends.length === 1, output);
     assert.equal(f.store.job(job.id).outbox[1].status, 'sending');
+    const lifecycleUrl = `http://127.0.0.1:${lifecyclePort}`;
+    const version = await (await fetch(`${lifecycleUrl}/version`)).json();
+    assert.deepEqual(version, { sha: identityEnv.SERVICE_DELIVERY_SHA,
+      artifactSha256: identityEnv.SERVICE_DELIVERY_ARTIFACT, requestId: identityEnv.SERVICE_DELIVERY_REQUEST,
+      instanceId: identityEnv.SERVICE_DELIVERY_INSTANCE, version: '0.1.0' });
+    assert.equal((await (await fetch(`${lifecycleUrl}/health`)).json()).ok, true);
     if (stop === 'control') {
       const result = await promisify(execFile)(process.execPath, ['src/cli.js', 'stop', '--config', f.configFile],
         { cwd: path.resolve(import.meta.dirname, '..') });
       assert.match(result.stdout, /Drain requested/);
-    } else {
+    } else if (stop === 'SIGTERM') {
       child.kill('SIGTERM');
       await waitFor(() => output.includes('BRIDGE_DRAIN_REQUESTED'), output);
       child.kill('SIGTERM');
+    } else {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const response = await fetch(`${lifecycleUrl}/admin/restart`, {
+          method: 'POST', headers: { 'content-type': 'application/json' }, body: '{"pending":true}',
+        });
+        assert.equal(response.status, 200);
+        assert.deepEqual(await response.json(), { instanceId: identityEnv.SERVICE_DELIVERY_INSTANCE,
+          drainProtocol: 1, running: true, restartPending: true, phase: 'draining', reason: 'bridge-draining' });
+      }
     }
     await waitFor(() => output.includes('BRIDGE_DRAIN_REQUESTED'), output);
     await delay(50);
@@ -75,9 +102,17 @@ for (const stop of ['control', 'SIGTERM']) {
     assert.equal(child.signalCode, null);
     assert.equal(f.heldSends[0].response.destroyed, false);
     assert.equal(f.sent.length, 1);
+    assert.deepEqual(await (await fetch(`${lifecycleUrl}/health`)).json(), {
+      instanceId: version.instanceId, running: true, ok: false, phase: 'draining',
+    });
+    const status = await (await fetch(`${lifecycleUrl}/status`)).json();
+    assert.equal(status.reason, 'bridge-draining');
+    assert.equal(status.restartPending, true);
+    assert.equal('inFlight' in status, false);
     const exited = once(child, 'exit');
     f.heldSends[0].release();
     assert.deepEqual(await exited, [0, null], output);
+    await assert.rejects(fetch(`${lifecycleUrl}/version`));
     assert.match(output, /BRIDGE_DRAINED/);
     assert.equal(fs.existsSync(path.join(f.config.stateDir, 'run.lock')), false);
     assert.equal(fs.existsSync(path.join(f.config.stateDir, 'stop.json')), false);
