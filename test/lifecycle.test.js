@@ -25,7 +25,8 @@ test('independent module identity uses actual manifest version, no fabricated CD
   const config = lifecycleConfig(input);
   input.COCKPIT_MODULE_DIGEST = 'a'.repeat(64);
   assert.deepEqual(config.identity, { moduleApi: 1, moduleId: 'wechat',
-    moduleDigest: moduleEnv.COCKPIT_MODULE_DIGEST, instanceId: moduleEnv.COCKPIT_MODULE_INSTANCE, version: '0.1.0' });
+    moduleDigest: moduleEnv.COCKPIT_MODULE_DIGEST, instanceId: moduleEnv.COCKPIT_MODULE_INSTANCE,
+    version: '0.1.0', moduleVersion: '0.1.0' });
   assert.ok(Object.isFrozen(config) && Object.isFrozen(config.identity));
   assert.equal('sha' in config.identity, false);
   assert.equal(lifecycleConfig({ ...moduleEnv, COCKPIT_MODULE_PORT: undefined,
@@ -59,6 +60,7 @@ test('lifecycle is optional and strictly captures identity without repository fa
   const config = lifecycleConfig(input);
   input.SERVICE_DELIVERY_SHA = 'c'.repeat(40);
   assert.equal(config.identity.sha, env.SERVICE_DELIVERY_SHA);
+  assert.equal('moduleVersion' in config.identity, false);
   assert.ok(Object.isFrozen(config.identity));
   assert.equal(lifecycleConfig({ ...env, SERVICE_DELIVERY_SHA: 'c'.repeat(64) }).identity.sha.length, 64);
   for (const port of ['', '0', '65536', '1.0', ' 123', '0123', '-1', 'http://localhost', '123\n']) {
@@ -166,6 +168,7 @@ test('independent module health/version/status/drain return the same immutable m
   const url = `http://127.0.0.1:${port}`;
   const version = await (await fetch(`${url}/version`)).json();
   assert.deepEqual(version, config.identity);
+  assert.equal(version.moduleVersion, version.version);
   const health = await (await fetch(`${url}/health`)).json();
   assert.deepEqual(health, { ...version, running: true, ok: true, phase: 'running' });
   const draining = await (await fetch(`${url}/admin/restart`, {

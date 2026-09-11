@@ -38,10 +38,11 @@ identity validation and all its response shapes remain unchanged.
 Module `/version`:
 
 ```json
-{"moduleApi":1,"moduleId":"wechat","moduleDigest":"<digest64>","instanceId":"<uuid>","version":"0.1.0"}
+{"moduleApi":1,"moduleId":"wechat","moduleDigest":"<digest64>","instanceId":"<uuid>","version":"0.1.0","moduleVersion":"0.1.0"}
 ```
 
-Module `/health` returns those **same five identity fields** plus
+`moduleVersion` aliases the already validated actual `version`; both are retained.
+Module `/health` returns those **same six identity fields** plus
 `{"running":true,"ok":true,"phase":"running"}` (actual current state, not a
 startup guarantee). `/status` and `/admin/restart` also carry the same module
 identity. There is no `sha`, `artifactSha256` or fabricated delivery request.

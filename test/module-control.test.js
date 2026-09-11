@@ -478,7 +478,7 @@ test('real managed CLI runner shares stable lock with offline mutations, status,
   const lifecycleUrl = `http://127.0.0.1:${lifecyclePort}`;
   const version = await (await fetch(`${lifecycleUrl}/version`)).json();
   assert.deepEqual(version, { moduleApi: 1, moduleId: 'wechat', moduleDigest: moduleEnv.COCKPIT_MODULE_DIGEST,
-    instanceId: moduleEnv.COCKPIT_MODULE_INSTANCE, version: '0.1.0' });
+    instanceId: moduleEnv.COCKPIT_MODULE_INSTANCE, version: '0.1.0', moduleVersion: '0.1.0' });
   assert.deepEqual(await (await fetch(`${lifecycleUrl}/health`)).json(),
     { ...version, running: true, ok: true, phase: 'running' });
   assert.ok(readPrivate(path.join(config.lockDir, 'run.lock')));

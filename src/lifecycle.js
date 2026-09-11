@@ -25,7 +25,7 @@ export function lifecycleConfig(env = process.env) {
     requireThat(env.COCKPIT_MODULE_VERSION === manifest.version, 'COCKPIT_MODULE_VERSION_MISMATCH');
     return Object.freeze({ port: Number(port), identity: Object.freeze({
       moduleApi: 1, moduleId: manifest.id, moduleDigest: env.COCKPIT_MODULE_DIGEST,
-      instanceId: env.COCKPIT_MODULE_INSTANCE, version: manifest.version,
+      instanceId: env.COCKPIT_MODULE_INSTANCE, version: manifest.version, moduleVersion: manifest.version,
     }) });
   }
   if (env.SERVICE_DELIVERY_PORT === undefined) return null;
