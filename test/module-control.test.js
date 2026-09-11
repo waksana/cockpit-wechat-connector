@@ -165,6 +165,41 @@ test('offline status, unique binding, durable idempotent receipts and exact nati
   assert.equal((await control(f.file, { operation: 'status' })).status.boundSessionId, null);
 });
 
+test('binding inconsistency takes precedence over business blockers without changing files or control identity', async t => {
+  for (const binding of [
+    { sessionId: 'different-session', cwd: '/fixture/workspace' },
+    { sessionId: 'session-one', cwd: '/different/workspace' },
+  ]) {
+    for (const job of [
+      { id: 'pending', status: 'queued' },
+      { id: 'unknown', status: 'prompting' },
+      { id: 'sending', status: 'replying', outbox: [{ status: 'sending' }] },
+    ]) {
+      const f = await fixture(t);
+      await control(f.file, bind());
+      const config = loadConfig(f.file);
+      const store = new Store(config.stateDir);
+      store.set('binding', binding);
+      store.db.prepare('INSERT INTO jobs VALUES (?,?,?)').run(job.id, 1, JSON.stringify(job));
+      store.close();
+      const before = fileSnapshot(f.dir);
+      const response = await wire(f.file, { operation: 'status' });
+      assert.equal(response.code, 0, response.stdout);
+      const { status } = JSON.parse(response.stdout);
+      assert.equal(status.reason, 'PERSISTED_BINDING_CHANGED');
+      assert.equal(status.available, false);
+      assert.equal(status.boundSessionId, 'session-one');
+      assert.equal(status.revision, 1);
+      assert.equal(status.unknownOperation, false);
+      assert.equal(status.runnerUnknown, false);
+      assert.equal(status.pendingJobs, 1);
+      assert.equal(status.unknownJobs, job.status === 'queued' ? 0 : 1);
+      assert.deepEqual(fileSnapshot(f.dir), before);
+      assert.equal(f.requests.length, 1);
+    }
+  }
+});
+
 test('parallel offline status creates no control state and never competes for mutation locks', async t => {
   const f = await fixture(t);
   const initial = fileSnapshot(f.dir);

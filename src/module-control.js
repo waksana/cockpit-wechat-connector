@@ -85,7 +85,7 @@ function statusDetails(config, state, runner) {
     || (fs.existsSync(config.moduleStateRoot) && fs.readdirSync(config.moduleStateRoot).length > 0));
   const reason = unknownOperation ? 'OPERATION_OUTCOME_UNKNOWN'
     : runner.runnerUnknown ? 'RUNNER_STATE_UNKNOWN' : runner.running ? 'RUNNING'
-      : blocker(inspection) || (bindingChanged ? 'PERSISTED_BINDING_CHANGED' : null)
+      : (bindingChanged ? 'PERSISTED_BINDING_CHANGED' : null) || blocker(inspection)
         || (legacyData ? 'LEGACY_ADOPTION_REQUIRED' : null)
         || (boundSessionId ? 'ALREADY_BOUND' : null)
         || (!managed ? 'MODULE_MANAGED_OPT_IN_REQUIRED' : null)

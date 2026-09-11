@@ -1,6 +1,6 @@
 # Official WeChat module (opt-in, offline control)
 
-`module.json` is schema/config version 1, module/package version 0.1.1, Linux x64,
+`module.json` is schema/config version 1, module/package version 0.1.2, Linux x64,
 Node 24, Cockpit API 1. Its sole role `wechat` provides binding only: no injected
 instructions, skills or MCP. The existing lifecycle service remains
 `node src/cli.js run`: `/health`, `/version`, `/admin/restart`. It requires one
@@ -15,7 +15,7 @@ runtime startup is separately authorized:
 ```text
 node src/cli.js run --config /absolute/private/module-config.json
 COCKPIT_MODULE_ID=wechat
-COCKPIT_MODULE_VERSION=0.1.1
+COCKPIT_MODULE_VERSION=0.1.2
 COCKPIT_MODULE_DIGEST=<64 lowercase hexadecimal catalog digest>
 COCKPIT_MODULE_INSTANCE=<canonical lowercase UUID for this process>
 COCKPIT_MODULE_PORT=<loopback port, integer 1..65535>
@@ -38,7 +38,7 @@ identity validation and all its response shapes remain unchanged.
 Module `/version`:
 
 ```json
-{"moduleApi":1,"moduleId":"wechat","moduleDigest":"<digest64>","instanceId":"<uuid>","version":"0.1.1","moduleVersion":"0.1.1"}
+{"moduleApi":1,"moduleId":"wechat","moduleDigest":"<digest64>","instanceId":"<uuid>","version":"0.1.2","moduleVersion":"0.1.2"}
 ```
 
 `moduleVersion` aliases the already validated actual `version`; both are retained.
@@ -134,6 +134,13 @@ environment variable when selecting the file authority. Missing/insecure/
 malformed files make status `configReady:false` with a stable `configReason`;
 status still makes no network requests. File ownership/permissions are checked,
 but token validity is only evaluated by the native server.
+
+In 0.1.2 and later, detailed status prioritizes `PERSISTED_BINDING_CHANGED`
+over business blockers such as `PENDING_JOBS` and `UNKNOWN_OUTCOMES`. Counts
+remain unchanged; a job blocker no longer hides a detected session/cwd
+mismatch. Partial running/WAL snapshots still do not inspect the historical
+Store binding: their control ID/revision is not a claim of Store consistency.
+No field, mutation fence or recovery behavior changes.
 
 Status success:
 
