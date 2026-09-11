@@ -15,6 +15,7 @@ import { acquireModuleGate, assertCurrentConfig, controlFile, readControl } from
 import { readPrivate, RunLock, Store, writePrivate } from '../src/storage.js';
 
 const root = path.resolve(import.meta.dirname, '..');
+const actualVersion = JSON.parse(fs.readFileSync(path.join(root, 'package.json'))).version;
 const credentials = { account: 'fixture-account', peer: 'fixture-peer', token: 'FAKE_PRIVATE_TOKEN',
   baseUrl: 'https://ilinkai.weixin.qq.com' };
 const bind = (operationId = 'bind-first', sessionId = 'session-one') => ({
@@ -958,7 +959,7 @@ test('real managed CLI runner shares stable lock with offline mutations, status,
   await new Promise(resolve => reserved.listen(0, '127.0.0.1', resolve));
   const lifecyclePort = reserved.address().port;
   await new Promise(resolve => reserved.close(resolve));
-  const moduleEnv = { COCKPIT_MODULE_ID: 'wechat', COCKPIT_MODULE_VERSION: '0.1.0',
+  const moduleEnv = { COCKPIT_MODULE_ID: 'wechat', COCKPIT_MODULE_VERSION: actualVersion,
     COCKPIT_MODULE_DIGEST: 'c'.repeat(64), COCKPIT_MODULE_INSTANCE: randomUUID(),
     COCKPIT_MODULE_PORT: String(lifecyclePort), SERVICE_DELIVERY_PORT: undefined,
     SERVICE_DELIVERY_SHA: undefined, SERVICE_DELIVERY_ARTIFACT: undefined,
@@ -979,7 +980,7 @@ test('real managed CLI runner shares stable lock with offline mutations, status,
   const lifecycleUrl = `http://127.0.0.1:${lifecyclePort}`;
   const version = await (await fetch(`${lifecycleUrl}/version`)).json();
   assert.deepEqual(version, { moduleApi: 1, moduleId: 'wechat', moduleDigest: moduleEnv.COCKPIT_MODULE_DIGEST,
-    instanceId: moduleEnv.COCKPIT_MODULE_INSTANCE, version: '0.1.0', moduleVersion: '0.1.0' });
+    instanceId: moduleEnv.COCKPIT_MODULE_INSTANCE, version: actualVersion, moduleVersion: actualVersion });
   assert.deepEqual(await (await fetch(`${lifecycleUrl}/health`)).json(),
     { ...version, running: true, ok: true, phase: 'running' });
   assert.ok(readPrivate(path.join(config.lockDir, 'run.lock')));

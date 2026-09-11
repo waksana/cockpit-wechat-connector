@@ -13,6 +13,7 @@ import { SessionBridge } from '../src/session-bridge.js';
 import { RunLock, writePrivate } from '../src/storage.js';
 import { deliveryCheckpoint } from '../src/cockpit.js';
 
+const actualVersion = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url))).version;
 async function waitFor(predicate, message) {
   const until = Date.now() + 5000;
   while (!predicate() && Date.now() < until) await delay(10);
@@ -76,7 +77,7 @@ for (const stop of ['control', 'SIGTERM', 'http']) {
     const version = await (await fetch(`${lifecycleUrl}/version`)).json();
     assert.deepEqual(version, { sha: identityEnv.SERVICE_DELIVERY_SHA,
       artifactSha256: identityEnv.SERVICE_DELIVERY_ARTIFACT, requestId: identityEnv.SERVICE_DELIVERY_REQUEST,
-      instanceId: identityEnv.SERVICE_DELIVERY_INSTANCE, version: '0.1.0' });
+      instanceId: identityEnv.SERVICE_DELIVERY_INSTANCE, version: actualVersion });
     assert.equal((await (await fetch(`${lifecycleUrl}/health`)).json()).ok, true);
     if (stop === 'control') {
       const result = await promisify(execFile)(process.execPath, ['src/cli.js', 'stop', '--config', f.configFile],

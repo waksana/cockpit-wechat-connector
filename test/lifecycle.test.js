@@ -2,10 +2,12 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import net from 'node:net';
 import http from 'node:http';
+import fs from 'node:fs';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { lifecycleConfig, startLifecycle } from '../src/lifecycle.js';
 
+const actualVersion = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url))).version;
 const env = {
   SERVICE_DELIVERY_PORT: '39123',
   SERVICE_DELIVERY_SHA: 'a'.repeat(40),
@@ -14,7 +16,7 @@ const env = {
   SERVICE_DELIVERY_INSTANCE: 'fixture-instance',
 };
 const moduleEnv = {
-  COCKPIT_MODULE_ID: 'wechat', COCKPIT_MODULE_VERSION: '0.1.0',
+  COCKPIT_MODULE_ID: 'wechat', COCKPIT_MODULE_VERSION: actualVersion,
   COCKPIT_MODULE_DIGEST: 'd'.repeat(64),
   COCKPIT_MODULE_INSTANCE: '93e7f5a2-26f1-4d48-bfa5-f8f08250661a',
   COCKPIT_MODULE_PORT: '39124',
@@ -26,7 +28,7 @@ test('independent module identity uses actual manifest version, no fabricated CD
   input.COCKPIT_MODULE_DIGEST = 'a'.repeat(64);
   assert.deepEqual(config.identity, { moduleApi: 1, moduleId: 'wechat',
     moduleDigest: moduleEnv.COCKPIT_MODULE_DIGEST, instanceId: moduleEnv.COCKPIT_MODULE_INSTANCE,
-    version: '0.1.0', moduleVersion: '0.1.0' });
+    version: actualVersion, moduleVersion: actualVersion });
   assert.ok(Object.isFrozen(config) && Object.isFrozen(config.identity));
   assert.equal('sha' in config.identity, false);
   assert.equal(lifecycleConfig({ ...moduleEnv, COCKPIT_MODULE_PORT: undefined,
@@ -48,7 +50,7 @@ test('independent module identity uses actual manifest version, no fabricated CD
     ['COCKPIT_MODULE_DIGEST', 'D'.repeat(64)], ['COCKPIT_MODULE_INSTANCE', 'not-a-uuid']]) {
     assert.throws(() => lifecycleConfig({ ...moduleEnv, [key]: value }), { code: 'COCKPIT_MODULE_IDENTITY_INVALID' });
   }
-  for (const version of [undefined, '', '9.9.9', '0.1.0\n']) {
+  for (const version of [undefined, '', '9.9.9', `${actualVersion}\n`]) {
     assert.throws(() => lifecycleConfig({ ...moduleEnv, COCKPIT_MODULE_VERSION: version }),
       { code: 'COCKPIT_MODULE_VERSION_MISMATCH' });
   }

@@ -1,6 +1,6 @@
 # Official WeChat module (opt-in, offline control)
 
-`module.json` is schema/config version 1, module/package version 0.1.0, Linux x64,
+`module.json` is schema/config version 1, module/package version 0.1.1, Linux x64,
 Node 24, Cockpit API 1. Its sole role `wechat` provides binding only: no injected
 instructions, skills or MCP. The existing lifecycle service remains
 `node src/cli.js run`: `/health`, `/version`, `/admin/restart`. It requires one
@@ -15,7 +15,7 @@ runtime startup is separately authorized:
 ```text
 node src/cli.js run --config /absolute/private/module-config.json
 COCKPIT_MODULE_ID=wechat
-COCKPIT_MODULE_VERSION=0.1.0
+COCKPIT_MODULE_VERSION=0.1.1
 COCKPIT_MODULE_DIGEST=<64 lowercase hexadecimal catalog digest>
 COCKPIT_MODULE_INSTANCE=<canonical lowercase UUID for this process>
 COCKPIT_MODULE_PORT=<loopback port, integer 1..65535>
@@ -38,7 +38,7 @@ identity validation and all its response shapes remain unchanged.
 Module `/version`:
 
 ```json
-{"moduleApi":1,"moduleId":"wechat","moduleDigest":"<digest64>","instanceId":"<uuid>","version":"0.1.0","moduleVersion":"0.1.0"}
+{"moduleApi":1,"moduleId":"wechat","moduleDigest":"<digest64>","instanceId":"<uuid>","version":"0.1.1","moduleVersion":"0.1.1"}
 ```
 
 `moduleVersion` aliases the already validated actual `version`; both are retained.
@@ -341,3 +341,67 @@ no login, message send, prompt, cancellation or production state is used.
 The release allowlist contains `src`, `module.json`, `package.json` and
 `package-lock.json`; no config, profile, control state, database or credential
 file belongs in a release.
+
+## Independent real-runner archive acceptance
+
+Run after committing the selected release:
+
+```sh
+TMPDIR=/tmp node --test test/module-runtime-acceptance.test.js
+```
+
+Optionally set `WECHAT_ACCEPTANCE_REPORT=/tmp/new-evidence.json` to save the
+complete JSON evidence to a new absolute file (0600, no overwrite). The test
+archives the exact current `git HEAD` release allowlist, extracts it into its
+own temporary fixture, verifies `src/cli.js` against that commit, and launches
+the **real archived manifest service entry**, not a replacement HTTP service.
+Fixture config, account/API credentials, workspace, binding and database are
+all newly generated synthetic data. Teardown removes the fixture and leaves no
+service running.
+
+The actual fixture launch is:
+
+```text
+node --import FIXTURE/provider.mjs RELEASE/src/cli.js run --config FIXTURE/config.json
+HOME=FIXTURE
+WECHAT_FIXTURE_ORIGIN=http://127.0.0.1:PROVIDER_PORT
+WECHAT_FIXTURE_NETWORK_LOG=FIXTURE/network.jsonl
+COCKPIT_MODULE_ID=wechat
+COCKPIT_MODULE_VERSION=<actual archived manifest/package version>
+COCKPIT_MODULE_DIGEST=<SHA-256 of the exact fixture release tar>
+COCKPIT_MODULE_INSTANCE=<fresh lowercase UUID>
+COCKPIT_MODULE_PORT=<fresh loopback port>
+```
+
+No production environment/auth/proxy/`NODE_OPTIONS` values are inherited.
+Minimal real config uses `moduleManaged:true`, `deliveryMode:"correlated"`,
+new absolute `stateDir`/`lockDir`, synthetic `credentialFile`, empty raw
+`cockpit.sessionId/cwd`, loopback `cockpit.apiUrl/webUrl`, a synthetic protected
+`cockpit.tokenFile`, synthetic `weixin.allowedAccount/allowedPeer`, and the
+unchanged official `approvedApiOrigins`. The normal offline bind operation
+verifies this fixture's session metadata before startup. The generated exact
+config and environment are included in the optional report.
+
+**Boundary:** this connector has no paused/disabled healthy no-poll mode.
+Unbound/missing-credential/blocked configurations refuse startup; normal
+healthy `run` starts inbox polling. Production validation also intentionally
+rejects loopback WeChat `baseUrl`, so no production `apiBaseURL` escape hatch was
+added. Instead, the external test-only preload (never in the release archive)
+maps the real client's official poll URL to the explicit loopback provider.
+It allows only native capability/session reads and one held empty-input poll;
+login, prompt, send, typing, other mutations and external destinations are
+rejected before transport. Every actual fetch destination is audited as the
+configured loopback origin. This exercises the unmodified real runner,
+configuration/auth checks, storage, HTTP lifecycle and drain loop without a
+real WeChat account or server.
+
+The evidence includes matching `/version` and `/health` module identities,
+healthy running state, then `node:http` POST `/admin/restart` with exactly
+`{"pending":true}`. The held loopback poll closes, the real process logs
+`BRIDGE_DRAIN_REQUESTED`/`BRIDGE_DRAINED` and exits naturally with code 0 and no
+signal; its HTTP listener and stable run lock disappear. The binding remains,
+jobs stay empty, no cursor advances, credential/config bytes stay unchanged,
+and there are zero prompt/send/login requests. The fixture archive digest is a
+reproducible test authority, **not** an assertion about a separately installed
+Cockpit catalog digest or CI artifact. Live account validity and real native
+SDK/chat integration remain separate acceptance boundaries.
