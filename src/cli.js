@@ -12,7 +12,7 @@ import { Store, RunLock, privateDirectory, readPrivate, writePrivate } from './s
 import { WeixinClient, login } from './weixin.js';
 import { deliverPublishedPng } from './image.js';
 import { lifecycleConfig, startLifecycle } from './lifecycle.js';
-import { acquireModuleGate, assertActiveBinding, assertCurrentConfig, readControl } from './module-state.js';
+import { acquireModuleGate, assertActiveBinding, assertCurrentConfig, assertModuleActivation, readControl } from './module-state.js';
 import { moduleStatus } from './module-control.js';
 
 function options(argv) {
@@ -98,6 +98,7 @@ export async function main(argv = process.argv.slice(2)) {
       requireThat(config.cockpit.sessionId, 'MODULE_NOT_BOUND');
       requireThat(!Object.values(readControl(config)?.operations ?? {}).some(op => op.phase === 'pending'),
         'OPERATION_OUTCOME_UNKNOWN');
+      assertModuleActivation(config);
       lock = new RunLock(config.lockDir, { drain: command === 'run' });
       gate.release(); gate = null;
     }

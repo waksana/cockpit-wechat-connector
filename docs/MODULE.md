@@ -1,6 +1,6 @@
 # Official WeChat module (opt-in control)
 
-`module.json` is schema/config version 1, module/package version 0.1.5, Linux x64,
+`module.json` is schema/config version 1, module/package version 0.1.6, Linux x64,
 Node 24, Cockpit API 1. Its sole role `wechat` provides binding only: no injected
 instructions, skills or MCP. The existing lifecycle service remains
 `node src/cli.js run`: `/health`, `/version`, `/admin/restart`. It requires one
@@ -15,7 +15,7 @@ runtime startup is separately authorized:
 ```text
 node src/cli.js run --config /absolute/private/module-config.json
 COCKPIT_MODULE_ID=wechat
-COCKPIT_MODULE_VERSION=0.1.5
+COCKPIT_MODULE_VERSION=0.1.6
 COCKPIT_MODULE_DIGEST=<64 lowercase hexadecimal catalog digest>
 COCKPIT_MODULE_INSTANCE=<canonical lowercase UUID for this process>
 COCKPIT_MODULE_PORT=<loopback port, integer 1..65535>
@@ -38,7 +38,7 @@ identity validation and all its response shapes remain unchanged.
 Module `/version`:
 
 ```json
-{"moduleApi":1,"moduleId":"wechat","moduleDigest":"<digest64>","instanceId":"<uuid>","version":"0.1.5","moduleVersion":"0.1.5"}
+{"moduleApi":1,"moduleId":"wechat","moduleDigest":"<digest64>","instanceId":"<uuid>","version":"0.1.6","moduleVersion":"0.1.6"}
 ```
 
 `moduleVersion` aliases the already validated actual `version`; both are retained.
@@ -120,7 +120,91 @@ One installed connector/configuration reference must use **one stable lockDir**.
 The module enforces one active target there, not a global registry of arbitrary
 legacy profiles or other independently configured connector installations.
 An operator must explicitly ensure no legacy runner consumes the same account
-before opting in. This adapter never scans/adopts/stops those other profiles.
+before opting in. This adapter never scans, automatically adopts or stops other
+profiles; the local command below names exactly one reviewed source.
+
+## Explicit offline adoption of one legacy profile
+
+Version 0.1.6 adds a local operator command for the narrow case where an
+already-bound legacy profile must retain its exact Store, account credential,
+checkpoints, deduplication history, media work and unknown send receipts. It is
+not part of the bounded stdin module-control API, so an API caller cannot supply
+an arbitrary source path:
+
+```sh
+node src/module-adopt.js adopt \
+  --config /absolute/private/module-config.json \
+  --source-config /absolute/private/legacy-profile/config.json \
+  --operation-id unique-adopt-0001 \
+  --confirm
+```
+
+The module config remains the explicit `moduleManaged:true` reference described
+above: raw `cockpit.sessionId/cwd` are blank, `stateDir` is absent or empty,
+and `lockDir` is separate. Its `credentialFile` must be the exact canonical
+legacy credential path. All effective connector settings other than the
+module routing/state/lock fields must exactly equal the legacy profile:
+delivery mode, follow-up policy, status/diagnostic settings, Cockpit origins and
+token-file authority, WeChat account/peer/origin allowlist, limits and
+credential reference. The command never discovers profiles or credentials.
+
+The source config/file, state directory, lock directory and credential must be
+canonical, existing, private, same-UID, non-symlink paths. The source must have
+an existing `bridge.sqlite`, an exactly matching persisted Store `binding`, and
+a stopped, safely inspectable database. A nonempty WAL/journal is
+`STATE_SNAPSHOT_UNAVAILABLE`; adoption never ignores it, combines a stale main
+file with WAL, checkpoints it, or makes a guessed copy. Both the old and new
+runner locks must be absent and known. The command takes the old profile's real
+`RunLock` as an admission fence while holding the module control gate, so a
+protocol-compliant old runner cannot start during the native read and control
+commit. Disabling the old launcher after this operation remains an operator
+responsibility; this code does not edit services.
+
+Exactly one native `session/get` read verifies the source's existing session ID
+and exact cwd. It does not call load, prompt, interrupt, cancellation, session
+creation/deletion or any WeChat endpoint. A malformed response, timeout, 403,
+404 or other HTTP failure is not absence and cannot install an association.
+The source profile and all business files remain byte-for-byte in place.
+Instead, the protected routing record stores a distinct `adopt` receipt and a
+strict sourced-state reference. Normal `bind` receipts are not fabricated.
+The successful result reports `activation:"paused"` and
+`preservedPaths:[<legacy state root>]`; that entire root must be retained
+because old business records may contain absolute references beneath it.
+
+The same operation ID and exact source/config identity only read back the
+durable result; it does not repeat the native read or import data. A changed
+request conflicts, a pending receipt remains `OPERATION_OUTCOME_UNKNOWN`, and
+a later changed active binding returns `OPERATION_STATE_CHANGED`. Configuration
+or source-config drift after adoption is an explicit
+`ADOPTION_SOURCE_CHANGED`, not permission to reconstruct a route from the
+database.
+
+Adoption deliberately remains stopped. Status reports
+`available:false`, `reason:"ADOPTION_ACTIVATION_REQUIRED"`, `adopted:true` and
+`activationState:"paused"` while still exposing actual pending/unknown counts.
+`bindingConfirmed:true` is possible only when the sourced receipt, current
+module config, credential readiness and exact persisted Store binding all
+match; it does not mean business work is safe to replay. Every managed CLI
+business command, including `run` and `check`, refuses paused adoption before
+opening the Store or contacting a service.
+
+After a separate operator review has established that retained work is safe,
+activation is another explicit local command:
+
+```sh
+node src/module-adopt.js activate \
+  --config /absolute/private/module-config.json \
+  --operation-id unique-activate-0001 \
+  --confirm
+```
+
+Activation rechecks both runner fences, the source authority and persisted
+binding, and refuses pending batches/jobs, native follow-up/typing state and
+unknown prompt/send/image outcomes. It then repeats the read-only native
+session/cwd check at use time and atomically advances the routing revision.
+It never resolves, abandons, retries or replays business work. Successful
+activation only removes the module's startup fence; starting the service and
+any real WeChat traffic still require separate lifecycle authorization.
 
 ## Fixed control transport
 

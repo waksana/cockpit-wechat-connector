@@ -1,6 +1,6 @@
 {
   "name": "weixin-cockpit-bridge",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "private": true,
   "type": "module",
   "engines": {
@@ -9,6 +9,6 @@
   "scripts": {
     "start": "node src/cli.js run",
     "test": "node --test test/*.test.js",
-    "check": "node --check src/cli.js && node --check src/bridge.js"
+    "check": "node --check src/cli.js && node --check src/bridge.js && node --check src/module-adopt.js"
   }
 }

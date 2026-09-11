@@ -38,10 +38,16 @@ function bindingConfirmed(config, state, runner, ready, inspection) {
   if (!targetValid(active.sessionId, active.cwd) || active.sessionId !== config.cockpit.sessionId
     || active.cwd !== config.cockpit.cwd || active.stateDir !== config.stateDir
     || state.history.some(old => old.id === active.id || old.stateDir === active.stateDir)) return false;
-  const binds = Object.values(state.operations).filter(op => op.phase === 'complete' && op.request.operation === 'bind'
-    && op.result.ok && op.result.revision === state.revision);
+  const binds = Object.values(state.operations).filter(op => op.phase === 'complete'
+    && ((op.request.operation === 'bind' && op.result.revision === state.revision)
+      || (op.request.operation === 'adopt' && op.result.bindingId === active.id))
+    && op.result.ok);
   if (binds.length !== 1 || binds[0].request.sessionId !== active.sessionId || binds[0].request.cwd !== active.cwd
-    || binds[0].result.boundSessionId !== active.sessionId) return false;
+    || binds[0].result.boundSessionId !== active.sessionId
+    || (active.adoption && (binds[0].request.operation !== 'adopt'
+      || binds[0].request.sourceConfigPath !== active.adoption.sourceConfigPath
+      || binds[0].request.sourceConfigDigest !== active.adoption.sourceConfigDigest))
+    || (!active.adoption && binds[0].request.operation !== 'bind')) return false;
   const currentDigest = createHash('sha256').update(JSON.stringify(readPrivate(config.configPath))).digest('hex');
   if (currentDigest !== config.configDigest) return false;
   // A live known runner proves control association, not the contents of its business database.
@@ -93,6 +99,9 @@ function partialStatus(config, state, runner, reason) {
     unknownOperation,
     pendingJobs: null, unknownJobs: null, revision: state?.revision ?? 0,
     managed: true, detailsAvailable: false, bindingConfirmed: bindingConfirmed(config, state, runner, ready),
+    ...(state?.active?.adoption ? {
+      adopted: true, activationState: state.active.activation,
+    } : {}),
     ...retainedMissing(state) };
 }
 
@@ -120,6 +129,7 @@ function statusDetails(config, state, runner) {
     || (fs.existsSync(config.moduleStateRoot) && fs.readdirSync(config.moduleStateRoot).length > 0));
   const reason = unknownOperation ? 'OPERATION_OUTCOME_UNKNOWN'
     : runner.runnerUnknown ? 'RUNNER_STATE_UNKNOWN' : runner.running ? 'RUNNING'
+      : state?.active?.adoption && state.active.activation === 'paused' ? 'ADOPTION_ACTIVATION_REQUIRED'
       : (bindingChanged ? 'PERSISTED_BINDING_CHANGED' : null) || blocker(inspection)
         || (legacyData ? 'LEGACY_ADOPTION_REQUIRED' : null)
         || (boundSessionId ? 'ALREADY_BOUND' : null)
@@ -130,6 +140,9 @@ function statusDetails(config, state, runner) {
     unknownOperation,
     pendingJobs: inspection.pendingJobs, unknownJobs: inspection.unknownJobs,
     revision: state?.revision ?? 0, managed, bindingConfirmed: bindingConfirmed(config, state, runner, ready, inspection),
+    ...(state?.active?.adoption ? {
+      adopted: true, activationState: state.active.activation,
+    } : {}),
     ...retainedMissing(state) };
 }
 

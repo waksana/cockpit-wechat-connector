@@ -1,7 +1,8 @@
 # 微信 ↔ Cockpit 连接器
 
 官方可选模块适配器、唯一绑定及按需失效检查协议见 [docs/MODULE.md](docs/MODULE.md)。
-仅显式 `moduleManaged:true` 新配置启用；不迁移现有 profile、不登录、不自动启动收发。
+仅显式 `moduleManaged:true` 新配置启用；0.1.6 提供受限的本机旧 profile 引用式接管，
+但不登录、不复制业务数据库、不自动恢复未知结果或启动收发。详见模块文档。
 
 独立 Node.js CLI，直接调用公开 iLink HTTPS JSON API，再调用 Cockpit 的 HTTP API。
 **不需要 OpenClaw、原 installer、第三方 bot 框架、全局 npm 包或数据库服务。**

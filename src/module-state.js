@@ -9,6 +9,41 @@ import { privateDirectory, readPrivate, RunLock, secureExisting, writePrivate } 
 export const controlFile = config => path.join(config.lockDir, 'module-binding.json');
 export const gateDir = config => path.join(config.lockDir, 'module-control');
 
+function canonicalPrivatePath(file, directory = false) {
+  requireThat(path.isAbsolute(file) && path.resolve(file) === file && fs.realpathSync(file) === file,
+    'ADOPTION_SOURCE_INVALID');
+  secureExisting(file, directory);
+}
+
+function validateAdoption(config, binding) {
+  if (binding.adoption === undefined) {
+    requireThat(binding.stateDir === path.join(config.moduleStateRoot, binding.id), 'MODULE_STATE_INVALID');
+    requireThat(binding.activation === undefined, 'MODULE_STATE_INVALID');
+    return;
+  }
+  const adoption = binding.adoption;
+  requireThat(object(adoption) && adoption.schemaVersion === 1
+    && typeof adoption.sourceConfigPath === 'string'
+    && /^[a-f0-9]{64}$/.test(adoption.sourceConfigDigest)
+    && adoption.sourceStateDir === binding.stateDir
+    && adoption.credentialFile === config.credentialFile
+    && Array.isArray(adoption.preservedPaths)
+    && adoption.preservedPaths.length === 1
+    && adoption.preservedPaths[0] === adoption.sourceStateDir
+    && ['paused', 'active'].includes(binding.activation), 'MODULE_STATE_INVALID');
+  try {
+    canonicalPrivatePath(adoption.sourceConfigPath);
+    canonicalPrivatePath(adoption.sourceStateDir, true);
+    canonicalPrivatePath(adoption.credentialFile);
+    const raw = JSON.parse(fs.readFileSync(adoption.sourceConfigPath, 'utf8'));
+    requireThat(createHash('sha256').update(JSON.stringify(raw)).digest('hex') === adoption.sourceConfigDigest,
+      'ADOPTION_SOURCE_CHANGED');
+  } catch (error) {
+    if (error instanceof BridgeError) throw error;
+    throw new BridgeError('ADOPTION_SOURCE_CHANGED');
+  }
+}
+
 export function readControl(config) {
   const state = readPrivate(controlFile(config));
   if (!state) return null;
@@ -24,10 +59,15 @@ export function readControl(config) {
     requireThat(/^[A-Za-z0-9_-]{8,120}$/.test(id) && object(operation)
       && ['pending', 'complete'].includes(operation.phase)
       && object(operation.request) && operation.request.operationId === id
-      && ['bind', 'unbind', 'session-unbind'].includes(operation.request.operation)
+      && ['bind', 'unbind', 'session-unbind', 'adopt', 'activate-adoption'].includes(operation.request.operation)
       && typeof operation.request.sessionId === 'string'
       && (operation.request.operation === 'session-unbind' ? operation.request.cwd === undefined
-        : typeof operation.request.cwd === 'string'),
+        : typeof operation.request.cwd === 'string')
+      && (operation.request.operation !== 'activate-adoption'
+        || typeof operation.request.bindingId === 'string')
+      && (operation.request.operation !== 'adopt'
+        || (typeof operation.request.sourceConfigPath === 'string'
+          && /^[a-f0-9]{64}$/.test(operation.request.sourceConfigDigest))),
     'MODULE_STATE_INVALID');
     if (operation.phase === 'complete') {
       const result = operation.result;
@@ -43,7 +83,10 @@ export function readControl(config) {
       } else {
         requireThat(Number.isSafeInteger(result.revision) && result.revision >= 0 && result.revision <= state.revision
           && (result.boundSessionId === null || typeof result.boundSessionId === 'string')
-          && Object.keys(result).every(key => ['ok', 'operationId', 'revision', 'boundSessionId', 'error'].includes(key)),
+          && (result.bindingId === undefined || typeof result.bindingId === 'string')
+          && (result.activation === undefined || ['paused', 'active'].includes(result.activation))
+          && Object.keys(result).every(key => ['ok', 'operationId', 'revision', 'boundSessionId',
+            'bindingId', 'activation', 'error'].includes(key)),
         'MODULE_STATE_INVALID');
       }
     }
@@ -51,9 +94,9 @@ export function readControl(config) {
   for (const binding of [...state.history, ...(state.active ? [state.active] : [])]) {
     requireThat(typeof binding.id === 'string' && /^[a-f0-9-]{36}$/.test(binding.id)
       && typeof binding.sessionId === 'string' && typeof binding.cwd === 'string'
-      && binding.stateDir === path.join(config.moduleStateRoot, binding.id)
       && (binding.retiredReason === undefined || binding.retiredReason === 'TARGET_SESSION_MISSING'),
     'MODULE_STATE_INVALID');
+    validateAdoption(config, binding);
     requireThat(fs.existsSync(binding.stateDir), 'MODULE_BINDING_STATE_MISSING');
     secureExisting(binding.stateDir, true);
   }
@@ -116,6 +159,14 @@ export function assertActiveBinding(config) {
     throw new BridgeError(missing ? 'TARGET_SESSION_MISSING' : 'MODULE_CONFIG_STALE');
   }
   requireThat(state?.active, 'MODULE_NOT_BOUND');
+}
+
+export function assertModuleActivation(config) {
+  if (!config.moduleManaged) return;
+  const state = readControl(config);
+  requireThat(state?.active, 'MODULE_NOT_BOUND');
+  requireThat(state.active.adoption === undefined || state.active.activation === 'active',
+    'ADOPTION_ACTIVATION_REQUIRED');
 }
 
 // Only the caller that read authoritative absence for this exact route may retire it.
