@@ -5,7 +5,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import type { AskRequest, ModuleBackendContext, NativeChatEvent, NativeObservation } from '@waksana/cockpit-module-sdk/backend';
 import { type Config } from './config.js';
 import { sessionMeta } from './binding.js';
-import { type Binding, type Input, type Output, invariant, Store, uncertain } from './state.js';
+import { type Binding, type Input, type Output, invariant, retireBinding, Store, uncertain } from './state.js';
 import { WechatTransport, type InboundMessage, type Item } from './transport.js';
 import { downloadInbound, uploadOutbound, verifySnapshot } from './media.js';
 import { captureReferences, hasLocalReferences } from './references.js';
@@ -54,6 +54,14 @@ export class Service {
     void work.then(() => this.pending.delete(work), () => this.pending.delete(work));
     return work;
   }
+  private scoped(binding: Binding | null, work: Promise<void>): Promise<void> {
+    return this.track(work.catch(error => {
+      if (!binding || !this.store.read().retired.some(retired => retired.generation === binding.generation
+        && retired.sessionId === binding.sessionId)) throw error;
+      // A retired read may finish after reassignment; report it without faulting the new generation.
+      this.context.report(new Error(safeError(error)));
+    }));
+  }
   private serial(action: () => Promise<void>): Promise<void> {
     const work = this.tail.then(action);
     this.tail = work.catch(error => { if (!this.shutdownCancellation(error)) this.fail(error); });
@@ -96,7 +104,8 @@ export class Service {
     await this.tail;
   }
 
-  async poll(): Promise<void> {
+  poll(): Promise<void> { return this.scoped(this.store.read().binding, this.pollWork()); }
+  private async pollWork(): Promise<void> {
     this.accepting();
     const before = this.store.read();
     const binding = before.binding;
@@ -158,7 +167,10 @@ export class Service {
       cursor = page.cursor;
     }
     invariant(found, 'HISTORY_ANCHOR_MISSING');
-    for (const event of events) await this.observe({ sessionId: binding.sessionId, cwd: binding.cwd ?? null, event }, false);
+    for (const event of events) {
+      this.current(binding);
+      await this.observe({ sessionId: binding.sessionId, cwd: binding.cwd ?? null, event }, false);
+    }
     this.current(binding);
     this.store.change(state => {
       if (state.binding?.generation === binding.generation) state.binding.anchor = latest;
@@ -251,19 +263,17 @@ export class Service {
       }
     });
   }
-  tick(): Promise<void> { return this.track(this.tickWork()); }
+  tick(): Promise<void> { return this.scoped(this.store.read().binding, this.tickWork()); }
   private async tickWork(): Promise<void> {
     this.accepting();
     const state = this.store.read();
     if (!state.binding || uncertain(state)) return;
     const binding = state.binding;
     const meta = await sessionMeta(this.context, binding.sessionId);
+    this.accepting();
     this.current(binding);
     if (!meta) {
-      this.store.change(state => {
-        state.retired.push({ sessionId: binding.sessionId, generation: binding.generation, at: Date.now() });
-        state.binding = null; state.generation++;
-      });
+      this.store.change(state => retireBinding(state, binding));
       return;
     }
     invariant(!binding.cwd || binding.cwd === meta.cwd, 'SESSION_CWD_CHANGED');
@@ -273,6 +283,7 @@ export class Service {
     this.accepting();
     if (uncertain(this.store.read())) return;
     if (meta.loaded) await this.questions(binding, meta);
+    this.current(binding);
     const input = this.store.read().inputs.find(input => input.generation === binding.generation && input.stage === 'queued');
     if (input) await this.submit(binding, input);
     if (uncertain(this.store.read())) return;
@@ -285,6 +296,7 @@ export class Service {
     this.accepting();
     this.current(binding);
     let meta = await sessionMeta(this.context, binding.sessionId);
+    this.current(binding);
     invariant(meta, 'TARGET_SESSION_MISSING');
     if (!meta.loaded) {
       this.accepting();
@@ -417,6 +429,7 @@ export class Service {
       if (!token) return;
       if (output.ask) {
         const meta = await sessionMeta(this.context, binding.sessionId);
+        this.current(binding);
         if (meta?.ask?.requestId !== output.ask.requestId) {
           this.store.change(state => { state.outputs.find(value => value.key === output.key)!.stage = 'abandoned'; });
           continue;
@@ -438,6 +451,7 @@ export class Service {
           if (output.quoteId) item.ref_msg = { svr_id: output.quoteId };
           // Upload is an external mutation too; a stop between upload and send leaves a durable unknown intent.
           this.accepting();
+          this.current(binding);
           const result = await this.transport.send([item], token, part.clientId, this.context.signal);
           this.store.change(state => {
             const current = state.outputs.find(value => value.key === output.key)!;

@@ -19,7 +19,16 @@ not that the native session was loaded or messaging works. Notification replay
 is idempotent even after a binding was retired; it never restores old ownership.
 Only authoritative `meta: null` retires the old binding. Late/aborted lookups
 cannot delete a new generation. Outstanding old-generation work remains an
-explicit blocker; no old message is rerouted to a new session.
+explicit blocker only while an effect or capture is still in flight
+(`RETIRED_WORK_IN_FLIGHT`). Once it settles, retired unknown outcomes remain
+unknown but do not block a new binding. Queued inputs, outputs, and output parts
+in a confirmed retired generation become `abandoned` (records carry
+`RETIRED_BINDING_NOT_SCHEDULED`); pending/presented questions become stale.
+No records, receipts, files, or credentials are deleted, and no old message is
+retried or rerouted to a new session. The same retirement boundary applies to
+availability, permit, and saved callbacks, including already-retired history
+from earlier versions and after restart. General faults, invalid configuration,
+and unresolved work without a confirmed retirement still block.
 A poll completed after retirement retains its messages against the old
 generation as unresolved. After reassignment, messages with missing timestamps
 or timestamps before the new binding require explicit disposition instead of
@@ -53,7 +62,9 @@ The item length/control limits are connector policy, not claimed server limits.
 Before load, prompt, answer, or outbound upload/send, an intent is persisted.
 Only a positively validated result records acceptance. Crash-interrupted intents
 recover as unknown, not queued. Unknown load/prompt/answer/send results block
-automatic consumption and sending. There is no retry-on-timeout or success-shaped
+automatic consumption and sending in their non-retired generation. Retired
+in-flight effects also block until their outcome is recorded; a crash recovers
+them as unknown without replay. There is no retry-on-timeout or success-shaped
 fallback. Confirmed native prompt receipts use `user.message.data.messageId`;
 the chat event UUID is used only as a history position, never as that receipt.
 

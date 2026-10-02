@@ -89,7 +89,9 @@ inbox/outbox, cursor, questions, resolutions or unknown send records.
 Prove preservation while the old service is drained and stopped, before starting
 the replacement. Restart may legitimately change interrupted `intent` stages to
 `unknown` and increment the revision; ordinary `onReady` activity can also write
-state. A consumer checking exact preserved JSON hashes only **after** startup
+state, including archiving queued work in confirmed retired generations as
+described in [binding and availability](MODULE.md#binding-and-availability).
+A consumer checking exact preserved JSON hashes only **after** startup
 cannot distinguish that normal behavior from data loss. Such a consumer must
 handle its stopped/pre-start verification boundary explicitly; never omit `json`
 from the declaration, suppress recovery, or claim an automatic migration merely
