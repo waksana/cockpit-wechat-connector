@@ -59,11 +59,16 @@ export function record(value: unknown): value is Record<string, unknown> {
 function string(value: unknown, max = 50_000): value is string {
   return typeof value === 'string' && value.length <= max;
 }
-export function messageId(value: unknown): string {
+export function serverMessageId(value: unknown): string {
   const id = typeof value === 'number' && Number.isSafeInteger(value) ? String(value) : value;
   assert(typeof id === 'string' && /^(0|[1-9]\d{0,19})$/u.test(id)
     && BigInt(id) <= 18446744073709551615n, 'MESSAGE_ID_INVALID');
   return id;
+}
+function itemMessageId(value: unknown): string {
+  // Item msg_id is opaque metadata, not the uint64 envelope/receipt identity.
+  assert(string(value, 1024) && !/[\x00-\x1f\x7f]/u.test(value), 'ITEM_MESSAGE_ID_INVALID');
+  return value;
 }
 export function apiSuccess(value: Record<string, unknown>): void {
   assert((value.ret === undefined || value.ret === 0) && (value.errcode === undefined || value.errcode === 0),
@@ -113,13 +118,13 @@ function media(value: unknown): MediaReference {
 function quote(value: unknown, depth: number): Quote {
   assert(record(value) && depth < 5, 'QUOTE_INVALID');
   const result: Quote = {};
-  if (value.svr_id !== undefined) result.svr_id = messageId(value.svr_id);
+  if (value.svr_id !== undefined) result.svr_id = serverMessageId(value.svr_id);
   if (value.title !== undefined) { assert(string(value.title), 'QUOTE_INVALID'); result.title = value.title; }
   if (value.message_item !== undefined) {
     const item = value.message_item;
     assert(record(item) && typeof item.type === 'number' && Number.isSafeInteger(item.type), 'QUOTE_INVALID');
     result.message_item = { type: item.type };
-    if (item.msg_id !== undefined) result.message_item.msg_id = messageId(item.msg_id);
+    if (item.msg_id !== undefined) result.message_item.msg_id = itemMessageId(item.msg_id);
     // Quoted items are descriptive context, not permission to fetch their media.
     if (record(item.text_item) && item.text_item.text !== undefined) {
       assert(string(item.text_item.text), 'QUOTE_INVALID');
@@ -155,7 +160,7 @@ function quote(value: unknown, depth: number): Quote {
 export function validateItem(value: unknown, depth = 0): Item {
   assert(record(value) && [1, 2, 4, 5].includes(Number(value.type)) && typeof value.type === 'number', 'ITEM_INVALID');
   const result: Item = { type: value.type as Item['type'] };
-  if (value.msg_id !== undefined) result.msg_id = messageId(value.msg_id);
+  if (value.msg_id !== undefined) result.msg_id = itemMessageId(value.msg_id);
   if (value.ref_msg !== undefined) result.ref_msg = quote(value.ref_msg, depth);
   if (value.type === 1) {
     assert(record(value.text_item) && string(value.text_item.text), 'ITEM_TEXT_INVALID');
@@ -282,9 +287,9 @@ export class WechatTransport {
     let value: unknown;
     try {
       value = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes), ((key: string, item: unknown, context?: { source?: string }) => {
-        if (['message_id', 'msg_id', 'svr_id'].includes(key) && typeof item === 'number') {
+        if (['message_id', 'svr_id'].includes(key) && typeof item === 'number') {
           assert(typeof context?.source === 'string' && /^(0|[1-9]\d*)$/u.test(context.source), 'MESSAGE_ID_INVALID');
-          return messageId(context.source);
+          return serverMessageId(context.source);
         }
         return item;
       }) as Parameters<typeof JSON.parse>[1]);
@@ -312,7 +317,7 @@ export class WechatTransport {
         assert(Number.isSafeInteger(value.create_time_ms) && Number(value.create_time_ms) >= 0, 'MESSAGE_TIME_INVALID');
         createdAt = value.create_time_ms as number;
       }
-      messages.push({ id: messageId(value.message_id), account: this.account, peer: this.peer, text,
+      messages.push({ id: serverMessageId(value.message_id), account: this.account, peer: this.peer, text,
         contextToken: value.context_token, items, quotes: items.flatMap(item => item.ref_msg ? [item.ref_msg] : []),
         ...(createdAt === undefined ? {} : { createdAt }) });
     }
@@ -327,7 +332,7 @@ export class WechatTransport {
       context_token: contextToken, item_list: items.map(item => validateItem(item)),
     } }, signal);
     assert(Object.keys(result).every(key => ['ret', 'errcode', 'errmsg', 'message_id'].includes(key)), 'SEND_SCHEMA_INVALID');
-    const id = result.message_id === undefined ? undefined : messageId(result.message_id);
+    const id = result.message_id === undefined ? undefined : serverMessageId(result.message_id);
     assert(id !== '0' && (result.ret === 0 || id !== undefined), 'SEND_SCHEMA_INVALID');
     return id === undefined ? {} : { messageId: id };
   }

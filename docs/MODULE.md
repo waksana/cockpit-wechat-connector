@@ -34,6 +34,16 @@ Unknown schema/account changes refuse startup. It is not the old bridge schema.
 All files and receipts stay in this module's host-provided data root.
 
 Inbound messages and poll cursor are committed together. IDs are account-scoped.
+Envelope `message_id`, send receipts, and quote `svr_id` use lossless decimal
+uint64 server identities. Item `msg_id` (including a quoted `message_item.msg_id`)
+is instead opaque string metadata: it is preserved without numeric conversion,
+trimming, or case folding. Empty/default item IDs are permitted; a local 1,024
+character limit and control-character rejection bound this metadata. Numeric
+JSON item IDs are not coerced into strings. Item IDs never identify a persisted
+input, correlate a receipt, or resolve a retained quoted file; only the scoped
+server identity does that. An invalid authorized message rejects the whole poll
+before its cursor is committed.
+
 Before load, prompt, answer, or outbound upload/send, an intent is persisted.
 Only a positively validated result records acceptance. Crash-interrupted intents
 recover as unknown, not queued. Unknown load/prompt/answer/send results block

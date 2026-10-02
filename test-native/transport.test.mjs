@@ -16,7 +16,7 @@ test('poll pins official origin and preserves uint64 message and quote IDs lossl
   let request;
   const transport = new WechatTransport(config, async (url, init) => {
     request = { url: url.href, ...init };
-    return new Response('{"msgs":[{"message_id":18446744073709551615,"from_user_id":"test-peer","to_user_id":"test-bot","message_type":1,"message_state":2,"context_token":"test-context","create_time_ms":1234,"item_list":[{"type":1,"msg_id":9007199254740993,"text_item":{"text":"hello"},"ref_msg":{"svr_id":18446744073709551614,"partial_text":{"start":"first","end":"last"}}}]}],"get_updates_buf":"next"}');
+    return new Response('{"msgs":[{"message_id":18446744073709551615,"from_user_id":"test-peer","to_user_id":"test-bot","message_type":1,"message_state":2,"context_token":"test-context","create_time_ms":1234,"item_list":[{"type":1,"msg_id":"9007199254740993","text_item":{"text":"hello"},"ref_msg":{"svr_id":18446744073709551614,"partial_text":{"start":"first","end":"last"}}}]}],"get_updates_buf":"next"}');
   });
   const result = await transport.poll('previous');
   assert.equal(result.cursor, 'next');
@@ -34,6 +34,57 @@ test('unauthorized and group messages are never enqueued, even with malformed it
   const transport = new WechatTransport(config, async () => json({
     msgs: [message({ from_user_id: 'stranger', item_list: null }), message({ to_user_id: 'another-bot' }),
       message({ group_id: 'group', item_list: null }), message()], get_updates_buf: 'next',
+  }));
+  assert.equal((await transport.poll('')).messages.length, 1);
+});
+
+test('opaque item identities do not use the envelope uint64 identity contract', async () => {
+  const item = {
+    type: 1, msg_id: 'synthetic-part:alpha/001', text_item: { text: 'hello' },
+    ref_msg: { svr_id: '18446744073709551614',
+      message_item: { type: 1, msg_id: 'synthetic-part:quoted/01', text_item: { text: 'quoted' } } },
+  };
+  const transport = new WechatTransport(config, async () => json({
+    msgs: [message({ item_list: [item] })], get_updates_buf: 'next',
+  }));
+  const result = await transport.poll('before');
+  assert.equal(result.messages[0].id, '18446744073709551615');
+  assert.deepEqual(result.messages[0].items, [item]);
+  assert.deepEqual(result.messages[0].quotes, [item.ref_msg]);
+});
+
+test('item IDs remain bounded strings without normalization, including quoted items and outgoing metadata', async () => {
+  for (const id of ['', '00042', '18446744073709551616', 'opaque/part:ABC-1', 'x'.repeat(1024)]) {
+    const item = { type: 1, msg_id: id, text_item: { text: 'hello' },
+      ref_msg: { svr_id: '42', message_item: { type: 1, msg_id: id } } };
+    let sent;
+    const transport = new WechatTransport(config, async (url, init) => {
+      if (url.pathname.endsWith('/getupdates')) return json({ msgs: [message({ item_list: [item] })], get_updates_buf: 'next' });
+      sent = JSON.parse(init.body).msg.item_list[0];
+      return json({ ret: 0, message_id: '43' });
+    });
+    const result = await transport.poll('');
+    assert.deepEqual(result.messages[0].items[0], item);
+    await transport.send([item], 'context', 'client');
+    assert.deepEqual(sent, item);
+  }
+  for (const id of [null, true, {}, [], 42, 9007199254740992, 'x'.repeat(1025), 'bad\nid', 'bad\u0000id', 'bad\u007fid']) {
+    for (const item of [
+      { type: 1, msg_id: id, text_item: { text: 'hello' } },
+      { type: 1, text_item: { text: 'hello' }, ref_msg: { message_item: { type: 1, msg_id: id } } },
+    ]) {
+      const transport = new WechatTransport(config, async () => json({ msgs: [message({ item_list: [item] })], get_updates_buf: 'unsafe' }));
+      await assert.rejects(transport.poll('before'), /ITEM_MESSAGE_ID_INVALID/);
+      await assert.rejects(transport.send([item], 'context', 'client'), /ITEM_MESSAGE_ID_INVALID/);
+    }
+  }
+});
+
+test('invalid item metadata on unrelated senders is filtered before item validation', async () => {
+  const transport = new WechatTransport(config, async () => json({
+    msgs: [message({ from_user_id: 'stranger', item_list: [{ type: 1, msg_id: -1 }] }),
+      message({ group_id: 'group', item_list: [{ type: 1, msg_id: {} }] }), message()],
+    get_updates_buf: 'next',
   }));
   assert.equal((await transport.poll('')).messages.length, 1);
 });
