@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { mkdtempSync,readFileSync,rmSync,writeFileSync } from 'node:fs';
+import { copyFileSync,mkdtempSync,readFileSync,rmSync,writeFileSync } from 'node:fs';
+import { DatabaseSync } from 'node:sqlite';
 import { createCipheriv,createDecipheriv } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -244,16 +245,272 @@ test('late missing query cannot retire a newer generation; abort forbids cleanup
   await late;
   assert.equal(f.store.read().binding.sessionId,'new');
 });
-test('authoritative missing retires, but unknown historic work blocks replacement',async t => {
+test('authoritative deletion archives queued work, preserves unknowns and allows new-generation traffic',async t => {
   const f=fixture(t);
   await bind(f);
-  f.service.ingest([message('1')],'cursor',f.store.read().binding);
+  const old=f.store.read().binding;
+  f.service.ingest([message('1'),message('2')],'cursor',old);
+  for(const id of ['unknown','queued']) await f.service.observe({
+    sessionId: old.sessionId,cwd: f.root,event: { id,type: 'assistant.message',data: { content: `old ${id}` } },
+  });
+  f.store.change(state => {
+    state.inputs[0].stage='unknown'; state.inputs[0].reason='PROMPT_OUTCOME_UNKNOWN';
+    state.outputs[0].stage='unknown'; state.outputs[0].parts[0].stage='unknown';
+    state.outputs[0].reason='WECHAT_API_REJECTED';
+  });
+  const unknown=f.store.read().outputs[0];
   f.setMeta(null);
   const result=await f.manager.availability({ ...selection,sessionId: 'other' },new AbortController().signal);
   assert.equal(f.store.read().binding,null);
-  assert(result.reasons.some(reason => reason.code==='UNRESOLVED_HISTORY'));
-  await assert.rejects(f.manager.saved({ ...selection,sessionId: 'other',notificationId: 'new' },
-    new AbortController().signal),/UNRESOLVED_HISTORY/);
+  assert.deepEqual(result.reasons,[]);
+  const retired=f.store.read();
+  await f.manager.availability({ ...selection,sessionId: 'other' },new AbortController().signal);
+  assert.deepEqual(f.store.read(),retired);
+  assert.deepEqual(retired.outputs[0],unknown);
+  assert.equal(retired.inputs[0].stage,'unknown');
+  assert.equal(retired.inputs[1].stage,'abandoned');
+  assert.equal(retired.outputs[1].stage,'abandoned');
+  assert.equal(retired.outputs[1].parts[0].stage,'abandoned');
+  assert.equal(retired.outputs[1].reason,'RETIRED_BINDING_NOT_SCHEDULED');
+  f.setMeta({ sessionId: 'other',cwd: f.root,loaded: true,status: 'idle',ask: null });
+  await f.manager.saved({ ...selection,sessionId: 'other',notificationId: 'new' },new AbortController().signal);
+  const binding=f.store.read().binding;
+  assert(binding.generation>old.generation);
+  await f.service.observe({
+    sessionId: old.sessionId,cwd: f.root,event: { id: 'late',type: 'assistant.message',data: { content: 'do not mirror' } },
+  });
+  f.transport.poll=async () => ({
+    messages: [message('fresh','new input',{ createdAt: binding.boundAt+1 })],cursor: 'new-cursor',
+  });
+  await f.service.poll();
+  await f.service.tick();
+  await f.service.observe({
+    sessionId: 'other',cwd: f.root,event: { id: 'fresh',type: 'assistant.message',data: { content: 'new reply' } },
+  });
+  await f.service.tick();
+  assert.deepEqual(f.calls.filter(call => call.name==='prompt').map(call => call.body.sessionId),['other']);
+  assert.deepEqual(f.sent.map(send => send.items[0].text_item.text),['new reply']);
+  assert.deepEqual(f.store.read().outputs[0],unknown);
+  await f.manager.saved({ ...selection,notificationId: 'notification-1' },new AbortController().signal);
+  assert.equal(f.store.read().binding.sessionId,'other');
+});
+test('saved reconciles deletion even without a preflight',async t => {
+  const f=fixture(t);
+  await bind(f);
+  f.service.ingest([message('old')],'cursor',f.store.read().binding);
+  f.setMeta(null);
+  await f.manager.saved({ ...selection,sessionId: 'other',notificationId: 'new' },new AbortController().signal);
+  assert.equal(f.store.read().binding.sessionId,'other');
+  assert.equal(f.store.read().inputs[0].stage,'abandoned');
+});
+test('non-authoritative existence results and cancellation cannot release a binding',async t => {
+  for(const kind of ['throw','malformed','wrong-session','cancel','stopping','unloaded','idle']) await t.test(kind,async t => {
+    const f=fixture(t);
+    await bind(f);
+    const before=f.store.read();
+    const abort=new AbortController();
+    f.setHook(name => {
+      if(name!=='session/get') return;
+      if(kind==='throw') throw new Error('not found');
+      if(kind==='malformed') return {};
+      if(kind==='wrong-session') return { meta: { ...f.getMeta(),sessionId: 'different' } };
+      if(kind==='cancel') { abort.abort(); return { meta: null }; }
+      if(kind==='stopping') { f.stopping.abort(); return { meta: null }; }
+      return { meta: { ...f.getMeta(),loaded: kind==='idle',status: kind } };
+    });
+    const result=await f.manager.availability({ ...selection,sessionId: 'other' },abort.signal);
+    assert(result.reasons.some(reason => reason.code==='BINDING_OCCUPIED'));
+    assert.deepEqual(f.store.read(),before);
+    await assert.rejects(f.manager.saved({ ...selection,sessionId: 'other',notificationId: 'new' },abort.signal));
+    assert.deepEqual(f.store.read(),before);
+  });
+});
+test('retired history does not mask faults, configuration problems or unretired unknowns',async t => {
+  const f=fixture(t);
+  await bind(f);
+  f.setMeta(null);
+  await f.manager.availability(selection,new AbortController().signal);
+  f.store.change(state => {
+    state.fault='HISTORY_ANCHOR_MISSING';
+    state.inputs.push({ key: 'unretired',generation: state.generation,message: message('unretired'),stage: 'unknown' });
+  });
+  const manager=new BindingManager(f.context,f.store,() => ['MISSING_CONFIG']);
+  const result=await manager.availability(selection,new AbortController().signal);
+  assert.deepEqual(new Set(result.reasons.map(reason => reason.code)),new Set(['MISSING_CONFIG','UNRESOLVED_HISTORY']));
+  await assert.rejects(f.manager.saved({ ...selection,notificationId: 'new' },new AbortController().signal),/UNRESOLVED_HISTORY/);
+});
+test('simultaneous replacement saves commit at most one winner',async t => {
+  const f=fixture(t);
+  await bind(f);
+  f.setMeta(null);
+  await f.manager.availability(selection,new AbortController().signal);
+  const releases=[];
+  f.setHook((name,body) => name==='session/chat'?new Promise(resolve => {
+    releases.push(() => resolve({
+      sessionId: body.sessionId,source: body.source,direction: body.direction,
+      cursorStatus: 'ok',events: [],cursor: 'cursor',hasMore: false,
+    }));
+  }):undefined);
+  const first=f.manager.saved({ ...selection,sessionId: 'one',notificationId: 'one' },new AbortController().signal);
+  const second=f.manager.saved({ ...selection,sessionId: 'two',notificationId: 'two' },new AbortController().signal);
+  // Both saved callbacks must finish their asynchronous anchor read before competing at the CAS.
+  while(releases.length<2) await new Promise(resolve => setImmediate(resolve));
+  for(const release of releases) release();
+  const results=await Promise.allSettled([first,second]);
+  assert.equal(results.filter(result => result.status==='fulfilled').length,1);
+  assert.match(results.find(result => result.status==='rejected').reason.message,/BINDING_CHANGED/);
+  assert.equal(f.store.read().notifications.length,2);
+});
+test('already-retired legacy queues and crash intents recover without deleting unknown history',async t => {
+  const f=fixture(t);
+  await bind(f);
+  f.service.ingest([message('old')],'cursor',f.store.read().binding);
+  const root=mkdtempSync(join(tmpdir(),'wechat-retired-restart-'));
+  copyFileSync(join(f.root,'native-v1.sqlite'),join(root,'native-v1.sqlite'));
+  const db=new DatabaseSync(join(root,'native-v1.sqlite'));
+  const state=f.store.read();
+  state.retired.push({ sessionId: state.binding.sessionId,generation: state.generation,at: Date.now() });
+  state.binding=null; state.generation++;
+  state.outputs.push({
+    key: 'unknown',generation: 1,stage: 'unknown',kind: 'reply',text: 'old',files: [],
+    parts: [{ stage: 'unknown',clientId: 'old-unknown' }],reason: 'WECHAT_API_REJECTED',
+  },{
+    key: 'crash',generation: 1,stage: 'intent',kind: 'reply',text: 'old send',files: [],
+    parts: [{ stage: 'intent',clientId: 'old-intent' }],
+  },{
+    key: 'queued',generation: 1,stage: 'queued',kind: 'reply',text: 'old queue',files: [],
+    parts: [{ stage: 'queued',clientId: 'old-queue' }],
+  });
+  db.prepare('UPDATE state SET json=? WHERE id=1').run(JSON.stringify(state)); db.close();
+  const recovered=new Store(root,'fixture-account');
+  t.after(() => { recovered.close(); rmSync(root,{ recursive: true,force: true }); });
+  const manager=new BindingManager(f.context,recovered,() => []);
+  assert.deepEqual((await manager.availability(selection,new AbortController().signal)).reasons,[]);
+  await manager.saved({ ...selection,sessionId: 'replacement',notificationId: 'replacement' },new AbortController().signal);
+  assert.equal(recovered.read().binding.sessionId,'replacement');
+  assert.equal(recovered.read().inputs[0].stage,'abandoned');
+  assert.deepEqual(recovered.read().outputs.map(output => output.stage),['unknown','unknown','abandoned']);
+  assert.deepEqual(recovered.read().outputs[0],state.outputs[0]);
+  assert.deepEqual(recovered.read().notifications,['notification-1','replacement']);
+  assert.equal(recovered.read().cursor,'cursor');
+});
+test('retired in-flight sends settle once and unsent multipart tails never resume',async t => {
+  const f=fixture(t);
+  await bind(f);
+  f.service.ingest([message('1')],'cursor',f.store.read().binding);
+  await f.service.tick();
+  await f.service.observe({
+    sessionId: 'session-original',cwd: f.root,event: { id: 'long',type: 'assistant.message',data: { content: 'x'.repeat(4000) } },
+  });
+  let release;
+  let entered;
+  const started=new Promise(resolve => { entered=resolve; });
+  let sends=0;
+  f.transport.send=() => { sends++; entered(); return new Promise(resolve => { release=resolve; }); };
+  const tick=f.service.tick();
+  await started;
+  f.setMeta(null);
+  const result=await f.manager.availability({ ...selection,sessionId: 'replacement' },new AbortController().signal);
+  assert.deepEqual(result.reasons.map(reason => reason.code),['RETIRED_WORK_IN_FLIGHT']);
+  await assert.rejects(f.manager.saved({ ...selection,sessionId: 'replacement',notificationId: 'new' },
+    new AbortController().signal),/RETIRED_WORK_IN_FLIGHT/);
+  release({ messageId: 'confirmed-old-send' });
+  await tick;
+  assert.deepEqual(f.store.read().outputs[0].parts.map(part => part.stage),['accepted','abandoned']);
+  assert.equal(f.store.read().outputs[0].stage,'abandoned');
+  assert.equal(f.store.read().fault,undefined);
+  assert.deepEqual((await f.manager.availability(selection,new AbortController().signal)).reasons,[]);
+  await f.manager.saved({ ...selection,sessionId: 'replacement',notificationId: 'new' },new AbortController().signal);
+  assert.equal(sends,1);
+});
+test('deletion during passive submit lookup never loads or prompts the retired session',async t => {
+  const f=fixture(t);
+  await bind(f);
+  f.service.ingest([message('1')],'cursor',f.store.read().binding);
+  let gets=0;
+  let release;
+  let entered;
+  const started=new Promise(resolve => { entered=resolve; });
+  f.setHook(name => {
+    if(name==='session/get' && ++gets===2) return new Promise(resolve => { release=resolve; entered(); });
+  });
+  const tick=f.service.tick();
+  await started;
+  const oldMeta=f.getMeta();
+  f.setMeta(null);
+  await f.manager.availability(selection,new AbortController().signal);
+  await f.manager.saved({ ...selection,sessionId: 'replacement',notificationId: 'new' },new AbortController().signal);
+  release({ meta: oldMeta });
+  await tick;
+  assert.equal(f.calls.some(call => ['session/load','prompt'].includes(call.name)),false);
+  assert.equal(f.store.read().fault,undefined);
+  assert.equal(f.store.read().binding.sessionId,'replacement');
+});
+test('retired load and prompt effects retain their actual outcome without replay',async t => {
+  for(const kind of ['load','prompt-accepted','prompt-unknown']) await t.test(kind,async t => {
+    const f=fixture(t);
+    await bind(f);
+    if(kind!=='load') f.setMeta({ ...f.getMeta(),loaded: true,status: 'idle' });
+    f.service.ingest([message('effect')],'cursor',f.store.read().binding);
+    let release;
+    let entered;
+    const started=new Promise(resolve => { entered=resolve; });
+    const effect=kind==='load'?'session/load':'prompt';
+    f.setHook(name => {
+      if(name===effect) return new Promise((resolve,reject) => {
+        release=() => kind==='prompt-unknown'?reject(new Error('OUTCOME_UNKNOWN'))
+          :resolve(kind==='load'?{ ok: true,sessionId: 'session-original' }:{ ok: true,messageId: 'old-receipt' });
+        entered();
+      });
+    });
+    const tick=f.service.tick();
+    await started;
+    f.setMeta(null);
+    assert.deepEqual((await f.manager.availability(selection,new AbortController().signal)).reasons.map(reason => reason.code),
+      ['RETIRED_WORK_IN_FLIGHT']);
+    release();
+    await tick;
+    assert.equal(f.store.read().inputs[0].stage,kind==='load'?'abandoned':kind==='prompt-accepted'?'accepted':'unknown');
+    assert.deepEqual((await f.manager.availability(selection,new AbortController().signal)).reasons,[]);
+    await f.manager.saved({ ...selection,sessionId: 'replacement',notificationId: 'new' },new AbortController().signal);
+    f.setMeta({ sessionId: 'replacement',cwd: f.root,loaded: true,status: 'idle',ask: null });
+    await f.service.tick();
+    assert.equal(f.calls.filter(call => call.name===effect).length,1);
+    assert.equal(f.store.read().fault,undefined);
+  });
+});
+test('retirement during upload stops before send and keeps the unknown upload intent',async t => {
+  const f=fixture(t);
+  await bind(f);
+  f.store.change(state => { state.binding.contextToken='old-context'; });
+  const sourceRoot=mkdtempSync(join(tmpdir(),'wechat-upload-source-'));
+  t.after(() => rmSync(sourceRoot,{ recursive: true,force: true }));
+  const file=join(sourceRoot,'attachment.txt');
+  writeFileSync(file,'frozen fixture');
+  const service=new Service(f.context,{ ...f.config,fileRoots: [sourceRoot] },f.store,f.transport);
+  await service.observe({
+    sessionId: 'session-original',cwd: sourceRoot,event: { id: 'upload',type: 'assistant.message',data: { content: `[file](${file})` } },
+  });
+  let release;
+  let entered;
+  const started=new Promise(resolve => { entered=resolve; });
+  let uploads=0;
+  f.transport.call=async () => ({ upload_param: 'fake-upload' });
+  f.transport.request=() => { uploads++; entered(); return new Promise(resolve => { release=resolve; }); };
+  const tick=service.tick();
+  await started;
+  f.setMeta(null);
+  assert.deepEqual((await f.manager.availability(selection,new AbortController().signal)).reasons.map(reason => reason.code),
+    ['RETIRED_WORK_IN_FLIGHT']);
+  release({ headers: new Headers({ 'x-encrypted-param': 'fake-receipt' }) });
+  await tick;
+  assert.equal(uploads,1);
+  assert.equal(f.sent.length,1); // Text part was sent before the file upload began.
+  assert.equal(f.store.read().outputs[0].stage,'unknown');
+  assert.equal(f.store.read().outputs[0].reason,'BINDING_CHANGED');
+  assert.equal(f.store.read().outputs[0].parts.at(-1).stage,'unknown');
+  assert.deepEqual((await f.manager.availability(selection,new AbortController().signal)).reasons,[]);
+  await service.stop();
 });
 test('unknown prompt is persisted and never automatically retried',async t => {
   const f=fixture(t);
@@ -391,6 +648,26 @@ test('expected stopping after a passive read does not persist a permanent fault'
   await f.service.stop();
   assert.equal(f.store.read().fault,undefined);
 });
+test('a cancelled runtime existence lookup cannot retire or abandon queued work',async t => {
+  for(const kind of ['stopping','disposal']) await t.test(kind,async t => {
+    const f=fixture(t);
+    await bind(f);
+    f.service.ingest([message('queued')],'cursor',f.store.read().binding);
+    const before=f.store.read();
+    let release;
+    f.setHook(name => name==='session/get'?new Promise(resolve => { release=resolve; }):undefined);
+    const tick=f.service.tick();
+    if(kind==='stopping') f.stopping.abort();
+    else {
+      const signal=new AbortController();
+      f.context.signal=signal.signal;
+      signal.abort();
+    }
+    release({ meta: null });
+    await assert.rejects(tick,/SERVICE_STOPPING/);
+    assert.deepEqual(f.store.read(),before);
+  });
+});
 test('distinct assistant snapshots use event identity even with the same native messageId',async t => {
   const f=fixture(t);
   await bind(f);
@@ -488,17 +765,22 @@ test('a late poll for a retired generation cannot reroute its message to a new b
   let release;
   f.transport.poll=() => new Promise(resolve => { release=resolve; });
   const poll=f.service.poll();
-  f.store.change(state => {
-    state.generation++;
-    state.binding={ sessionId: 'replacement',generation: state.generation,anchor: null };
-  });
+  const old=f.store.read().binding;
+  f.setMeta(null);
+  await f.manager.availability(selection,new AbortController().signal);
+  await f.manager.saved({ ...selection,sessionId: 'replacement',notificationId: 'replacement' },new AbortController().signal);
   release({ messages: [message('late')],cursor: 'late-cursor' });
   await poll;
   const state=f.store.read();
-  assert.equal(state.inputs[0].generation,state.generation-1);
+  assert.equal(state.inputs[0].generation,old.generation);
   assert.equal(state.inputs[0].stage,'unknown');
   assert.equal(state.cursor,'late-cursor');
   assert.equal(state.binding.contextToken,undefined);
+  f.setMeta({ sessionId: 'replacement',cwd: f.root,loaded: true,status: 'idle',ask: null });
   await f.service.tick();
   assert.equal(f.calls.some(call => call.name==='prompt'),false);
+  f.service.ingest([message('fresh','fresh input',{ createdAt: state.binding.boundAt+1 })],'fresh-cursor',state.binding);
+  await f.service.tick();
+  assert.deepEqual(f.calls.filter(call => call.name==='prompt').map(call => call.body.sessionId),['replacement']);
+  assert.equal(f.store.read().inputs[0].stage,'unknown');
 });

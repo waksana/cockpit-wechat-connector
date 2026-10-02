@@ -4,7 +4,7 @@ import { copyFileSync, mkdtempSync, rmSync, writeFileSync, readFileSync } from '
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { pathToFileURL } from 'node:url';
-import { accountLease, readConfig, credentials } from '../dist/config.js';
+import { accountLease, readConfig, credentials, identity } from '../dist/config.js';
 import { activate } from '../dist/index.js';
 import { Store } from '../dist/state.js';
 
@@ -92,4 +92,88 @@ test('invalid config still reports retained occupancy and query uncertainty', as
   fixture.stopping.abort();
   await backend.onStop();
   await backend.dispose();
+});
+test('public role callbacks replace deleted bindings and serve only fresh traffic with fake transport', async t => {
+  for (const alreadyRetired of [false, true]) await t.test(`already retired: ${alreadyRetired}`, { timeout: 10000 }, async t => {
+    const root = mkdtempSync(join(tmpdir(), 'wechat-role-flow-'));
+    const config = { enabled: true, exclusiveAccountConfirmed: true, account: `fixture-${process.pid}`,
+      peer: 'fake-peer', fileRoots: [], webUrl: 'https://example.test' };
+    const store = new Store(root, identity(config));
+    store.change(state => {
+      state.generation = alreadyRetired ? 2 : 1;
+      state.binding = alreadyRetired ? null : { sessionId: 'deleted', generation: 1, anchor: null };
+      if (alreadyRetired) state.retired.push({ sessionId: 'deleted', generation: 1, at: Date.now() });
+      state.outputs.push(...['unknown', 'queued'].map(stage => ({
+        key: `old-${stage}`, generation: 1, kind: 'reply', stage, text: `old ${stage}`, files: [],
+        parts: [{ stage, clientId: `old-${stage}`, text: `old ${stage}` }],
+        ...(stage === 'unknown' ? { reason: 'WECHAT_API_REJECTED' } : {}),
+      })));
+    });
+    store.close();
+    writeFileSync(join(root, 'credentials.json'), JSON.stringify({
+      account: config.account, peer: config.peer, token: 'synthetic-only',
+    }), { mode: 0o600 });
+    const fixture = context(root, config);
+    const calls = [];
+    const sent = [];
+    let backend;
+    fixture.context.host.call = async (name, body) => {
+      calls.push({ name, body });
+      if (name === 'session/get') return { meta: body.sessionId === 'deleted' ? null
+        : { sessionId: body.sessionId, cwd: root, loaded: true, status: 'idle', ask: null } };
+      if (name === 'session/chat') return { sessionId: body.sessionId, source: body.source, direction: body.direction,
+        events: [], cursor: 'fake', cursorStatus: 'ok', hasMore: false };
+      if (name === 'prompt') {
+        await backend.events.handle({ sessionId: body.sessionId, cwd: root,
+          event: { id: 'new-reply', type: 'assistant.message', data: { content: 'fresh reply only' } } });
+        return { ok: true, messageId: 'fresh-native-receipt' };
+      }
+      assert.fail(`Unexpected host call: ${name}`);
+    };
+    let resolveSend;
+    const received = new Promise(resolve => { resolveSend = resolve; });
+    let polled = false;
+    t.mock.method(globalThis, 'fetch', async (url, init) => {
+      if (url.pathname === '/ilink/bot/getupdates') {
+        if (polled) return new Promise((resolve, reject) => {
+          init.signal.addEventListener('abort', () => reject(init.signal.reason), { once: true });
+        });
+        polled = true;
+        return new Response(JSON.stringify({ get_updates_buf: 'fresh-cursor', msgs: [{
+          message_id: '123', from_user_id: config.peer, to_user_id: config.account,
+          message_type: 1, message_state: 2, context_token: 'fresh-context', create_time_ms: Date.now() + 1,
+          item_list: [{ type: 1, text_item: { text: 'fresh input' } }],
+        }] }));
+      }
+      assert.equal(url.pathname, '/ilink/bot/sendmessage');
+      sent.push(JSON.parse(init.body).msg);
+      resolveSend();
+      return new Response(JSON.stringify({ message_id: '456' }));
+    });
+    backend = await activate(fixture.context);
+    t.after(async () => {
+      fixture.stopping.abort();
+      await backend.onStop();
+      await backend.dispose();
+      rmSync(root, { recursive: true, force: true });
+    });
+    const selection = { operation: alreadyRetired ? 'add' : 'create', sessionId: 'replacement',
+      roles: [{ moduleId: 'wechat', roleId: 'wechat' }], previousRoles: [] };
+    const signal = new AbortController().signal;
+    assert.deepEqual((await backend.roleAssignments.availability(selection, signal)).reasons, []);
+    assert.deepEqual(await backend.roleAssignments.permit(selection, signal), { allowed: true });
+    await backend.roleAssignments.saved({ ...selection, notificationId: 'saved' }, signal);
+    await backend.onReady();
+    await received;
+    fixture.stopping.abort();
+    await backend.onStop();
+    const status = (await backend.routes.find(route => route.path === '/status').handler({})).body;
+    assert.equal(status.binding.sessionId, 'replacement');
+    assert.equal(status.fault, null);
+    assert.equal(status.outputs.find(output => output.key === 'old-unknown').stage, 'unknown');
+    assert.equal(status.outputs.find(output => output.key === 'old-unknown').reason, 'WECHAT_API_REJECTED');
+    assert.equal(status.outputs.find(output => output.key === 'old-queued').stage, 'abandoned');
+    assert.deepEqual(calls.filter(call => call.name === 'prompt').map(call => call.body.sessionId), ['replacement']);
+    assert.deepEqual(sent.map(message => message.item_list[0].text_item.text), ['fresh reply only']);
+  });
 });

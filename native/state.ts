@@ -83,6 +83,9 @@ function validate(value: State): void {
   for (const list of [value.inputs, value.outputs, value.questions, value.retired, value.notifications, value.resolutions]) {
     invariant(Array.isArray(list) && list.length <= 10_000, 'STATE_LIMIT_OR_SCHEMA');
   }
+  invariant(value.retired.every(binding => typeof binding.sessionId === 'string' && binding.sessionId.length > 0
+    && Number.isSafeInteger(binding.generation) && binding.generation >= 0 && binding.generation < value.generation
+    && Number.isFinite(binding.at)), 'STATE_RETIREMENT_INVALID');
   invariant(value.inputs.every(input => typeof input.key === 'string' && stages.includes(input.stage)
     && Number.isSafeInteger(input.generation) && typeof input.message?.id === 'string'), 'STATE_INPUT_INVALID');
   invariant(value.outputs.every(output => typeof output.key === 'string' && stages.includes(output.stage)
@@ -145,6 +148,7 @@ export class Store {
   change(action: (state: State) => void): void {
     const next = structuredClone(this.state);
     action(next);
+    archiveRetired(next);
     if (JSON.stringify(next) === JSON.stringify(this.state) && next.revision > 0) return;
     next.revision++;
     validate(next);
@@ -156,11 +160,45 @@ export class Store {
   close(): void { this.db.close(); }
 }
 
+export function retireBinding(state: State, binding: Binding): void {
+  if (state.binding?.generation !== binding.generation || state.binding.sessionId !== binding.sessionId) return;
+  state.retired.push({ sessionId: binding.sessionId, generation: binding.generation, at: Date.now() });
+  state.binding = null;
+  state.generation++;
+}
+
+function archiveRetired(state: State): void {
+  const retired = new Set(state.retired.map(binding => binding.generation));
+  for (const record of [...state.inputs, ...state.outputs]) {
+    if (retired.has(record.generation) && record.stage === 'queued') {
+      record.stage = 'abandoned';
+      record.reason = 'RETIRED_BINDING_NOT_SCHEDULED';
+    }
+  }
+  for (const output of state.outputs) {
+    if (retired.has(output.generation)) {
+      for (const part of output.parts) if (part.stage === 'queued') part.stage = 'abandoned';
+    }
+  }
+  for (const question of state.questions) {
+    if (retired.has(question.generation) && ['pending', 'presented'].includes(question.stage)) question.stage = 'stale';
+  }
+}
+
+export function retiredWorkInFlight(state: State): boolean {
+  const retired = new Set(state.retired.map(binding => binding.generation));
+  return state.inputs.some(input => retired.has(input.generation) && input.stage === 'intent')
+    || state.outputs.some(output => retired.has(output.generation)
+      && (output.stage === 'intent' || output.parts.some(part => part.stage === 'intent')));
+}
 export function unresolved(state: State): boolean {
-  return !!state.fault || state.inputs.some(input => ['queued', 'intent', 'unknown'].includes(input.stage))
-    || state.outputs.some(output => ['queued', 'intent', 'unknown'].includes(output.stage));
+  const retired = new Set(state.retired.map(binding => binding.generation));
+  return !!state.fault || state.inputs.some(input => !retired.has(input.generation) && ['queued', 'intent', 'unknown'].includes(input.stage))
+    || state.outputs.some(output => !retired.has(output.generation) && ['queued', 'intent', 'unknown'].includes(output.stage));
 }
 export function uncertain(state: State): boolean {
-  return !!state.fault || state.inputs.some(input => ['intent', 'unknown'].includes(input.stage))
-    || state.outputs.some(output => ['intent', 'unknown'].includes(output.stage));
+  const retired = new Set(state.retired.map(binding => binding.generation));
+  return !!state.fault || retiredWorkInFlight(state)
+    || state.inputs.some(input => !retired.has(input.generation) && ['intent', 'unknown'].includes(input.stage))
+    || state.outputs.some(output => !retired.has(output.generation) && ['intent', 'unknown'].includes(output.stage));
 }
