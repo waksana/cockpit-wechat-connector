@@ -8,9 +8,10 @@ service.
 
 This is a **new module**, not a wrapper around the former CLI. Its new private
 database is intentionally incompatible with legacy profiles and receipts.
-No old installation, credential, cursor, SQLite/WAL, or service is discovered,
-adopted, migrated, or deleted. Legacy `src/` and `test/` sources remain for
-protocol history; they are not included in the module archive or imported by it.
+No old CLI installation, credential, cursor, SQLite/WAL, or service is discovered,
+adopted, migrated, or deleted. The obsolete standalone CLI and its queue/recovery
+tools have been removed from the repository. Existing native module data is
+retained through the [one-time adapter conversion](docs/MODULE.md#upgrading-existing-native-data).
 
 ## Requirements
 
@@ -97,6 +98,12 @@ mirrors new primary assistant message bodies from that shared session, including
 replies triggered from Web. The selected peer must be authorized to see the
 entire session. It does not forward tool execution details or subagent transcripts.
 
+Ordinary input calls native `prompt` with `mode: "immediate"`; native Copilot
+owns busy/steering/execution behavior. Replies call WeChat send/upload directly.
+There is no connector-owned durable inbox/outbox, retry worker, or manual
+unlock workflow. A failed/unknown message does not block independent later
+messages or role selection, and is never automatically retried.
+
 An unloaded existing session still owns its binding. Only a real inbound message
 loads that same ID through `session/load`; passive availability/history never
 loads, creates, or reloads a session. Only a valid `session/get` response with
@@ -113,7 +120,7 @@ The answer goes to the exact pending `requestId` through native `respondAsk`,
 not as another prompt. Exact choice text uses `wasFreeform: false`; arbitrary
 text uses `true` only when allowed.
 
-Messages are assigned to the displayed question when received and persisted.
+Messages are associated with the displayed question when received.
 Before submission the connector rechecks that request. A question already
 answered in Web, replaced, or not yet presented causes a rejection notice; its
 reply is never silently used to answer the next question. Duplicate messages do
@@ -128,9 +135,9 @@ Do not use this text bridge as an approval/security boundary.
 Plan and elicitation decisions remain native Web interactions, with a WeChat
 link notification; they are not misrepresented as AskUser.
 
-## Files, quotes, recovery, and shutdown
+## Files, quotes, delivery limits, and shutdown
 
-See the [module contract](docs/MODULE.md) for durable delivery states, immutable
-local media copies, source path permissions, history gaps, and drain behavior.
+See the [module contract](docs/MODULE.md) for direct-call delivery limits,
+deduplication/results, immutable media copies, history gaps, and shutdown.
 Tencent protocol adaptations retain the [MIT attribution](THIRD_PARTY_NOTICES.md)
 and [upstream license](LICENSE.tencent).

@@ -72,29 +72,30 @@ See [runtime requirements](../README.md#requirements) and the
 
 ### Existing native data
 
-The existing native `0.2.1` and this first Rolling use identical business code and
-schema: `PRAGMA user_version=1`, JSON `schema: 1`, and one `state` table with
-`id` and `json` columns. Only existing schema **1** is supported. A missing
-database can initialize fresh; an existing version 0/unknown schema or missing
-singleton row is rejected, not migrated. The declaration preserves both columns
-and has no migrations. This is unrelated to legacy CLI databases.
+Native data retains `PRAGMA user_version=1`, JSON `schema: 1`, and one `state`
+table with `id` and `json` columns. The thin adapter uses the additive JSON marker
+`adapter: 2`. On first startup it preserves pre-adapter JSON as an inert `legacy`
+snapshot and converts only protocol identity/deduplication/results, never pending
+work. See [the conversion contract](MODULE.md#upgrading-existing-native-data).
+A missing database initializes fresh; version 0/unknown schema or missing
+singleton row is rejected. The declaration preserves both columns and has no
+external migration commands. This is unrelated to former standalone CLI databases.
 
 Preserve the entire host-provided `modules/data/wechat` root **at the same
 absolute location**, plus host-held module configuration. This includes
 `credentials.json`, `native-v1.sqlite`, `incoming/` and `outgoing/`, all associated
 private files, owner/mode and bytes. Snapshot references are absolute paths.
-Do not reset account/peer identity, binding/generation, notification deduplication,
-inbox/outbox, cursor, questions, resolutions or unknown send records.
+Do not reset account/peer identity, binding identity, notification deduplication,
+cursor, results or the retained legacy snapshot.
 
 Prove preservation while the old service is drained and stopped, before starting
-the replacement. Restart may legitimately change interrupted `intent` stages to
-`unknown` and increment the revision; ordinary `onReady` activity can also write
-state, including archiving queued work in confirmed retired generations as
-described in [binding and availability](MODULE.md#binding-and-availability).
+the replacement. First startup legitimately adds `adapter: 2`, the original `legacy`
+snapshot and converted results, and increments the revision. Ordinary protocol
+activity can also write state.
 A consumer checking exact preserved JSON hashes only **after** startup
 cannot distinguish that normal behavior from data loss. Such a consumer must
 handle its stopped/pre-start verification boundary explicitly; never omit `json`
-from the declaration, suppress recovery, or claim an automatic migration merely
+from the declaration, suppress conversion, or invent a schema migration merely
 to make post-start byte equality pass. No restart retries or message replay are
 authorized by this contract.
 

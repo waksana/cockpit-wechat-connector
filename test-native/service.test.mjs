@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { copyFileSync,mkdtempSync,readFileSync,rmSync,writeFileSync } from 'node:fs';
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import fsPromises from 'node:fs/promises';
+import { syncBuiltinESMExports } from 'node:module';
 import { DatabaseSync } from 'node:sqlite';
-import { createCipheriv,createDecipheriv } from 'node:crypto';
-import { tmpdir } from 'node:os';
+import { createCipheriv, createDecipheriv } from 'node:crypto';
 import { join } from 'node:path';
 import { Store } from '../dist/state.js';
 import { BindingManager } from '../dist/binding.js';
@@ -11,776 +12,778 @@ import { Service } from '../dist/service.js';
 import { capabilities } from '../dist/index.js';
 import { WechatTransport } from '../dist/transport.js';
 
+function directory(t) {
+  const root = mkdtempSync(join(process.cwd(), '.wechat-service-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  return root;
+}
+function deferred() {
+  let resolve, reject;
+  const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
+  return { promise, resolve, reject };
+}
 function fixture(t) {
-  const root=mkdtempSync(join(tmpdir(),'wechat-native-'));
-  const stopping=new AbortController();
-  const signal=new AbortController();
-  const store=new Store(root,'fixture-account');
-  const calls=[];
-  const sent=[];
-  let events=[];
-  let meta={ sessionId: 'session-original',cwd: root,loaded: false,status: 'unloaded',ask: null };
+  const root = mkdtempSync(join(process.cwd(), '.wechat-service-'));
+  const source = join(root, 'source');
+  mkdirSync(source, { mode: 0o700 });
+  const stopping = new AbortController();
+  const signal = new AbortController();
+  const store = new Store(join(root, 'state'), 'fixture-account');
+  const calls = [], sent = [], reports = [];
+  let events = [];
+  let meta = { sessionId: 'session-original', cwd: source, loaded: false, status: 'unloaded', ask: null };
   let hook;
-  const context={
-    moduleId: 'wechat',dataRoot: root,apiVersion: 1,serviceReadyVersion: 1,shutdownVersion: 1,
-    stopping: stopping.signal,signal: signal.signal,config: {},report() { },invalidate() { },publish() { },
+  const context = {
+    moduleId: 'wechat', dataRoot: store.root, apiVersion: 1, serviceReadyVersion: 1, shutdownVersion: 1,
+    stopping: stopping.signal, signal: signal.signal, config: {},
+    report(error) { reports.push(error.message); }, invalidate() {}, publish() {},
     host: {
-      roleAssignmentVersion: 1,roleAvailabilityVersion: 1,sessionLoadVersion: 1,chatReadVersion: 1,
-      promptReceiptVersion: 1,askResponseVersion: 1,
-      async call(name,body) {
-        calls.push({ name,body });
-        if(hook) { const result=await hook(name,body); if(result!==undefined) return result; }
-        if(name==='session/get') return { meta };
-        if(name==='session/load') { meta={ ...meta,loaded: true,status: 'idle' }; return { ok: true,sessionId: body.sessionId }; }
-        if(name==='session/chat') return {
-          sessionId: body.sessionId,events: events.slice(-body.max),
-          source: body.source,direction: body.direction,cursor: 'cursor-1',cursorStatus: 'ok',hasMore: false
-        };
-        if(name==='prompt') return { ok: true,queued: true,messageId: 'native-receipt-not-event-uuid' };
-        if(name==='respondAsk') { meta.ask=null; return { ok: true }; }
-        throw new Error('UNEXPECTED_HOST_CALL');
+      roleAssignmentVersion: 1, roleAvailabilityVersion: 1, sessionLoadVersion: 1, chatReadVersion: 1,
+      promptReceiptVersion: 1, askResponseVersion: 1,
+      async call(name, body) {
+        calls.push({ name, body });
+        if (hook) { const result = await hook(name, body); if (result !== undefined) return result; }
+        if (name === 'session/get') return { meta };
+        if (name === 'session/load') {
+          meta = { ...meta, loaded: true, status: 'idle' };
+          return { ok: true, sessionId: body.sessionId };
+        }
+        if (name === 'session/chat') return page(body, events.slice(-body.max));
+        if (name === 'prompt') return { ok: true, messageId: `native-receipt-${body.text}` };
+        if (name === 'respondAsk') { meta.ask = null; return { ok: true }; }
+        assert.fail(`Unexpected host call: ${name}`);
       },
     },
   };
-  const config={ account: 'account',peer: 'peer',fileRoots: [root],webUrl: 'https://example.test',enabled: true,exclusiveAccountConfirmed: true };
-  const transport={
-    async send(items,token,clientId) { sent.push({ items,token,clientId }); return { messageId: String(sent.length+100) }; },
-    async poll() { return { messages: [],cursor: 'wx-cursor' }; }
+  const config = { account: 'account', peer: 'peer', fileRoots: [source], webUrl: 'https://example.test',
+    enabled: true, exclusiveAccountConfirmed: true };
+  const transport = {
+    async send(items, token, clientId) { sent.push({ items, token, clientId }); return { messageId: String(sent.length + 100) }; },
+    async poll() { return { messages: [], cursor: 'wx-cursor' }; },
   };
-  const service=new Service(context,config,store,transport);
-  const manager=new BindingManager(context,store,() => []);
+  const service = new Service(context, config, store, transport);
+  const manager = new BindingManager(context, store, () => []);
+  const services = [service];
   t.after(async () => {
     stopping.abort();
-    await service.stop();
+    await Promise.all(services.map(service => service.stop()));
     store.close();
-    rmSync(root,{ recursive: true,force: true });
+    rmSync(root, { recursive: true, force: true });
   });
   return {
-    root,store,calls,sent,context,config,stopping,service,manager,transport,
-    setMeta(value) { meta=value; },getMeta() { return meta; },setEvents(value) { events=value; },setHook(value) { hook=value; }
+    root, source, store, calls, sent, reports, context, config, stopping, signal, service, manager, transport,
+    setMeta(value) { meta = value; }, getMeta() { return meta; }, setEvents(value) { events = value; },
+    setHook(value) { hook = value; },
+    serviceWith(transport) {
+      const service = new Service(context, config, store, transport);
+      services.push(service);
+      return service;
+    },
   };
 }
-const selection={ operation: 'add',sessionId: 'session-original',roles: [{ moduleId: 'wechat',roleId: 'wechat' }],previousRoles: [] };
+const selection = { operation: 'add', sessionId: 'session-original',
+  roles: [{ moduleId: 'wechat', roleId: 'wechat' }], previousRoles: [] };
+const activeSignal = () => new AbortController().signal;
+function page(body, events, extra = {}) {
+  return { sessionId: body.sessionId, events, source: body.source, direction: body.direction,
+    cursor: 'history-cursor', cursorStatus: 'ok', hasMore: false, ...extra };
+}
 async function bind(f) {
-  await f.manager.saved({ ...selection,notificationId: 'notification-1' },new AbortController().signal);
+  await f.manager.saved({ ...selection, notificationId: 'notification-1' }, activeSignal());
   await f.service.tick();
 }
-function message(id,text='hello',extra={}) {
-  return {
-    id,text,account: 'account',peer: 'peer',contextToken: 'synthetic-context',
-    items: [{ type: 1,text_item: { text } }],quotes: [],...extra
-  };
+async function replace(f) {
+  f.setMeta(null);
+  assert.deepEqual((await f.manager.availability({ ...selection, sessionId: 'replacement' }, activeSignal())).reasons, []);
+  await f.manager.saved({ ...selection, sessionId: 'replacement', notificationId: 'replacement' }, activeSignal());
+  f.setMeta({ sessionId: 'replacement', cwd: f.source, loaded: true, status: 'idle', ask: null });
+  return f.store.read().binding;
 }
-test('required capabilities checked before activation can open storage',() => {
-  assert.throws(() => capabilities({ host: {} }),/REQUIRED_HOST_CAPABILITIES_MISSING/);
+function message(id, text = 'hello', extra = {}) {
+  return { id, text, account: 'account', peer: 'peer', contextToken: 'synthetic-context',
+    items: [{ type: 1, text_item: { text } }], quotes: [], ...extra };
+}
+function event(id, content, extra = {}) {
+  return { id, type: 'assistant.message', data: { content }, ...extra };
+}
+function observe(f, id, content, extra = {}) {
+  return f.service.observe({ sessionId: f.store.read().binding.sessionId, cwd: f.source,
+    event: event(id, content, extra) });
+}
+function inputs(f) { return f.store.read().receipts.filter(receipt => receipt.direction === 'input'); }
+function outputs(f) { return f.store.read().receipts.filter(receipt => receipt.direction === 'output'); }
+async function establishContext(f) {
+  await f.service.ingest([message('initial')], 'initial-cursor', f.store.read().binding);
+}
+
+test('required capabilities checked before activation can open storage', () => {
+  assert.throws(() => capabilities({ host: {} }), /REQUIRED_HOST_CAPABILITIES_MISSING/);
 });
-test('opaque item IDs survive polling while only envelope IDs deduplicate and resolve quotes',async t => {
-  const f=fixture(t);
+test('binding and ticks are passive; real input loads only the original ID and submits immediately', async t => {
+  const f = fixture(t);
   await bind(f);
-  let batch=0;
-  const transport=new WechatTransport({ account: 'account',peer: 'peer',token: 'synthetic-only' },async () => {
-    const itemId=batch++===0?'synthetic-part:alpha/001':'synthetic-part:changed/1';
-    return new Response(JSON.stringify({
-      get_updates_buf: `cursor-${batch}`,msgs: [{
-        message_id: '9007199254740993',from_user_id: 'peer',to_user_id: 'account',
-        message_type: 1,message_state: 2,context_token: 'fake-context',
-        item_list: [{ type: 1,msg_id: itemId,text_item: { text: 'first envelope' } }],
-      }, {
-        message_id: '9007199254740994',from_user_id: 'peer',to_user_id: 'account',
-        message_type: 1,message_state: 2,context_token: 'fake-context',
-        item_list: [{ type: 1,msg_id: itemId,text_item: { text: 'second envelope' },
-          ref_msg: { svr_id: '42',message_item: {
-            type: 1,msg_id: '9007199254740993',text_item: { text: 'provided context, not an envelope match' },
-          } } }],
-      }],
-    }));
+  await f.service.tick();
+  assert(!f.calls.some(call => ['session/load', 'prompt', 'session/new'].includes(call.name)));
+  assert((await f.manager.availability({ ...selection, sessionId: 'other' }, activeSignal()))
+    .reasons.some(reason => reason.code === 'BINDING_OCCUPIED'));
+  await f.service.ingest([message('1')], 'cursor-a', f.store.read().binding);
+  const mutations = f.calls.filter(call => ['session/load', 'prompt'].includes(call.name));
+  assert.deepEqual(mutations.map(call => call.name), ['session/load', 'prompt']);
+  assert(mutations.every(call => call.body.sessionId === 'session-original'));
+  assert.equal(mutations[1].body.mode, 'immediate');
+  assert.equal(inputs(f)[0].status, 'accepted');
+  assert.equal(inputs(f)[0].nativeMessageId, 'native-receipt-hello');
+  assert.equal(f.store.read().adapter, 2);
+  for (const obsolete of ['inputs', 'outputs', 'retired', 'questions', 'fault']) assert(!(obsolete in f.store.read()));
+  await f.service.ingest([message('1', 'duplicate')], 'cursor-b', f.store.read().binding);
+  assert.equal(inputs(f).length, 1);
+  assert.equal(f.store.read().cursor, 'cursor-b');
+  assert.equal(f.calls.filter(call => call.name === 'prompt').length, 1);
+});
+test('busy native sessions receive ordinary immediate prompts without cancellation or queue management', async t => {
+  const f = fixture(t);
+  await bind(f);
+  f.setMeta({ ...f.getMeta(), loaded: true, status: 'running', processing: true });
+  await f.service.ingest([message('1'), message('2', 'second')], 'cursor', f.store.read().binding);
+  assert.deepEqual(f.calls.filter(call => call.name === 'prompt').map(call => call.body.mode), ['immediate', 'immediate']);
+  assert(f.calls.every(call => ['session/get', 'session/chat', 'prompt'].includes(call.name)));
+  assert(inputs(f).every(receipt => receipt.status === 'accepted'));
+});
+test('opaque item IDs never replace envelope IDs for deduplication or exact quotes', async t => {
+  const f = fixture(t);
+  await bind(f);
+  let batch = 0;
+  const transport = new WechatTransport({ account: 'account', peer: 'peer', token: 'synthetic-only' }, async () => {
+    const itemId = batch++ === 0 ? 'synthetic-part:alpha/001' : 'changed-item-id';
+    return new Response(JSON.stringify({ get_updates_buf: `cursor-${batch}`, msgs: [
+      ['9007199254740993', 'first envelope'], ['9007199254740994', 'second envelope'],
+    ].map(([id, text], index) => ({
+      message_id: id, from_user_id: 'peer', to_user_id: 'account', message_type: 1, message_state: 2,
+      context_token: 'fake-context', item_list: [{ type: 1, msg_id: itemId, text_item: { text },
+        ...(index ? { ref_msg: { svr_id: '42', message_item: {
+          type: 1, msg_id: '9007199254740993', text_item: { text: 'not an envelope match' },
+        } } } : {}) }],
+    })) }));
   });
-  const service=new Service(f.context,f.config,f.store,transport);
+  const service = f.serviceWith(transport);
   await service.poll();
-  assert.equal(f.store.read().inputs.length,2);
-  assert.equal(f.store.read().inputs[0].message.items[0].msg_id,'synthetic-part:alpha/001');
-  assert.equal(f.store.read().cursor,'cursor-1');
-  await service.tick();
-  await service.tick();
   await service.poll();
-  await service.tick();
-  const inputs=f.store.read().inputs;
-  assert.equal(inputs.length,2);
-  assert(inputs.every(input => input.stage==='accepted'));
-  assert.equal(inputs[0].key,'account:9007199254740993');
-  assert.equal(inputs[1].key,'account:9007199254740994');
-  assert.equal(f.store.read().cursor,'cursor-2');
-  const prompts=f.calls.filter(call => call.name==='prompt');
-  assert.equal(prompts.length,2);
-  assert(prompts[1].body.text.includes('"resolution":"unresolved"'));
-  assert(!prompts[1].body.text.includes('exact-local-id'));
+  assert.deepEqual(inputs(f).map(receipt => receipt.key), ['account:9007199254740993', 'account:9007199254740994']);
+  assert(inputs(f).every(receipt => receipt.status === 'accepted'));
+  assert.equal(f.store.read().cursor, 'cursor-2');
+  const prompts = f.calls.filter(call => call.name === 'prompt');
+  assert.equal(prompts.length, 2);
+  assert.match(prompts[1].body.text, /"resolution":"unresolved"/);
 });
-test('without Files, encrypted incoming attachments and immutable outgoing copies traverse native prompt and CDN',async t => {
-  const f=fixture(t);
+test('encrypted CDN file, image and video traverse native attachments, immutable capture and exact outgoing quotes', async t => {
+  const f = fixture(t);
   await bind(f);
-  const sourceRoot=mkdtempSync(join(tmpdir(),'wechat-source-'));
-  t.after(() => rmSync(sourceRoot,{ recursive: true,force: true }));
-  const key=Buffer.alloc(16,7);
-  const original=Buffer.from('incoming fixture');
-  const cipher=createCipheriv('aes-128-ecb',key,null);
-  const ciphertext=Buffer.concat([cipher.update(original),cipher.final()]);
-  const sends=[];
+  const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+ip1sAAAAASUVORK5CYII=', 'base64');
+  const video = Buffer.from('000000186674797069736f6d0000020069736f6d69736f32', 'hex');
+  const fixtures = [
+    { type: 4, name: 'in.txt', bytes: Buffer.from('incoming fixture') },
+    { type: 2, name: 'in.png', bytes: png },
+    { type: 5, name: 'in.mp4', bytes: video },
+  ];
+  const key = Buffer.alloc(16, 7);
+  const encrypted = fixtures.map(({ bytes }) => {
+    const cipher = createCipheriv('aes-128-ecb', key, null);
+    return Buffer.concat([cipher.update(bytes), cipher.final()]);
+  });
+  const sends = [], uploads = [];
   let uploadKey;
-  let uploaded;
-  const transport=new WechatTransport({ account: 'account',peer: 'peer',token: 'synthetic-only' },async (url,init) => {
-    if(url.pathname==='/ilink/bot/getupdates') return new Response(JSON.stringify({
-      get_updates_buf: 'with-file',msgs: [{
-        message_id: '700',from_user_id: 'peer',to_user_id: 'account',
-        message_type: 1,message_state: 2,context_token: 'fake-context',
-        item_list: [{
-          type: 4,msg_id: 'synthetic-file-part/001',file_item: {
-            file_name: 'in.txt',len: String(original.length),
-            media: { encrypt_query_param: 'fake',aes_key: key.toString('base64'),encrypt_type: 1 }
-          }
-        }]
-      }],
+  const transport = new WechatTransport({ account: 'account', peer: 'peer', token: 'synthetic-only' }, async (url, init) => {
+    if (url.pathname === '/ilink/bot/getupdates') return new Response(JSON.stringify({
+      get_updates_buf: 'media', msgs: fixtures.map(({ type, name, bytes }, index) => {
+        const media = { encrypt_query_param: String(index), aes_key: key.toString('base64'), encrypt_type: 1 };
+        const body = type === 4 ? { file_item: { file_name: name, len: String(bytes.length), media } }
+          : type === 2 ? { image_item: { media } } : { video_item: { media, video_size: bytes.length } };
+        return { message_id: String(700 + index), from_user_id: 'peer', to_user_id: 'account',
+          message_type: 1, message_state: 2, context_token: 'fake-context',
+          item_list: [{ type, msg_id: `media-part/${index}`, ...body }] };
+      }),
     }));
-    if(url.pathname==='/c2c/download') return new Response(ciphertext);
-    if(url.pathname==='/ilink/bot/getuploadurl') {
-      uploadKey=Buffer.from(JSON.parse(init.body).aeskey,'hex');
+    if (url.pathname === '/c2c/download') return new Response(encrypted[Number(url.searchParams.get('encrypted_query_param'))]);
+    if (url.pathname === '/ilink/bot/getuploadurl') {
+      uploadKey = Buffer.from(JSON.parse(init.body).aeskey, 'hex');
       return new Response(JSON.stringify({ upload_param: 'fake-upload' }));
     }
-    if(url.pathname==='/c2c/upload') {
-      const decrypt=createDecipheriv('aes-128-ecb',uploadKey,null);
-      uploaded=Buffer.concat([decrypt.update(init.body),decrypt.final()]);
-      return new Response('',{ headers: { 'x-encrypted-param': 'fake-receipt' } });
+    if (url.pathname === '/c2c/upload') {
+      const decipher = createDecipheriv('aes-128-ecb', uploadKey, null);
+      uploads.push(Buffer.concat([decipher.update(init.body), decipher.final()]));
+      return new Response('', { headers: { 'x-encrypted-param': 'fake-receipt' } });
     }
-    if(url.pathname==='/ilink/bot/sendmessage') {
-      sends.push(JSON.parse(init.body).msg);
-      return new Response(JSON.stringify({ message_id: String(800+sends.length) }));
-    }
-    assert.fail(`Unexpected endpoint ${url.pathname}`);
+    assert.equal(url.pathname, '/ilink/bot/sendmessage');
+    sends.push(JSON.parse(init.body).msg);
+    if (sends.length === 1) for (const item of fixtures) writeFileSync(join(f.source, item.name), 'mutated after capture, before upload');
+    return new Response(JSON.stringify({ message_id: String(800 + sends.length) }));
   });
-  const service=new Service(f.context,{ ...f.config,fileRoots: [sourceRoot] },f.store,transport);
+  const service = f.serviceWith(transport);
   await service.poll();
-  await service.tick();
-  const prompt=f.calls.find(call => call.name==='prompt');
-  assert.equal(prompt.body.attachments[0].type,'file');
-  assert.deepEqual(readFileSync(prompt.body.attachments[0].path),original);
-  const source=join(sourceRoot,'out.txt');
-  writeFileSync(source,'frozen output');
-  await service.observe({
-    sessionId: 'session-original',cwd: sourceRoot,event: {
-      id: 'file-reply',type: 'assistant.message',data: { content: `[result](${source})` },
-    }
-  });
-  writeFileSync(source,'changed after live capture');
-  await service.tick();
-  assert.equal(uploaded.toString(),'frozen output');
-  assert(sends.some(send => send.item_list[0].type===4));
-  assert(f.calls.every(call => ['session/get','session/chat','session/load','prompt'].includes(call.name)));
-  const fileSendIndex=sends.findIndex(send => send.item_list[0].type===4);
-  service.ingest([message('701','Quote file',{
-    items: [{
-      type: 1,text_item: { text: 'Quote file' },
-      ref_msg: { svr_id: String(801+fileSendIndex),message_item: { type: 4,msg_id: 'synthetic-file-part/quoted' } }
-    }]
-  })],'quote-cursor',f.store.read().binding);
-  await service.tick();
-  const quotePrompt=f.calls.filter(call => call.name==='prompt').at(-1);
-  assert.equal(readFileSync(quotePrompt.body.attachments[0].path,'utf8'),'frozen output');
-  await service.stop();
+  const prompts = f.calls.filter(call => call.name === 'prompt');
+  assert.equal(prompts.length, 3);
+  for (const [index, prompt] of prompts.entries()) {
+    assert.equal(prompt.body.attachments[0].type, 'file');
+    assert.deepEqual(readFileSync(prompt.body.attachments[0].path), fixtures[index].bytes);
+    assert.equal(statSync(prompt.body.attachments[0].path).mode & 0o777, 0o400);
+  }
+  for (const item of fixtures) writeFileSync(join(f.source, item.name), item.bytes);
+  await service.observe({ sessionId: 'session-original', cwd: f.source,
+    event: event('media-reply', fixtures.map(item => `[result](${join(f.source, item.name)})`).join('\n')) });
+  for (const item of fixtures) writeFileSync(join(f.source, item.name), 'mutated source');
+  assert.deepEqual(uploads, fixtures.map(item => item.bytes));
+  assert.deepEqual(sends.filter(send => send.item_list[0].type !== 1).map(send => send.item_list[0].type), [4, 2, 5]);
+  const output = outputs(f).find(receipt => receipt.key.endsWith(':media-reply'));
+  assert.equal(output.status, 'accepted');
+  for (const file of output.media) assert.equal(statSync(file.path).mode & 0o777, 0o400);
+  const retained = output.sent.find(part => part.file?.name === 'in.txt');
+  await service.ingest([message('703', 'Quote file', { items: [{
+    type: 1, text_item: { text: 'Quote file' }, ref_msg: { svr_id: retained.messageId,
+      message_item: { type: 4, msg_id: 'unrelated-item-id' } },
+  }] })], 'quote-cursor', f.store.read().binding);
+  const quoted = f.calls.filter(call => call.name === 'prompt').at(-1).body;
+  assert.match(quoted.text, /exact-local-id/);
+  assert.deepEqual(readFileSync(quoted.attachments[0].path), fixtures[0].bytes);
 });
-test('unloaded binding is occupied; only inbound loads original ID; receipts are not event UUIDs',async t => {
-  const f=fixture(t);
+test('live primary snapshots send immediately and deduplicate by event ID, not native message ID', async t => {
+  const f = fixture(t);
   await bind(f);
-  assert.equal(f.calls.some(call => ['prompt','session/load'].includes(call.name)),false);
-  const other=await f.manager.availability({ ...selection,sessionId: 'other' },new AbortController().signal);
-  assert(other.reasons.some(reason => reason.code==='BINDING_OCCUPIED'));
-  f.service.ingest([message('1')],'cursor-a',f.store.read().binding);
-  await f.service.tick();
-  const mutation=f.calls.filter(call => ['prompt','session/load'].includes(call.name));
-  assert.deepEqual(mutation.map(call => call.name),['session/load','prompt']);
-  assert(mutation.every(call => call.body.sessionId==='session-original'));
-  assert.equal(f.store.read().inputs[0].messageId,'native-receipt-not-event-uuid');
-  await f.service.observe({
-    sessionId: 'session-original',cwd: f.root,event: {
-      id: 'event-uuid',type: 'user.message',data: { messageId: 'native-receipt-not-event-uuid',content: 'hello' },
-    }
-  });
-  assert.equal(f.store.read().inputs[0].reason,'NATIVE_MESSAGE_OBSERVED');
-  f.service.ingest([message('1')],'cursor-b',f.store.read().binding);
-  assert.equal(f.store.read().inputs.length,1);
+  await establishContext(f);
+  for (const [id, content] of [['a', 'First'], ['b', 'Updated'], ['a', 'duplicate']])
+    await observe(f, id, content, { data: { messageId: 'same-native-id', content } });
+  for (const extra of [{ ephemeral: true }, { agentId: 'child' }, { parentToolCallId: 'tool' },
+    { data: { content: 'child', agentId: 'child' } }, { data: { content: 'child', parentToolCallId: 'tool' } }])
+    await observe(f, `ignored-${JSON.stringify(extra)}`, 'ignored', extra);
+  assert.deepEqual(f.sent.map(send => send.items[0].text_item.text), ['First', 'Updated']);
+  assert.equal(outputs(f).length, 2);
+  assert(outputs(f).every(receipt => receipt.status === 'accepted'));
 });
-test('availability aggregates configuration, occupied, unresolved and unknown without destructive cleanup',async t => {
-  const f=fixture(t);
-  await bind(f);
-  f.store.change(state => { state.fault='UNKNOWN_SEND'; });
-  const manager=new BindingManager(f.context,f.store,() => ['MISSING_CONFIG']);
-  f.setHook(name => { if(name==='session/get') throw new Error('404'); });
-  const result=await manager.availability({ ...selection,sessionId: 'other' },new AbortController().signal);
-  assert.deepEqual(new Set(result.reasons.map(reason => reason.code)),
-    new Set(['MISSING_CONFIG','UNRESOLVED_HISTORY','BINDING_EXISTENCE_UNKNOWN','BINDING_OCCUPIED']));
-  assert.equal(f.store.read().binding.sessionId,'session-original');
-});
-test('saved replay is idempotent; competing bindings cannot both win',async t => {
-  const f=fixture(t);
-  await bind(f);
-  const generation=f.store.read().generation;
-  await f.manager.saved({ ...selection,notificationId: 'notification-1' },new AbortController().signal);
-  assert.equal(f.store.read().generation,generation);
-  await assert.rejects(f.manager.saved({ ...selection,sessionId: 'other',notificationId: 'notification-2' },
-    new AbortController().signal),/BINDING_OCCUPIED/);
-  assert.equal(f.store.read().notifications.length,1);
-});
-test('late missing query cannot retire a newer generation; abort forbids cleanup',async t => {
-  const f=fixture(t);
-  await bind(f);
-  let resolve;
-  f.setHook(name => name==='session/get'? new Promise(done => { resolve=done; }):undefined);
-  const pending=f.manager.availability({ ...selection,sessionId: 'other' },new AbortController().signal);
-  f.store.change(state => { state.generation++; state.binding={ sessionId: 'new',generation: state.generation }; });
-  resolve({ meta: null });
-  await pending;
-  assert.equal(f.store.read().binding.sessionId,'new');
-  const abort=new AbortController();
-  const late=f.manager.availability(selection,abort.signal);
-  abort.abort();
-  resolve({ meta: null });
-  await late;
-  assert.equal(f.store.read().binding.sessionId,'new');
-});
-test('authoritative deletion archives queued work, preserves unknowns and allows new-generation traffic',async t => {
-  const f=fixture(t);
-  await bind(f);
-  const old=f.store.read().binding;
-  f.service.ingest([message('1'),message('2')],'cursor',old);
-  for(const id of ['unknown','queued']) await f.service.observe({
-    sessionId: old.sessionId,cwd: f.root,event: { id,type: 'assistant.message',data: { content: `old ${id}` } },
-  });
-  f.store.change(state => {
-    state.inputs[0].stage='unknown'; state.inputs[0].reason='PROMPT_OUTCOME_UNKNOWN';
-    state.outputs[0].stage='unknown'; state.outputs[0].parts[0].stage='unknown';
-    state.outputs[0].reason='WECHAT_API_REJECTED';
-  });
-  const unknown=f.store.read().outputs[0];
-  f.setMeta(null);
-  const result=await f.manager.availability({ ...selection,sessionId: 'other' },new AbortController().signal);
-  assert.equal(f.store.read().binding,null);
-  assert.deepEqual(result.reasons,[]);
-  const retired=f.store.read();
-  await f.manager.availability({ ...selection,sessionId: 'other' },new AbortController().signal);
-  assert.deepEqual(f.store.read(),retired);
-  assert.deepEqual(retired.outputs[0],unknown);
-  assert.equal(retired.inputs[0].stage,'unknown');
-  assert.equal(retired.inputs[1].stage,'abandoned');
-  assert.equal(retired.outputs[1].stage,'abandoned');
-  assert.equal(retired.outputs[1].parts[0].stage,'abandoned');
-  assert.equal(retired.outputs[1].reason,'RETIRED_BINDING_NOT_SCHEDULED');
-  f.setMeta({ sessionId: 'other',cwd: f.root,loaded: true,status: 'idle',ask: null });
-  await f.manager.saved({ ...selection,sessionId: 'other',notificationId: 'new' },new AbortController().signal);
-  const binding=f.store.read().binding;
-  assert(binding.generation>old.generation);
-  await f.service.observe({
-    sessionId: old.sessionId,cwd: f.root,event: { id: 'late',type: 'assistant.message',data: { content: 'do not mirror' } },
-  });
-  f.transport.poll=async () => ({
-    messages: [message('fresh','new input',{ createdAt: binding.boundAt+1 })],cursor: 'new-cursor',
-  });
-  await f.service.poll();
-  await f.service.tick();
-  await f.service.observe({
-    sessionId: 'other',cwd: f.root,event: { id: 'fresh',type: 'assistant.message',data: { content: 'new reply' } },
-  });
-  await f.service.tick();
-  assert.deepEqual(f.calls.filter(call => call.name==='prompt').map(call => call.body.sessionId),['other']);
-  assert.deepEqual(f.sent.map(send => send.items[0].text_item.text),['new reply']);
-  assert.deepEqual(f.store.read().outputs[0],unknown);
-  await f.manager.saved({ ...selection,notificationId: 'notification-1' },new AbortController().signal);
-  assert.equal(f.store.read().binding.sessionId,'other');
-});
-test('saved reconciles deletion even without a preflight',async t => {
-  const f=fixture(t);
-  await bind(f);
-  f.service.ingest([message('old')],'cursor',f.store.read().binding);
-  f.setMeta(null);
-  await f.manager.saved({ ...selection,sessionId: 'other',notificationId: 'new' },new AbortController().signal);
-  assert.equal(f.store.read().binding.sessionId,'other');
-  assert.equal(f.store.read().inputs[0].stage,'abandoned');
-});
-test('non-authoritative existence results and cancellation cannot release a binding',async t => {
-  for(const kind of ['throw','malformed','wrong-session','cancel','stopping','unloaded','idle']) await t.test(kind,async t => {
-    const f=fixture(t);
+test('failed and ambiguous submissions never replay on duplicate poll, tick or restart and do not block later input', async t => {
+  for (const kind of ['load-timeout', 'prompt-timeout', 'missing']) await t.test(kind, async t => {
+    const f = fixture(t);
     await bind(f);
-    const before=f.store.read();
-    const abort=new AbortController();
+    if (kind !== 'load-timeout') f.setMeta({ ...f.getMeta(), loaded: true, status: 'idle' });
     f.setHook(name => {
-      if(name!=='session/get') return;
-      if(kind==='throw') throw new Error('not found');
-      if(kind==='malformed') return {};
-      if(kind==='wrong-session') return { meta: { ...f.getMeta(),sessionId: 'different' } };
-      if(kind==='cancel') { abort.abort(); return { meta: null }; }
-      if(kind==='stopping') { f.stopping.abort(); return { meta: null }; }
-      return { meta: { ...f.getMeta(),loaded: kind==='idle',status: kind } };
+      if (kind === 'missing' && name === 'session/get') return { meta: null };
+      if (name === (kind === 'load-timeout' ? 'session/load' : 'prompt')) throw new Error('timeout');
     });
-    const result=await f.manager.availability({ ...selection,sessionId: 'other' },abort.signal);
-    assert(result.reasons.some(reason => reason.code==='BINDING_OCCUPIED'));
-    assert.deepEqual(f.store.read(),before);
-    await assert.rejects(f.manager.saved({ ...selection,sessionId: 'other',notificationId: 'new' },abort.signal));
-    assert.deepEqual(f.store.read(),before);
-  });
-});
-test('retired history does not mask faults, configuration problems or unretired unknowns',async t => {
-  const f=fixture(t);
-  await bind(f);
-  f.setMeta(null);
-  await f.manager.availability(selection,new AbortController().signal);
-  f.store.change(state => {
-    state.fault='HISTORY_ANCHOR_MISSING';
-    state.inputs.push({ key: 'unretired',generation: state.generation,message: message('unretired'),stage: 'unknown' });
-  });
-  const manager=new BindingManager(f.context,f.store,() => ['MISSING_CONFIG']);
-  const result=await manager.availability(selection,new AbortController().signal);
-  assert.deepEqual(new Set(result.reasons.map(reason => reason.code)),new Set(['MISSING_CONFIG','UNRESOLVED_HISTORY']));
-  await assert.rejects(f.manager.saved({ ...selection,notificationId: 'new' },new AbortController().signal),/UNRESOLVED_HISTORY/);
-});
-test('simultaneous replacement saves commit at most one winner',async t => {
-  const f=fixture(t);
-  await bind(f);
-  f.setMeta(null);
-  await f.manager.availability(selection,new AbortController().signal);
-  const releases=[];
-  f.setHook((name,body) => name==='session/chat'?new Promise(resolve => {
-    releases.push(() => resolve({
-      sessionId: body.sessionId,source: body.source,direction: body.direction,
-      cursorStatus: 'ok',events: [],cursor: 'cursor',hasMore: false,
-    }));
-  }):undefined);
-  const first=f.manager.saved({ ...selection,sessionId: 'one',notificationId: 'one' },new AbortController().signal);
-  const second=f.manager.saved({ ...selection,sessionId: 'two',notificationId: 'two' },new AbortController().signal);
-  // Both saved callbacks must finish their asynchronous anchor read before competing at the CAS.
-  while(releases.length<2) await new Promise(resolve => setImmediate(resolve));
-  for(const release of releases) release();
-  const results=await Promise.allSettled([first,second]);
-  assert.equal(results.filter(result => result.status==='fulfilled').length,1);
-  assert.match(results.find(result => result.status==='rejected').reason.message,/BINDING_CHANGED/);
-  assert.equal(f.store.read().notifications.length,2);
-});
-test('already-retired legacy queues and crash intents recover without deleting unknown history',async t => {
-  const f=fixture(t);
-  await bind(f);
-  f.service.ingest([message('old')],'cursor',f.store.read().binding);
-  const root=mkdtempSync(join(tmpdir(),'wechat-retired-restart-'));
-  copyFileSync(join(f.root,'native-v1.sqlite'),join(root,'native-v1.sqlite'));
-  const db=new DatabaseSync(join(root,'native-v1.sqlite'));
-  const state=f.store.read();
-  state.retired.push({ sessionId: state.binding.sessionId,generation: state.generation,at: Date.now() });
-  state.binding=null; state.generation++;
-  state.outputs.push({
-    key: 'unknown',generation: 1,stage: 'unknown',kind: 'reply',text: 'old',files: [],
-    parts: [{ stage: 'unknown',clientId: 'old-unknown' }],reason: 'WECHAT_API_REJECTED',
-  },{
-    key: 'crash',generation: 1,stage: 'intent',kind: 'reply',text: 'old send',files: [],
-    parts: [{ stage: 'intent',clientId: 'old-intent' }],
-  },{
-    key: 'queued',generation: 1,stage: 'queued',kind: 'reply',text: 'old queue',files: [],
-    parts: [{ stage: 'queued',clientId: 'old-queue' }],
-  });
-  db.prepare('UPDATE state SET json=? WHERE id=1').run(JSON.stringify(state)); db.close();
-  const recovered=new Store(root,'fixture-account');
-  t.after(() => { recovered.close(); rmSync(root,{ recursive: true,force: true }); });
-  const manager=new BindingManager(f.context,recovered,() => []);
-  assert.deepEqual((await manager.availability(selection,new AbortController().signal)).reasons,[]);
-  await manager.saved({ ...selection,sessionId: 'replacement',notificationId: 'replacement' },new AbortController().signal);
-  assert.equal(recovered.read().binding.sessionId,'replacement');
-  assert.equal(recovered.read().inputs[0].stage,'abandoned');
-  assert.deepEqual(recovered.read().outputs.map(output => output.stage),['unknown','unknown','abandoned']);
-  assert.deepEqual(recovered.read().outputs[0],state.outputs[0]);
-  assert.deepEqual(recovered.read().notifications,['notification-1','replacement']);
-  assert.equal(recovered.read().cursor,'cursor');
-});
-test('retired in-flight sends settle once and unsent multipart tails never resume',async t => {
-  const f=fixture(t);
-  await bind(f);
-  f.service.ingest([message('1')],'cursor',f.store.read().binding);
-  await f.service.tick();
-  await f.service.observe({
-    sessionId: 'session-original',cwd: f.root,event: { id: 'long',type: 'assistant.message',data: { content: 'x'.repeat(4000) } },
-  });
-  let release;
-  let entered;
-  const started=new Promise(resolve => { entered=resolve; });
-  let sends=0;
-  f.transport.send=() => { sends++; entered(); return new Promise(resolve => { release=resolve; }); };
-  const tick=f.service.tick();
-  await started;
-  f.setMeta(null);
-  const result=await f.manager.availability({ ...selection,sessionId: 'replacement' },new AbortController().signal);
-  assert.deepEqual(result.reasons.map(reason => reason.code),['RETIRED_WORK_IN_FLIGHT']);
-  await assert.rejects(f.manager.saved({ ...selection,sessionId: 'replacement',notificationId: 'new' },
-    new AbortController().signal),/RETIRED_WORK_IN_FLIGHT/);
-  release({ messageId: 'confirmed-old-send' });
-  await tick;
-  assert.deepEqual(f.store.read().outputs[0].parts.map(part => part.stage),['accepted','abandoned']);
-  assert.equal(f.store.read().outputs[0].stage,'abandoned');
-  assert.equal(f.store.read().fault,undefined);
-  assert.deepEqual((await f.manager.availability(selection,new AbortController().signal)).reasons,[]);
-  await f.manager.saved({ ...selection,sessionId: 'replacement',notificationId: 'new' },new AbortController().signal);
-  assert.equal(sends,1);
-});
-test('deletion during passive submit lookup never loads or prompts the retired session',async t => {
-  const f=fixture(t);
-  await bind(f);
-  f.service.ingest([message('1')],'cursor',f.store.read().binding);
-  let gets=0;
-  let release;
-  let entered;
-  const started=new Promise(resolve => { entered=resolve; });
-  f.setHook(name => {
-    if(name==='session/get' && ++gets===2) return new Promise(resolve => { release=resolve; entered(); });
-  });
-  const tick=f.service.tick();
-  await started;
-  const oldMeta=f.getMeta();
-  f.setMeta(null);
-  await f.manager.availability(selection,new AbortController().signal);
-  await f.manager.saved({ ...selection,sessionId: 'replacement',notificationId: 'new' },new AbortController().signal);
-  release({ meta: oldMeta });
-  await tick;
-  assert.equal(f.calls.some(call => ['session/load','prompt'].includes(call.name)),false);
-  assert.equal(f.store.read().fault,undefined);
-  assert.equal(f.store.read().binding.sessionId,'replacement');
-});
-test('retired load and prompt effects retain their actual outcome without replay',async t => {
-  for(const kind of ['load','prompt-accepted','prompt-unknown']) await t.test(kind,async t => {
-    const f=fixture(t);
-    await bind(f);
-    if(kind!=='load') f.setMeta({ ...f.getMeta(),loaded: true,status: 'idle' });
-    f.service.ingest([message('effect')],'cursor',f.store.read().binding);
-    let release;
-    let entered;
-    const started=new Promise(resolve => { entered=resolve; });
-    const effect=kind==='load'?'session/load':'prompt';
-    f.setHook(name => {
-      if(name===effect) return new Promise((resolve,reject) => {
-        release=() => kind==='prompt-unknown'?reject(new Error('OUTCOME_UNKNOWN'))
-          :resolve(kind==='load'?{ ok: true,sessionId: 'session-original' }:{ ok: true,messageId: 'old-receipt' });
-        entered();
-      });
-    });
-    const tick=f.service.tick();
-    await started;
-    f.setMeta(null);
-    assert.deepEqual((await f.manager.availability(selection,new AbortController().signal)).reasons.map(reason => reason.code),
-      ['RETIRED_WORK_IN_FLIGHT']);
-    release();
-    await tick;
-    assert.equal(f.store.read().inputs[0].stage,kind==='load'?'abandoned':kind==='prompt-accepted'?'accepted':'unknown');
-    assert.deepEqual((await f.manager.availability(selection,new AbortController().signal)).reasons,[]);
-    await f.manager.saved({ ...selection,sessionId: 'replacement',notificationId: 'new' },new AbortController().signal);
-    f.setMeta({ sessionId: 'replacement',cwd: f.root,loaded: true,status: 'idle',ask: null });
+    await f.service.ingest([message('bad')], 'bad-cursor', f.store.read().binding);
+    assert.equal(inputs(f)[0].status, kind === 'missing' ? 'failed' : 'unknown');
+    f.setHook(undefined);
+    const before = f.calls.filter(call => ['session/load', 'prompt'].includes(call.name)).length;
+    f.transport.poll = async () => ({ messages: [message('bad')], cursor: 'duplicate' });
     await f.service.tick();
-    assert.equal(f.calls.filter(call => call.name===effect).length,1);
-    assert.equal(f.store.read().fault,undefined);
+    await f.service.poll();
+    const restarted = f.serviceWith(f.transport);
+    await restarted.tick();
+    await restarted.poll();
+    assert.equal(f.calls.filter(call => ['session/load', 'prompt'].includes(call.name)).length, before);
+    await restarted.ingest([message('good', 'later')], 'good-cursor', f.store.read().binding);
+    assert.equal(inputs(f).at(-1).status, 'accepted');
+    assert.equal(f.calls.filter(call => call.name === 'prompt').at(-1).body.text, 'later');
+    assert(!f.calls.some(call => call.name === 'session/new'));
   });
 });
-test('retirement during upload stops before send and keeps the unknown upload intent',async t => {
-  const f=fixture(t);
+test('failed and timeout outputs are diagnostic receipts, not a barrier or a retry schedule', async t => {
+  const f = fixture(t);
   await bind(f);
-  f.store.change(state => { state.binding.contextToken='old-context'; });
-  const sourceRoot=mkdtempSync(join(tmpdir(),'wechat-upload-source-'));
-  t.after(() => rmSync(sourceRoot,{ recursive: true,force: true }));
-  const file=join(sourceRoot,'attachment.txt');
-  writeFileSync(file,'frozen fixture');
-  const service=new Service(f.context,{ ...f.config,fileRoots: [sourceRoot] },f.store,f.transport);
-  await service.observe({
-    sessionId: 'session-original',cwd: sourceRoot,event: { id: 'upload',type: 'assistant.message',data: { content: `[file](${file})` } },
-  });
-  let release;
-  let entered;
-  const started=new Promise(resolve => { entered=resolve; });
-  let uploads=0;
-  f.transport.call=async () => ({ upload_param: 'fake-upload' });
-  f.transport.request=() => { uploads++; entered(); return new Promise(resolve => { release=resolve; }); };
-  const tick=service.tick();
-  await started;
-  f.setMeta(null);
-  assert.deepEqual((await f.manager.availability(selection,new AbortController().signal)).reasons.map(reason => reason.code),
-    ['RETIRED_WORK_IN_FLIGHT']);
-  release({ headers: new Headers({ 'x-encrypted-param': 'fake-receipt' }) });
-  await tick;
-  assert.equal(uploads,1);
-  assert.equal(f.sent.length,1); // Text part was sent before the file upload began.
-  assert.equal(f.store.read().outputs[0].stage,'unknown');
-  assert.equal(f.store.read().outputs[0].reason,'BINDING_CHANGED');
-  assert.equal(f.store.read().outputs[0].parts.at(-1).stage,'unknown');
-  assert.deepEqual((await f.manager.availability(selection,new AbortController().signal)).reasons,[]);
-  await service.stop();
-});
-test('unknown prompt is persisted and never automatically retried',async t => {
-  const f=fixture(t);
-  await bind(f);
-  f.setHook(name => { if(name==='prompt') throw new Error('timeout'); });
-  f.service.ingest([message('1')],'cursor',f.store.read().binding);
-  await f.service.tick();
-  assert.equal(f.store.read().inputs[0].stage,'unknown');
-  await f.service.tick();
-  assert.equal(f.calls.filter(call => call.name==='prompt').length,1);
-});
-test('AskUser is sent as text; following text answers exact request, never prompt',async t => {
-  const f=fixture(t);
-  await bind(f);
-  f.service.ingest([message('1')],'cursor',f.store.read().binding);
-  await f.service.tick();
-  f.getMeta().ask={ requestId: 'ask-1',question: 'Which color?',choices: ['Blue','Green'],allowFreeform: true };
-  await f.service.tick();
-  assert.match(f.sent.at(-1).items[0].text_item.text,/Which color/);
-  f.service.ingest([message('2','Blue')],'cursor-2',f.store.read().binding);
-  await f.service.tick();
-  const answer=f.calls.find(call => call.name==='respondAsk');
-  assert.deepEqual(answer.body,{ sessionId: 'session-original',requestId: 'ask-1',answer: 'Blue',wasFreeform: false });
-  assert.equal(f.calls.filter(call => call.name==='prompt').length,1);
-});
-test('freeform answer obeys native allowFreeform and exact question identity',async t => {
-  const f=fixture(t);
-  await bind(f);
-  f.service.ingest([message('1')],'cursor',f.store.read().binding);
-  await f.service.tick();
-  f.getMeta().ask={ requestId: 'ask-1',question: 'Which?',choices: ['Blue'],allowFreeform: false };
-  await f.service.tick();
-  f.service.ingest([message('2','custom')],'cursor-2',f.store.read().binding);
-  await f.service.tick();
-  assert.equal(f.calls.filter(call => call.name==='respondAsk').length,0);
-  assert.equal(f.store.read().inputs[1].stage,'rejected');
-  f.service.ingest([message('3','Blue')],'cursor-3',f.store.read().binding);
-  f.getMeta().ask={ requestId: 'ask-2',question: 'Different?' };
-  await f.service.tick();
-  assert.equal(f.calls.filter(call => call.name==='respondAsk').length,0);
-  assert.equal(f.store.read().inputs[2].stage,'rejected');
-});
-test('Web answered question never falls through to a new prompt',async t => {
-  const f=fixture(t);
-  await bind(f);
-  f.service.ingest([message('1')],'cursor',f.store.read().binding);
-  await f.service.tick();
-  f.getMeta().ask={ requestId: 'ask-1',question: 'Name?',allowFreeform: true };
-  await f.service.tick();
-  f.service.ingest([message('2','my answer')],'cursor-2',f.store.read().binding);
-  f.getMeta().ask=null;
-  await f.service.tick();
-  assert.equal(f.store.read().inputs[1].stage,'rejected');
-  assert.equal(f.calls.filter(call => call.name==='prompt').length,1);
-  assert.equal(f.calls.filter(call => call.name==='respondAsk').length,0);
-});
-test('shared live replies are mirrored once and unknown sends are blocked',async t => {
-  const f=fixture(t);
-  await bind(f);
-  f.service.ingest([message('1')],'cursor',f.store.read().binding);
-  await f.service.tick();
-  const observation={
-    sessionId: 'session-original',cwd: f.root,event: {
-      id: 'event-2',type: 'assistant.message',data: { messageId: 'assistant-1',content: 'Reply from a Web turn' },
-    }
+  await establishContext(f);
+  await f.service.observe({ sessionId: 'session-original', cwd: f.source,
+    event: event('historical-file', '[file](/never/read/mutable.txt)') }, false);
+  assert.equal(outputs(f)[0].status, 'failed');
+  assert.equal(outputs(f)[0].reason, 'HISTORICAL_FILE_SNAPSHOT_UNAVAILABLE');
+  const originalSend = f.transport.send;
+  let attempts = 0;
+  f.transport.send = async (...args) => {
+    attempts++;
+    if (attempts === 1) throw new Error('timeout');
+    return originalSend(...args);
   };
-  await f.service.observe(observation);
-  await f.service.observe(observation);
-  let attempts=0;
-  f.transport.send=async () => { attempts++; throw new Error('timeout'); };
+  await observe(f, 'timeout', 'uncertain');
+  await observe(f, 'later', 'delivered');
+  const observations = [event('timeout', 'uncertain'), event('later', 'delivered')];
+  f.setEvents(observations);
   await f.service.tick();
-  await f.service.tick();
-  assert.equal(attempts,1);
-  assert.equal(f.store.read().outputs[0].stage,'unknown');
+  await f.service.poll();
+  const restarted = f.serviceWith(f.transport);
+  await restarted.tick();
+  await restarted.observe({ sessionId: 'session-original', event: observations[0] });
+  assert.equal(attempts, 2);
+  assert.deepEqual(outputs(f).map(receipt => receipt.status), ['failed', 'unknown', 'accepted']);
+  assert.deepEqual(f.sent.map(send => send.items[0].text_item.text), ['delivered']);
 });
-test('historical local references are blocked without reading mutable source',async t => {
-  const f=fixture(t);
-  await bind(f);
-  await f.service.observe({
-    sessionId: 'session-original',cwd: f.root,event: {
-      id: 'old',type: 'assistant.message',data: { content: '[file](/not/a/real/source.txt)' },
-    }
-  },false);
-  assert.equal(f.store.read().outputs[0].stage,'unknown');
-  assert.equal(f.store.read().outputs[0].reason,'HISTORICAL_FILE_SNAPSHOT_UNAVAILABLE');
-});
-test('stop prevents new sends while joining an already-started send',async t => {
-  const f=fixture(t);
-  await bind(f);
-  f.service.ingest([message('1')],'cursor',f.store.read().binding);
-  await f.service.tick();
-  await f.service.observe({
-    sessionId: 'session-original',cwd: f.root,event: {
-      id: 'r',type: 'assistant.message',data: { content: 'hello' },
-    }
-  });
-  let release;
-  let started;
-  const entered=new Promise(resolve => { started=resolve; });
-  f.transport.send=() => { started(); return new Promise(resolve => { release=resolve; }); };
-  const tick=f.service.tick();
-  await entered;
-  f.stopping.abort();
-  const drain = f.service.stop();
-  let drained = false;
-  void drain.then(() => { drained = true; });
-  await Promise.resolve();
-  assert.equal(drained, false);
-  release({ messageId: '123' });
-  await Promise.all([tick, drain]);
-  assert.equal(f.store.read().outputs[0].stage,'accepted');
-  await assert.rejects(f.service.tick(),/SERVICE_STOPPING/);
-});
-test('restart preserves ambiguous intents as unknown',t => {
-  const root=mkdtempSync(join(tmpdir(),'wechat-restart-'));
-  const store=new Store(root,'account');
-  store.change(state => state.inputs.push({ key: 'a:1',generation: 1,message: message('1'),stage: 'intent',operation: 'prompt' }));
-  store.close();
-  const recovered=new Store(root,'account');
-  assert.equal(recovered.read().inputs[0].stage,'unknown');
-  recovered.close();
-  t.after(() => rmSync(root,{ recursive: true,force: true }));
-});
-test('expected stopping after a passive read does not persist a permanent fault',async t => {
-  const f=fixture(t);
-  await bind(f);
-  let release;
-  let entered;
-  const started=new Promise(resolve => { entered=resolve; });
-  f.setHook(name => name==='session/get'? new Promise(resolve => { release=resolve; entered(); }):undefined);
-  await f.service.start();
-  await started;
-  f.stopping.abort();
-  release({ meta: f.getMeta() });
-  await f.service.stop();
-  assert.equal(f.store.read().fault,undefined);
-});
-test('a cancelled runtime existence lookup cannot retire or abandon queued work',async t => {
-  for(const kind of ['stopping','disposal']) await t.test(kind,async t => {
-    const f=fixture(t);
+test('displayed pending questions route exact choice and freeform answers to respondAsk, never prompt', async t => {
+  for (const [answer, freeform] of [['Blue', false], ['Custom', true]]) await t.test(answer, async t => {
+    const f = fixture(t);
     await bind(f);
-    f.service.ingest([message('queued')],'cursor',f.store.read().binding);
-    const before=f.store.read();
-    let release;
-    f.setHook(name => name==='session/get'?new Promise(resolve => { release=resolve; }):undefined);
-    const tick=f.service.tick();
-    if(kind==='stopping') f.stopping.abort();
-    else {
-      const signal=new AbortController();
-      f.context.signal=signal.signal;
-      signal.abort();
-    }
-    release({ meta: null });
-    await assert.rejects(tick,/SERVICE_STOPPING/);
-    assert.deepEqual(f.store.read(),before);
+    await establishContext(f);
+    f.getMeta().ask = { requestId: 'ask-1', question: 'Which color?', choices: ['Blue', 'Green'], allowFreeform: true };
+    await f.service.tick();
+    assert.match(f.sent.at(-1).items[0].text_item.text, /Which color\?[\s\S]*Blue/);
+    assert.equal(f.store.read().question.request.requestId, 'ask-1');
+    await f.service.ingest([message('answer', answer)], 'answered', f.store.read().binding);
+    assert.deepEqual(f.calls.find(call => call.name === 'respondAsk').body,
+      { sessionId: 'session-original', requestId: 'ask-1', answer, wasFreeform: freeform });
+    assert.equal(f.calls.filter(call => call.name === 'prompt').length, 1);
+    assert.equal(f.store.read().question.answered, true);
   });
 });
-test('distinct assistant snapshots use event identity even with the same native messageId',async t => {
-  const f=fixture(t);
-  await bind(f);
-  for(const [id,content] of [['snapshot-a','First'],['snapshot-b','Updated']]) {
-    await f.service.observe({
-      sessionId: 'session-original',cwd: f.root,event: {
-        id,type: 'assistant.message',data: { messageId: 'same-native-id',content },
+test('unpresented, disallowed, pre-presentation and media replies cannot answer a question or become prompts', async t => {
+  for (const kind of ['unpresented', 'choice-only', 'old-timestamp', 'media']) await t.test(kind, async t => {
+    const f = fixture(t);
+    await bind(f);
+    await establishContext(f);
+    f.getMeta().ask = { requestId: 'ask-1', question: 'Which?', choices: ['Blue'], allowFreeform: kind !== 'choice-only' };
+    if (kind !== 'unpresented') await f.service.tick();
+    const extra = kind === 'old-timestamp' ? { createdAt: f.store.read().question.presentedAt - 1 }
+      : kind === 'media' ? { items: [{ type: 4 }] } : {};
+    await f.service.ingest([message('answer', 'custom', extra)], 'answer', f.store.read().binding);
+    assert.equal(inputs(f).at(-1).status, 'failed');
+    assert.equal(inputs(f).at(-1).reason, 'ANSWER_NOT_CURRENT_OR_NOT_ALLOWED');
+    assert(!f.calls.some(call => call.name === 'respondAsk'));
+    assert.equal(f.calls.filter(call => call.name === 'prompt').length, 1);
+  });
+});
+test('invalid choices and query failures preserve a displayed pending question for a later valid answer', async t => {
+  for (const kind of ['invalid-choice', 'query-failure']) await t.test(kind, async t => {
+    const f = fixture(t);
+    await bind(f);
+    await establishContext(f);
+    f.getMeta().ask = {
+      requestId: 'still-pending', question: '[Which color?](/never/read/question.md)',
+      choices: ['Blue'], allowFreeform: false,
+    };
+    await f.service.tick();
+    const displayed = f.store.read().question;
+    assert.equal(displayed.request.requestId, 'still-pending');
+    assert.equal(displayed.answered, false);
+    assert.match(f.sent.at(-1).items[0].text_item.text, /\[Which color\?\]\(\/never\/read\/question.md\)/);
+    if (kind === 'query-failure') f.setHook(name => {
+      if (name === 'session/get') throw new Error('SESSION_QUERY_FAILED');
+    });
+    await f.service.ingest([message('unsuccessful', kind === 'invalid-choice' ? 'Purple' : 'Blue')],
+      'unsuccessful-cursor', f.store.read().binding);
+    assert.equal(inputs(f).at(-1).status, 'failed');
+    assert.equal(inputs(f).at(-1).reason,
+      kind === 'invalid-choice' ? 'ANSWER_NOT_CURRENT_OR_NOT_ALLOWED' : 'SESSION_QUERY_FAILED');
+    assert.deepEqual(f.store.read().question, displayed);
+    assert(!f.calls.some(call => call.name === 'respondAsk'));
+    f.setHook(undefined);
+    await f.service.tick();
+    assert.deepEqual(f.store.read().question, displayed);
+    assert.equal(outputs(f).filter(receipt => receipt.key === 'ask:1:still-pending').length, 1);
+    assert.equal(f.sent.filter(send => send.items[0].text_item?.text.includes('Which color?')).length, 1);
+    await f.service.ingest([message('valid', 'Blue')], 'valid-cursor', f.store.read().binding);
+    assert.deepEqual(f.calls.filter(call => call.name === 'respondAsk').map(call => call.body), [{
+      sessionId: 'session-original', requestId: 'still-pending', answer: 'Blue', wasFreeform: false,
+    }]);
+    assert.equal(inputs(f).at(-1).status, 'accepted');
+    assert.equal(f.store.read().question.answered, true);
+    assert.equal(f.calls.filter(call => call.name === 'prompt').length, 1);
+  });
+});
+test('Web-answer races do not fall through to prompts or freeze the next question', async t => {
+  for (const kind of ['already-answered', 'different-request', 'rejected-at-submit']) await t.test(kind, async t => {
+    const f = fixture(t);
+    await bind(f);
+    await establishContext(f);
+    f.getMeta().ask = { requestId: 'ask-1', question: 'First question?' };
+    await f.service.tick();
+    if (kind === 'already-answered') f.getMeta().ask = null;
+    if (kind === 'different-request') f.getMeta().ask = { requestId: 'ask-2', question: 'Next question?' };
+    if (kind === 'rejected-at-submit') f.setHook(name => {
+      if (name === 'respondAsk') {
+        f.getMeta().ask = { requestId: 'ask-2', question: 'Next question?' };
+        throw Object.assign(new Error('Request no longer pending'), { code: 'REQUEST_NOT_PENDING' });
       }
     });
-  }
-  assert.equal(f.store.read().outputs.length,2);
-  assert.deepEqual(f.store.read().outputs.map(output => output.text),['First','Updated']);
-});
-test('definitive Web answer race is rejected without freezing the next question',async t => {
-  const f=fixture(t);
-  await bind(f);
-  f.service.ingest([message('1')],'cursor',f.store.read().binding);
-  await f.service.tick();
-  f.getMeta().ask={ requestId: 'ask-1',question: 'Question?' };
-  await f.service.tick();
-  f.service.ingest([message('2','answer')],'cursor-2',f.store.read().binding);
-  f.setHook(name => {
-    if(name==='respondAsk') {
-      f.getMeta().ask={ requestId: 'ask-2',question: 'Next question?' };
-      throw Object.assign(new Error('Request no longer pending'),{ code: 'REQUEST_NOT_PENDING' });
-    }
+    await f.service.ingest([message('answer', 'my answer')], 'answer', f.store.read().binding);
+    assert.equal(inputs(f).at(-1).status, 'failed');
+    assert.equal(f.calls.filter(call => call.name === 'prompt').length, 1);
+    assert.equal(f.calls.filter(call => call.name === 'respondAsk').length, kind === 'rejected-at-submit' ? 1 : 0);
+    assert.equal(f.store.read().question.answered, true);
+    f.setHook(undefined);
+    f.getMeta().ask = { requestId: 'ask-2', question: 'Next question?' };
+    await f.service.tick();
+    assert(f.sent.some(send => send.items[0].text_item?.text.includes('Next question?')));
   });
-  await f.service.tick();
-  assert.equal(f.store.read().inputs[1].stage,'rejected');
-  await f.service.tick();
-  assert(f.sent.some(send => send.items.some(item => item.text_item?.text.includes('Next question?'))));
 });
-test('unknown lazy load is never retried or replaced by session creation',async t => {
-  const f=fixture(t);
+test('history anchors omit old events, walk new pages in order and suppress live/history duplicates', async t => {
+  const f = fixture(t);
+  f.setEvents([event('anchor', 'Never replay')]);
   await bind(f);
-  f.service.ingest([message('1')],'cursor',f.store.read().binding);
-  f.setHook(name => { if(name==='session/load') throw new Error('timeout'); });
-  await f.service.tick();
-  await f.service.tick();
-  assert.equal(f.store.read().inputs[0].operation,'load');
-  assert.equal(f.store.read().inputs[0].stage,'unknown');
-  assert.equal(f.calls.filter(call => call.name==='session/load').length,1);
-  assert.equal(f.calls.filter(call => call.name==='prompt'||call.name==='session/new').length,0);
-});
-test('history traverses bounded backward pages in chronological delivery order',async t => {
-  const f=fixture(t);
-  const event=(id,content) => ({ id,type: 'assistant.message',data: { content } });
-  f.setEvents([event('anchor','Old text must not replay')]);
-  await bind(f);
-  const queries=[];
-  f.setHook((name,body) => {
-    if(name!=='session/chat') return;
+  await establishContext(f);
+  await observe(f, 'e2', 'second');
+  const queries = [];
+  f.setHook((name, body) => {
+    if (name !== 'session/chat') return;
     queries.push(body);
-    const page=!body.cursor? [event('e3','third'),event('e4','fourth')]
-      :body.cursor==='older-1'? [event('e1','first'),event('e2','second')]:[event('anchor','old')];
-    return {
-      sessionId: body.sessionId,source: body.source,direction: body.direction,cursorStatus: 'ok',
-      events: page,hasMore: body.cursor!=='older-2',cursor: !body.cursor? 'older-1':'older-2'
-    };
+    const events = !body.cursor ? [event('e3', 'third'), event('e4', 'fourth')]
+      : body.cursor === 'older-1' ? [event('e1', 'first'), event('e2', 'second')] : [event('anchor', 'Never replay')];
+    return page(body, events, { hasMore: body.cursor !== 'older-2', cursor: !body.cursor ? 'older-1' : 'older-2' });
   });
   await f.service.tick();
-  assert.deepEqual(f.store.read().outputs.map(output => output.text),['first','second','third','fourth']);
-  assert.equal(f.store.read().binding.anchor,'e4');
-  assert.equal(queries.length,3);
-  assert(queries.every(query => query.source==='persisted'&&query.direction==='backward'));
+  assert.deepEqual(f.sent.map(send => send.items[0].text_item.text), ['second', 'first', 'third', 'fourth']);
+  assert.equal(f.store.read().binding.anchor, 'e4');
+  assert.equal(queries.length, 3);
+  assert(queries.every(query => query.source === 'persisted' && query.direction === 'backward'));
+  await f.service.tick();
+  assert.equal(f.sent.length, 4);
 });
-test('exact scoped quotes are retained and outgoing quote IDs require observed native input',async t => {
-  const f=fixture(t);
+test('unknown legacy anchor baselines history without replay; missing anchor never blocks live input or output', async t => {
+  const f = fixture(t);
   await bind(f);
-  f.service.ingest([message('501','Original input')],'cursor',f.store.read().binding);
+  await establishContext(f);
+  f.store.change(state => { delete state.binding.anchor; });
+  f.setEvents([event('old', 'old output')]);
   await f.service.tick();
-  await f.service.observe({
-    sessionId: 'session-original',cwd: f.root,event: {
-      id: 'uuid-only',type: 'user.message',data: { messageId: 'native-receipt-not-event-uuid',content: 'Original input' },
-    }
-  });
-  await f.service.observe({
-    sessionId: 'session-original',cwd: f.root,event: {
-      id: 'out',type: 'assistant.message',data: { content: 'An answer' },
-    }
-  });
-  await f.service.tick();
-  assert.equal(f.sent[0].items[0].ref_msg.svr_id,'501');
-  f.service.ingest([message('502','About that',{
-    items: [{ type: 1,text_item: { text: 'About that' },ref_msg: { svr_id: '501' } }],
-  })],'cursor-2',f.store.read().binding);
-  await f.service.tick();
-  const text=f.calls.filter(call => call.name==='prompt').at(-1).body.text;
-  assert.match(text,/exact-local-id/);
-  assert.match(text,/Original input/);
+  assert.equal(f.sent.length, 0);
+  assert.equal(f.store.read().binding.anchor, 'old');
+  f.setEvents([event('unseen', 'not linked')]);
+  await assert.rejects(f.service.tick(), /HISTORY_ANCHOR_MISSING/);
+  await f.service.ingest([message('fresh')], 'fresh', f.store.read().binding);
+  await observe(f, 'live', 'live output');
+  assert.equal(inputs(f).at(-1).status, 'accepted');
+  assert.equal(f.sent.at(-1).items[0].text_item.text, 'live output');
 });
-test('a late poll for a retired generation cannot reroute its message to a new binding',async t => {
-  const f=fixture(t);
+test('exact native user receipt association quotes the envelope ID, never an event UUID', async t => {
+  const f = fixture(t);
   await bind(f);
-  let release;
-  f.transport.poll=() => new Promise(resolve => { release=resolve; });
-  const poll=f.service.poll();
-  const old=f.store.read().binding;
+  await f.service.ingest([message('501', 'Original input')], 'cursor', f.store.read().binding);
+  await f.service.observe({ sessionId: 'session-original', event: {
+    id: 'not-the-message-id', type: 'user.message', data: { messageId: 'native-receipt-Original input' },
+  } });
+  await observe(f, 'out', 'An answer');
+  assert.equal(f.sent[0].items[0].ref_msg.svr_id, '501');
+  await f.service.ingest([message('502', 'About that', { items: [{
+    type: 1, text_item: { text: 'About that' }, ref_msg: { svr_id: '501' },
+  }] })], 'cursor-2', f.store.read().binding);
+  assert.match(f.calls.filter(call => call.name === 'prompt').at(-1).body.text, /exact-local-id[\s\S]*Original input/);
+});
+test('existence uncertainty, cancellation and all existing native states retain occupancy without history gates', async t => {
+  for (const kind of ['throw', 'malformed', 'wrong-session', 'cancel', 'stopping', 'disposal', 'unloaded', 'idle', 'running', 'error'])
+    await t.test(kind, async t => {
+      const f = fixture(t);
+      await bind(f);
+      const before = f.store.read();
+      const abort = new AbortController();
+      f.setHook(name => {
+        if (name !== 'session/get') return;
+        if (kind === 'throw') throw new Error('not found');
+        if (kind === 'malformed') return {};
+        if (kind === 'wrong-session') return { meta: { ...f.getMeta(), sessionId: 'different' } };
+        if (kind === 'cancel') { abort.abort(); return { meta: null }; }
+        if (kind === 'stopping') { f.stopping.abort(); return { meta: null }; }
+        if (kind === 'disposal') { f.signal.abort(); return { meta: null }; }
+        return { meta: { ...f.getMeta(), loaded: kind !== 'unloaded', status: kind } };
+      });
+      const result = await f.manager.availability({ ...selection, sessionId: 'other' }, abort.signal);
+      assert(result.reasons.some(reason => reason.code === 'BINDING_OCCUPIED'));
+      assert.deepEqual(f.store.read(), before);
+      await assert.rejects(f.manager.saved({ ...selection, sessionId: 'other', notificationId: 'new' }, abort.signal));
+      assert.deepEqual(f.store.read(), before);
+    });
+});
+test('availability aggregates configuration and unknown existence without inventing unresolved-history gates', async t => {
+  const f = fixture(t);
+  await bind(f);
+  f.store.change(state => {
+    state.lastError = 'UNKNOWN_SEND';
+    state.receipts.push({ key: 'old', generation: 1, direction: 'output', status: 'unknown', text: 'old', media: [] });
+  });
+  f.setHook(name => { if (name === 'session/get') throw new Error('query failed'); });
+  const manager = new BindingManager(f.context, f.store, () => ['MISSING_CONFIG']);
+  assert.deepEqual(new Set((await manager.availability({ ...selection, sessionId: 'other' }, activeSignal()))
+    .reasons.map(reason => reason.code)), new Set(['MISSING_CONFIG', 'BINDING_EXISTENCE_UNKNOWN', 'BINDING_OCCUPIED']));
+});
+test('saved replay stays idempotent after deletion and two concurrent saved candidates have one CAS winner', async t => {
+  const f = fixture(t);
+  await bind(f);
+  const generation = f.store.read().generation;
+  await f.manager.saved({ ...selection, notificationId: 'notification-1' }, activeSignal());
+  assert.equal(f.store.read().generation, generation);
   f.setMeta(null);
-  await f.manager.availability(selection,new AbortController().signal);
-  await f.manager.saved({ ...selection,sessionId: 'replacement',notificationId: 'replacement' },new AbortController().signal);
-  release({ messages: [message('late')],cursor: 'late-cursor' });
-  await poll;
-  const state=f.store.read();
-  assert.equal(state.inputs[0].generation,old.generation);
-  assert.equal(state.inputs[0].stage,'unknown');
-  assert.equal(state.cursor,'late-cursor');
-  assert.equal(state.binding.contextToken,undefined);
-  f.setMeta({ sessionId: 'replacement',cwd: f.root,loaded: true,status: 'idle',ask: null });
+  await f.manager.availability(selection, activeSignal());
+  const entered = deferred(), releases = [];
+  f.setHook((name, body) => {
+    if (name !== 'session/chat') return;
+    const gate = deferred();
+    releases.push(() => gate.resolve(page(body, [])));
+    if (releases.length === 2) entered.resolve();
+    return gate.promise;
+  });
+  const saves = ['one', 'two'].map(sessionId => f.manager.saved({ ...selection, sessionId, notificationId: sessionId }, activeSignal()));
+  await entered.promise;
+  releases.forEach(release => release());
+  const results = await Promise.allSettled(saves);
+  assert.equal(results.filter(result => result.status === 'fulfilled').length, 1);
+  assert.match(results.find(result => result.status === 'rejected').reason.message, /BINDING_CHANGED/);
+  assert.equal(f.store.read().notifications.length, 2);
+  const state = f.store.read();
+  await f.manager.saved({ ...selection, notificationId: 'notification-1' }, activeSignal());
+  assert.deepEqual(f.store.read(), state);
+});
+test('late missing existence responses cannot retire a newer binding generation', async t => {
+  const f = fixture(t);
+  await bind(f);
+  const gate = deferred();
+  f.setHook(name => name === 'session/get' ? gate.promise : undefined);
+  const pending = f.manager.availability({ ...selection, sessionId: 'other' }, activeSignal());
+  f.store.change(state => { state.generation++; state.binding = { sessionId: 'new', generation: state.generation }; });
+  gate.resolve({ meta: null });
+  await pending;
+  assert.equal(f.store.read().binding.sessionId, 'new');
+});
+test('schema-1 migration preserves queued, intent and unknown records verbatim without replay or changing credentials', async t => {
+  const f = fixture(t);
+  const root = directory(t);
+  const seed = new Store(root, 'fixture-account');
+  seed.close();
+  const credentials = Buffer.from('{"account":"fixture","token":"synthetic-only"}\n');
+  writeFileSync(join(root, 'credentials.json'), credentials, { mode: 0o600 });
+  const legacy = {
+    schema: 1, revision: 9, identity: 'fixture-account', generation: 2, binding: null,
+    notifications: ['old-notification'], cursor: 'retained-cursor', retired: [{ sessionId: 'old', generation: 1, at: 123 }],
+    fault: 'OLD_UNKNOWN', questions: [],
+    inputs: ['queued', 'intent', 'unknown'].map((stage, index) => ({
+      key: `account:${index}`, generation: 1, stage, operation: 'prompt', message: message(String(index)),
+    })),
+    outputs: ['queued', 'intent', 'unknown'].map(stage => ({
+      key: `old-${stage}`, generation: 1, stage, kind: 'reply', text: `old ${stage}`, files: [],
+      parts: [{ stage, clientId: stage }], ...(stage === 'unknown' ? { reason: 'WECHAT_API_REJECTED' } : {}),
+    })),
+  };
+  const db = new DatabaseSync(join(root, 'native-v1.sqlite'));
+  db.prepare('UPDATE state SET json=? WHERE id=1').run(JSON.stringify(legacy));
+  db.close();
+  let recovered = new Store(root, 'fixture-account');
+  assert.deepEqual(recovered.read().legacy, legacy);
+  assert.deepEqual(recovered.read().receipts.map(receipt => receipt.status), ['skipped', 'unknown', 'unknown', 'skipped', 'unknown', 'unknown']);
+  assert.equal(recovered.read().receipts.at(-1).reason, 'WECHAT_API_REJECTED');
+  assert.equal(recovered.read().cursor, 'retained-cursor');
+  recovered.close();
+  recovered = new Store(root, 'fixture-account');
+  const service = new Service(f.context, f.config, recovered, f.transport);
+  try {
+    const manager = new BindingManager(f.context, recovered, () => []);
+    assert.deepEqual((await manager.availability(selection, activeSignal())).reasons, []);
+    await manager.saved({ ...selection, notificationId: 'replacement' }, activeSignal());
+    await service.tick();
+    await service.poll();
+    assert(!f.calls.some(call => ['prompt', 'respondAsk', 'session/load'].includes(call.name)));
+    assert.equal(f.sent.length, 0);
+    assert.deepEqual(recovered.read().legacy, legacy);
+    assert.deepEqual(readFileSync(join(root, 'credentials.json')), credentials);
+  } finally { await service.stop(); recovered.close(); }
+});
+test('persisted adapter-2 unknown receipts survive reopening without becoming work', async t => {
+  const f = fixture(t);
+  await bind(f);
+  await establishContext(f);
+  let sends = 0;
+  f.transport.send = async () => { sends++; throw new Error('timeout'); };
+  f.setHook(name => { if (name === 'prompt') throw new Error('timeout'); });
+  await f.service.ingest([message('uncertain-input')], 'uncertain-cursor', f.store.read().binding);
+  await observe(f, 'uncertain', 'possibly delivered');
+  const prompts = f.calls.filter(call => call.name === 'prompt').length;
+  const attempts = sends;
+  f.setHook(undefined);
+  f.transport.poll = async () => ({ messages: [message('uncertain-input')], cursor: 'repeated' });
+  const root = directory(t);
+  copyFileSync(join(f.store.root, 'native-v1.sqlite'), join(root, 'native-v1.sqlite'));
+  const reopened = new Store(root, 'fixture-account');
+  const service = new Service(f.context, f.config, reopened, f.transport);
+  try {
+    await service.tick();
+    await service.poll();
+    await service.observe({ sessionId: 'session-original', event: event('uncertain', 'possibly delivered') });
+    assert.deepEqual(reopened.read().receipts, JSON.parse(JSON.stringify(f.store.read().receipts)));
+    assert.equal(reopened.read().receipts.at(-1).status, 'unknown');
+    assert.equal(f.calls.filter(call => call.name === 'prompt').length, prompts);
+    assert.equal(sends, attempts);
+  } finally { await service.stop(); reopened.close(); }
+});
+test('deletion during passive input lookup never loads or submits across the replacement binding', async t => {
+  const f = fixture(t);
+  await bind(f);
+  const gate = deferred(), entered = deferred();
+  const oldMeta = f.getMeta();
+  let first = true;
+  f.setHook(name => {
+    if (name === 'session/get' && first) { first = false; entered.resolve(); return gate.promise; }
+  });
+  const incoming = f.service.ingest([message('old')], 'old', f.store.read().binding);
+  await entered.promise;
+  await replace(f);
+  const replacement = f.store.read().binding;
+  gate.resolve({ meta: oldMeta });
+  await incoming;
+  assert.deepEqual(f.store.read().binding, replacement);
+  assert.equal(inputs(f)[0].reason, 'BINDING_CHANGED');
+  assert(!f.calls.some(call => ['session/load', 'prompt'].includes(call.name)));
+});
+test('new bindings are allowed while old load/prompt effects resolve; completions update only old receipts', async t => {
+  for (const kind of ['load', 'prompt-accepted', 'prompt-timeout']) await t.test(kind, async t => {
+    const f = fixture(t);
+    await bind(f);
+    if (kind !== 'load') f.setMeta({ ...f.getMeta(), loaded: true, status: 'idle' });
+    const effect = kind === 'load' ? 'session/load' : 'prompt';
+    const gate = deferred(), entered = deferred();
+    f.setHook(name => { if (name === effect) { entered.resolve(); return gate.promise; } });
+    const incoming = f.service.ingest([message('old')], 'old', f.store.read().binding);
+    await entered.promise;
+    await replace(f);
+    const replacement = f.store.read().binding;
+    if (kind === 'prompt-timeout') gate.reject(new Error('timeout'));
+    else gate.resolve(kind === 'load' ? { ok: true, sessionId: 'session-original' } : { ok: true, messageId: 'old-receipt' });
+    await incoming;
+    assert.deepEqual(f.store.read().binding, replacement);
+    assert.equal(inputs(f)[0].status, kind === 'prompt-accepted' ? 'accepted' : 'unknown');
+    assert.equal(f.store.read().lastError, undefined);
+    assert.equal(f.sent.length, 0);
+    f.setHook(undefined);
+    await f.service.ingest([message('fresh', 'fresh input', { createdAt: replacement.boundAt + 1 })], 'fresh', replacement);
+    assert.equal(inputs(f).at(-1).status, 'accepted');
+    assert.equal(f.calls.filter(call => call.name === effect && call.body.sessionId === 'session-original').length, 1);
+  });
+});
+test('new binding during an old send has no historical in-flight barrier; multipart tails never cross it', async t => {
+  for (const multipart of [false, true]) await t.test(`multipart: ${multipart}`, async t => {
+    const f = fixture(t);
+    await bind(f);
+    await establishContext(f);
+    const gate = deferred(), entered = deferred();
+    let attempts = 0;
+    f.transport.send = async () => { attempts++; entered.resolve(); return gate.promise; };
+    const outgoing = observe(f, 'old-send', multipart ? 'x'.repeat(4000) : 'one part');
+    await entered.promise;
+    await replace(f);
+    const replacement = f.store.read().binding;
+    gate.resolve({ messageId: 'old-message-id' });
+    await outgoing;
+    assert.deepEqual(f.store.read().binding, replacement);
+    assert.equal(f.store.read().lastError, undefined);
+    const receipt = outputs(f)[0];
+    assert.equal(receipt.generation, 1);
+    assert.equal(receipt.sent[0].messageId, 'old-message-id');
+    assert.equal(receipt.status, multipart ? 'unknown' : 'accepted');
+    await f.service.tick();
+    assert.equal(attempts, 1);
+  });
+});
+test('deletion during upload prevents a file send after replacement without retrying the upload', async t => {
+  const f = fixture(t);
+  await bind(f);
+  await establishContext(f);
+  const path = join(f.source, 'attachment.txt');
+  writeFileSync(path, 'frozen fixture');
+  const gate = deferred(), entered = deferred();
+  let uploads = 0;
+  f.transport.call = async () => ({ upload_param: 'fake-upload' });
+  f.transport.request = async () => { uploads++; entered.resolve(); return gate.promise; };
+  const outgoing = observe(f, 'upload', `[file](${path})`);
+  await entered.promise;
+  await replace(f);
+  const replacement = f.store.read().binding;
+  gate.resolve({ headers: new Headers({ 'x-encrypted-param': 'fake-receipt' }) });
+  await outgoing;
+  assert.deepEqual(f.store.read().binding, replacement);
+  assert.equal(uploads, 1);
+  assert.equal(f.sent.length, 1);
+  assert.equal(f.sent[0].items[0].type, 1);
+  assert.equal(outputs(f)[0].status, 'unknown');
+  assert.equal(outputs(f)[0].reason, 'BINDING_CHANGED');
+  assert.equal(f.store.read().lastError, undefined);
   await f.service.tick();
-  assert.equal(f.calls.some(call => call.name==='prompt'),false);
-  f.service.ingest([message('fresh','fresh input',{ createdAt: state.binding.boundAt+1 })],'fresh-cursor',state.binding);
-  await f.service.tick();
-  assert.deepEqual(f.calls.filter(call => call.name==='prompt').map(call => call.body.sessionId),['replacement']);
-  assert.equal(f.store.read().inputs[0].stage,'unknown');
+  assert.equal(uploads, 1);
+});
+test('deletion during asynchronous live capture cannot send the captured file under the new binding', async t => {
+  const f = fixture(t);
+  await bind(f);
+  await establishContext(f);
+  const path = join(f.source, 'capture.txt');
+  writeFileSync(path, 'captured fixture');
+  const gate = deferred(), entered = deferred();
+  const original = fsPromises.open;
+  const mock = t.mock.method(fsPromises, 'open', async (...args) => {
+    if (args[0] === path) { entered.resolve(); await gate.promise; }
+    return original(...args);
+  });
+  syncBuiltinESMExports();
+  try {
+    const outgoing = observe(f, 'capture', `[file](${path})`);
+    await entered.promise;
+    await replace(f);
+    const replacement = f.store.read().binding;
+    gate.resolve();
+    await outgoing;
+    assert.deepEqual(f.store.read().binding, replacement);
+    assert.equal(f.sent.length, 0);
+    assert.equal(outputs(f)[0].reason, 'BINDING_CHANGED');
+    assert.equal(f.store.read().lastError, undefined);
+  } finally { gate.resolve(); mock.mock.restore(); syncBuiltinESMExports(); }
+});
+test('late polls retain old-generation diagnostics without rerouting, and fresh replacement traffic succeeds', async t => {
+  const f = fixture(t);
+  await bind(f);
+  const gate = deferred();
+  f.transport.poll = () => gate.promise;
+  const polling = f.service.poll();
+  const old = f.store.read().binding;
+  const replacement = await replace(f);
+  gate.resolve({ messages: [message('late')], cursor: 'late-cursor' });
+  await polling;
+  assert.equal(inputs(f)[0].generation, old.generation);
+  assert.equal(inputs(f)[0].status, 'failed');
+  assert.equal(inputs(f)[0].reason, 'BINDING_CHANGED');
+  assert.equal(f.store.read().binding.contextToken, undefined);
+  assert(!f.calls.some(call => call.name === 'prompt'));
+  await f.service.ingest([message('prebinding', 'old', { createdAt: replacement.boundAt - 1 }),
+    message('fresh', 'fresh', { createdAt: replacement.boundAt + 1 })], 'fresh-cursor', replacement);
+  assert.equal(inputs(f)[1].reason, 'PREBINDING_INPUT_NOT_FORWARDED');
+  assert.equal(inputs(f)[2].status, 'accepted');
+  assert.deepEqual(f.calls.filter(call => call.name === 'prompt').map(call => call.body.sessionId), ['replacement']);
+});
+test('cancelled passive observation cannot retire a binding', async t => {
+  for (const kind of ['stopping', 'disposal']) await t.test(kind, async t => {
+    const f = fixture(t);
+    await bind(f);
+    const before = f.store.read();
+    const gate = deferred();
+    f.setHook(name => name === 'session/get' ? gate.promise : undefined);
+    const tick = f.service.tick();
+    (kind === 'stopping' ? f.stopping : f.signal).abort();
+    gate.resolve({ meta: null });
+    await assert.rejects(tick, /SERVICE_STOPPING/);
+    assert.deepEqual(f.store.read(), before);
+  });
+});
+test('graceful stop joins active prompt/send effects without adding a durable drain queue', async t => {
+  for (const kind of ['prompt', 'send']) await t.test(kind, async t => {
+    const f = fixture(t);
+    await bind(f);
+    await establishContext(f);
+    const gate = deferred(), entered = deferred();
+    if (kind === 'prompt') f.setHook(name => {
+      if (name === 'prompt') { entered.resolve(); return gate.promise; }
+    });
+    else f.transport.send = async () => { entered.resolve(); return gate.promise; };
+    const active = kind === 'prompt' ? f.service.ingest([message('active')], 'active', f.store.read().binding)
+      : observe(f, 'active', 'active reply');
+    await entered.promise;
+    f.stopping.abort();
+    let stopped = false;
+    const stop = f.service.stop().then(() => { stopped = true; });
+    await Promise.resolve();
+    assert.equal(stopped, false);
+    gate.resolve(kind === 'prompt' ? { ok: true, messageId: 'accepted-during-stop' } : { messageId: 'sent-during-stop' });
+    await Promise.all([active, stop]);
+    assert.equal((kind === 'prompt' ? inputs(f) : outputs(f)).at(-1).status, 'accepted');
+    await assert.rejects(f.service.tick(), /SERVICE_STOPPING/);
+    const count = f.calls.length;
+    await f.service.ingest([message('after-stop')], 'after-stop', f.store.read().binding);
+    await observe(f, 'after-stop', 'not sent');
+    assert.equal(f.calls.length, count);
+    for (const obsolete of ['inputs', 'outputs', 'retired', 'questions', 'fault']) assert(!(obsolete in f.store.read()));
+  });
 });

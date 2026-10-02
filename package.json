@@ -9,7 +9,6 @@
   "scripts": {
     "build": "tsc -p tsconfig.json && node scripts/bundle.mjs",
     "test": "node --test --test-concurrency=2 test-native/*.test.mjs",
-    "test:legacy": "node --test test/*.test.js",
     "check": "tsc -p tsconfig.json --noEmit",
     "pack:module": "node scripts/package-release.mjs pack module-output"
   },
