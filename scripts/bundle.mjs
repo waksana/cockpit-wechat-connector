@@ -1,6 +1,8 @@
 import { build } from 'esbuild';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
+import { buildIdentity, inventory, shipped, sourceHash } from './release-identity.mjs';
+const identity = buildIdentity(process.cwd());
 const result = await build({
   entryPoints: ['native/index.ts'],
   outfile: 'dist/index.js',
@@ -25,3 +27,6 @@ for (const input of Object.keys(result.metafile.inputs)) {
   licenses.set(root, `${pkg.name}@${pkg.version}\n\n${readFileSync(license, 'utf8')}`);
 }
 writeFileSync('dist/THIRD_PARTY_LICENSES.txt', [...licenses.values()].join('\n\n-----\n\n'));
+writeFileSync('.module-build-receipt.json', JSON.stringify({
+  build: identity, sourceHash: sourceHash(process.cwd()), files: inventory(process.cwd(), shipped),
+}) + '\n');

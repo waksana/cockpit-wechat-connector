@@ -12,3 +12,6 @@ state/
 credentials*.json
 dist/
 *.tgz
+.module-build-receipt.json
+module-output/
+release-artifact/
