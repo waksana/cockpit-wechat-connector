@@ -1,6 +1,6 @@
 import type { ModuleBackendContext, ModuleRoleAvailabilityReason, RoleAvailabilityCheck, RoleAssignmentNotification,
   ModuleHostIntentResult } from '@waksana/cockpit-module-sdk/backend';
-import { invariant, retireBinding, retiredWorkInFlight, Store, unresolved } from './state.js';
+import { invariant, retireBinding, Store } from './state.js';
 
 export async function sessionMeta(context: ModuleBackendContext, sessionId: string) {
   const result: ModuleHostIntentResult<'session/get'> = await context.host.call('session/get', { sessionId });
@@ -46,8 +46,6 @@ export class BindingManager {
     }
     const current = this.store.read();
     if (current.binding && current.binding.sessionId !== selection.sessionId) add('BINDING_OCCUPIED');
-    if (unresolved(current)) add('UNRESOLVED_HISTORY');
-    if (retiredWorkInFlight(current)) add('RETIRED_WORK_IN_FLIGHT');
     return { reasons };
   }
   async saved(notification: RoleAssignmentNotification, signal: AbortSignal): Promise<void> {
@@ -58,8 +56,6 @@ export class BindingManager {
     const before = this.store.read();
     invariant(this.problems().length === 0, 'SERVICE_UNAVAILABLE');
     invariant(!before.binding || before.binding.sessionId === notification.sessionId, 'BINDING_OCCUPIED');
-    invariant(!unresolved(before), 'UNRESOLVED_HISTORY');
-    invariant(!retiredWorkInFlight(before), 'RETIRED_WORK_IN_FLIGHT');
     let anchor: string | null | undefined;
     if (!before.binding) {
       const page = await this.context.host.call('session/chat', {
@@ -77,8 +73,6 @@ export class BindingManager {
       if (state.notifications.includes(notification.notificationId)) return;
       invariant(state.generation === before.generation, 'BINDING_CHANGED');
       invariant(!state.binding || state.binding.sessionId === notification.sessionId, 'BINDING_OCCUPIED');
-      invariant(!unresolved(state), 'UNRESOLVED_HISTORY');
-      invariant(!retiredWorkInFlight(state), 'RETIRED_WORK_IN_FLIGHT');
       if (!state.binding) {
         state.generation++;
         state.binding = { sessionId: notification.sessionId, generation: state.generation, anchor, boundAt: Date.now() };

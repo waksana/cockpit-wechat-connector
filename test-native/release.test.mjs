@@ -139,25 +139,26 @@ for (const interrupted of [false, true]) test(`packaged Rolling preserves native
   const content = Buffer.from('synthetic retained bytes');
   const snapshot = { path: join(dataRoot, paths[1]), name: 'file', size: content.length, sha256: hash(content),
     md5: createHash('md5').update(content).digest('hex'), mime: 'application/octet-stream', kind: 'file' };
-  store.change(state => {
-    state.generation = 2;
-    state.binding = { sessionId: 'retained-session', generation: 2, anchor: 'anchor', contextToken: 'synthetic-context', cwd: '/synthetic' };
-    state.retired.push({ sessionId: 'old-session', generation: 1, at: 1 });
-    state.notifications.push('saved-notification');
-    state.cursor = 'retained-cursor';
-    state.inputs.push({ key: 'input-1', generation: 2, stage: interrupted ? 'intent' : 'accepted',
-      message: { id: '123', text: 'synthetic input' }, operation: 'prompt', messageId: 'native-receipt', media: [snapshot] });
-    state.outputs.push({ key: 'output-1', generation: 2, kind: 'reply', stage: interrupted ? 'intent' : 'unknown',
+  store.close();
+  const before = {
+    schema: 1, revision: 12, identity: 'synthetic-account-peer-identity', generation: 2,
+    binding: { sessionId: 'retained-session', generation: 2, anchor: 'anchor', contextToken: 'synthetic-context', cwd: '/synthetic' },
+    retired: [{ sessionId: 'old-session', generation: 1, at: 1 }], notifications: ['saved-notification'],
+    cursor: 'retained-cursor',
+    inputs: [{ key: 'input-1', generation: 2, stage: interrupted ? 'intent' : 'accepted',
+      message: { id: '123', text: 'synthetic input' }, operation: 'prompt', messageId: 'native-receipt', media: [snapshot] }],
+    outputs: [{ key: 'output-1', generation: 2, kind: 'reply', stage: interrupted ? 'intent' : 'unknown',
       text: 'synthetic output', files: [{ ...snapshot, path: join(dataRoot, paths[2]) }],
       parts: [{ stage: 'accepted', clientId: 'accepted-part', messageId: '456' },
-        { stage: interrupted ? 'intent' : 'unknown', clientId: 'uncertain-part' }] });
-    state.questions.push({ request: { requestId: 'retained-question', question: 'synthetic question' },
-      generation: 2, outputKey: 'output-1', stage: 'presented' });
-    state.resolutions.push({ key: 'retired-input', note: 'synthetic disposition', at: 1 });
-  });
-  const before = store.read(); store.close();
+        { stage: interrupted ? 'intent' : 'unknown', clientId: 'uncertain-part' }] }],
+    questions: [{ request: { requestId: 'retained-question', question: 'synthetic question' },
+      generation: 2, outputKey: 'output-1', stage: 'presented' }],
+    resolutions: [{ key: 'retired-input', note: 'synthetic disposition', at: 1 }],
+  };
   const dbPath = join(dataRoot, 'native-v1.sqlite');
-  const beforeBytes = readFileSync(dbPath);
+  const oldDb = new DatabaseSync(dbPath);
+  oldDb.prepare('UPDATE state SET json=? WHERE id=1').run(JSON.stringify(before));
+  oldDb.close();
   const privateFiles = paths.map(path => ({ path, hash: hash(readFileSync(join(dataRoot, path))), mode: lstatSync(join(dataRoot, path)).mode }));
   const backend = await import(pathToFileURL(join(consumer, 'dist/index.js')).href);
   const stopping = new AbortController();
@@ -172,16 +173,19 @@ for (const interrupted of [false, true]) test(`packaged Rolling preserves native
   const after = JSON.parse(db.prepare('SELECT json FROM state WHERE id=1').get().json);
   assert.equal(db.prepare('PRAGMA user_version').get().user_version, 1);
   db.close();
-  const expected = structuredClone(before);
-  if (interrupted) {
-    expected.revision++;
-    expected.inputs[0].stage = 'unknown';
-    expected.outputs[0].stage = 'unknown';
-    expected.outputs[0].parts[1].stage = 'unknown';
-  } else assert.deepEqual(readFileSync(dbPath), beforeBytes);
-  assert.deepEqual(after, expected);
-  await verifySnapshot(after.inputs[0].media[0]);
-  await verifySnapshot(after.outputs[0].files[0]);
+  assert.equal(after.adapter, 2);
+  assert.deepEqual(after.legacy, before);
+  assert.deepEqual(after.binding, before.binding);
+  assert.equal(after.receipts[0].status, interrupted ? 'unknown' : 'accepted');
+  assert.equal(after.receipts[1].status, 'unknown');
+  assert.equal(after.cursor, before.cursor);
+  assert.deepEqual(after.notifications, before.notifications);
+  assert.equal(after.revision, before.revision + 1);
+  await verifySnapshot(after.receipts[0].media[0]);
+  await verifySnapshot(after.legacy.outputs[0].files[0]);
+  const migratedBytes = readFileSync(dbPath);
+  new Store(dataRoot, before.identity).close();
+  assert.deepEqual(readFileSync(dbPath), migratedBytes);
   assert.deepEqual(paths.map(path => ({ path, hash: hash(readFileSync(join(dataRoot, path))), mode: lstatSync(join(dataRoot, path)).mode })), privateFiles);
 });
 

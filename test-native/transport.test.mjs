@@ -30,7 +30,7 @@ test('poll pins official origin and preserves uint64 message and quote IDs lossl
   assert.equal(JSON.parse(request.body).get_updates_buf, 'previous');
 });
 
-test('unauthorized and group messages are never enqueued, even with malformed items', async () => {
+test('unauthorized and group messages are never forwarded, even with malformed items', async () => {
   const transport = new WechatTransport(config, async () => json({
     msgs: [message({ from_user_id: 'stranger', item_list: null }), message({ to_user_id: 'another-bot' }),
       message({ group_id: 'group', item_list: null }), message()], get_updates_buf: 'next',

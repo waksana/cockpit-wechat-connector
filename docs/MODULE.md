@@ -1,144 +1,126 @@
-# Native module behavior and recovery
+# Native WeChat adapter
 
-Configuration and activation instructions are in [README](../README.md).
-The module backend export is `activate(context)` in the bundled `dist/index.js`.
-All host interaction uses the public SDK `context.host.call`; the module has
-no native handles, host-private imports, HTTP API token, CLI runner, or daemon.
+Configuration is in [README](../README.md). The bundled backend exports
+`activate(context)`. Host interaction uses only public SDK `context.host.call`;
+there are no native handles, private host imports, CLI runners, or daemons.
+
+## Direct message paths
+
+Incoming authorized peer messages are converted and immediately submitted with
+`prompt({ sessionId, mode: "immediate", text, attachments })`. An unloaded session
+is first loaded through `session/load` with the **same** ID. The connector does
+not inspect native busy state, cancel a turn, clear the native queue, or wait for
+the current model turn to finish. Native Copilot owns steering and execution.
+A reply associated with an already displayed, still-pending question instead
+uses `respondAsk` with its exact request ID. Stale or ambiguous answers are
+reported, not silently treated as new prompts or answers to a different question.
+
+Primary assistant message observations call WeChat send/upload APIs directly.
+Multipart sends use a process-local promise chain to retain order; local files
+are captured when observed, before waiting for an earlier send. There is no
+durable outbox, send worker, retry schedule, recovery barrier, or message
+resolution workflow. A failed capture/send does not block the next independent
+reply or binding. A missing WeChat context token is a visible failure, not a
+message queued for later delivery.
+
+Polling remains necessary for the WeChat protocol. The native observation pass
+reads persisted chat using its retained anchor and observes pending questions.
+It does not drain pending input/output records. Unseen native events can be
+observed after reconnect; an event already attempted is not sent again.
+Historical file links without an original captured copy fail individually:
+the adapter does not reread mutable files to recreate an old attachment.
+Missing history anchors are reported rather than silently skipped. They do not
+disable independent live events, incoming messages, or role selection.
 
 ## Binding and availability
 
-Host role mutation locks serialize the complete availability/permit/save/notify
-sequence for the module. The module additionally saves its single binding and
-notification identity in one synchronous SQLite transaction. Availability
-preflight does not reserve the account, load a session, or send a message.
-All configuration, occupancy, unresolved-history, and existence-unknown reasons
-are returned together. An existing unloaded session is not free capacity.
+Availability and the saved callback query the existing binding through
+`session/get`. Only authoritative `meta: null` frees it; unloaded/idle sessions
+still own it, and failed, malformed, or cancelled queries never mean deletion.
+Saved notifications are idempotent. A synchronous binding-generation comparison
+ensures competing saves cannot both win. The generation is only a binding
+identity/fence, not a separate message lifecycle or retired-work ledger.
 
-A successful saved callback means the module durably recorded the association,
-not that the native session was loaded or messaging works. Notification replay
-is idempotent even after a binding was retired; it never restores old ownership.
-Only authoritative `meta: null` retires the old binding. Late/aborted lookups
-cannot delete a new generation. Outstanding old-generation work remains an
-explicit blocker only while an effect or capture is still in flight
-(`RETIRED_WORK_IN_FLIGHT`). Once it settles, retired unknown outcomes remain
-unknown but do not block a new binding. Queued inputs, outputs, and output parts
-in a confirmed retired generation become `abandoned` (records carry
-`RETIRED_BINDING_NOT_SCHEDULED`); pending/presented questions become stale.
-No records, receipts, files, or credentials are deleted, and no old message is
-retried or rerouted to a new session. The same retirement boundary applies to
-availability, permit, and saved callbacks, including already-retired history
-from earlier versions and after restart. General faults, invalid configuration,
-and unresolved work without a confirmed retirement still block.
-A poll completed after retirement retains its messages against the old
-generation as unresolved. After reassignment, messages with missing timestamps
-or timestamps before the new binding require explicit disposition instead of
-being treated as fresh commands.
+Availability depends on configuration/account ownership and actual session
+existence, **not** old send results or in-flight messages. Old callbacks retain
+their original target and recheck binding identity before new effects.
+An already-started external effect may still finish for its old target; its
+result cannot change the replacement binding or associate a question with it.
+No old message is rerouted to the replacement session.
 
-## Durable boundaries
+A late poll is recorded against its original binding, never forwarded into a
+replacement. After reassignment, input with missing timestamps or timestamps
+before the new binding is reported as `PREBINDING_INPUT_NOT_FORWARDED`.
+It is not held for manual release or replay.
 
-`native-v1.sqlite` is a new schema with `synchronous=FULL`, private permissions,
-and bounded records (10,000 per collection, 32 MiB serialized state). Full storage
-fails explicitly; no automatic eviction discards deduplication or receipts.
-Unknown schema/account changes refuse startup. It is not the old bridge schema.
-All files and receipts stay in this module's host-provided data root.
+## Minimal persistent state and delivery limits
 
-Inbound messages and poll cursor are committed together. IDs are account-scoped.
-Envelope `message_id`, send receipts, and quote `svr_id` use lossless decimal
-uint64 server identities. Item `msg_id` (including a quoted `message_item.msg_id`)
-is instead opaque string metadata: it is preserved without numeric conversion,
-trimming, or case folding. Empty/default item IDs are permitted; a local 1,024
-character limit and control-character rejection bound this metadata. Legacy
-integer JSON item IDs are preserved from their original decimal token, never a
-rounded JavaScript number; outgoing item IDs must already be strings.
-Item IDs never identify a persisted
-input, correlate a receipt, or resolve a retained quoted file; only the scoped
-server identity does that. An invalid authorized message rejects the whole poll
-before its cursor is committed.
+The private `native-v1.sqlite` keeps account identity, one binding, saved
+notification IDs, WeChat cursor, native observation anchor, the last displayed
+question association, and bounded deduplication/results. Message IDs and
+successful sent-part references retain exact quoted context and local media.
+Result records have only `accepted`, `unknown`, `failed`, or `skipped` outcomes;
+there are no runnable queued/intent records. Unknown is recorded before an
+attempt for deduplication and stays unknown if the process cannot record its
+outcome. It is never automatically retried.
 
-This distinction follows Tencent's [item and envelope type declarations](https://github.com/Tencent/openclaw-weixin/blob/24de5c9eb0dd5e595d7e2d090ed8a3f82870d42c/src/api/types.ts#L175-L206)
-and [nonnumeric quoted-item example](https://github.com/Tencent/openclaw-weixin/blob/24de5c9eb0dd5e595d7e2d090ed8a3f82870d42c/src/messaging/inbound.test.ts#L352-L375).
-The item length/control limits are connector policy, not claimed server limits.
+Advancing the WeChat cursor is not a durable delivery promise. A crash between
+cursor/dedup persistence and submission can lose that submission. A timeout or
+crash during an API call can leave delivery unknown; this is not exactly-once
+delivery or proof that nothing was sent. Restart never schedules result records.
+No automatic eviction deletes deduplication facts: at 20,000 results, 10,000
+notification IDs, or 64 MiB of JSON, writes fail explicitly. Media and existing
+credentials remain in the private data root.
 
-Before load, prompt, answer, or outbound upload/send, an intent is persisted.
-Only a positively validated result records acceptance. Crash-interrupted intents
-recover as unknown, not queued. Unknown load/prompt/answer/send results block
-automatic consumption and sending in their non-retired generation. Retired
-in-flight effects also block until their outcome is recorded; a crash recovers
-them as unknown without replay. There is no retry-on-timeout or success-shaped
-fallback. Confirmed native prompt receipts use `user.message.data.messageId`;
-the chat event UUID is used only as a history position, never as that receipt.
+`GET /status` reports configuration, binding, revision, `lastError`, and redacted
+result keys/directions/statuses/reasons. `lastError` is informational, never a
+gate. Errors are also reported to the Host; input failures attempt a WeChat
+notice, whose failure is separately visible. The former `POST /resolve` and
+`POST /recheck` routes are removed. There is no unlock/drop/retry replacement.
 
-Module API `GET /status` (under the host's digest-bound module API base) reports
-binding, state revision, redacted stages, and problem codes. It does not reveal
-tokens, text, media content, or CDN keys. `POST /resolve` can explicitly abandon
-one unknown record (or queued work belonging to a retired binding):
+### Upgrading existing native data
 
-```json
-{"revision":42,"key":"record-key-from-status","action":"abandon","note":"Operator investigated the ambiguous outcome and accepts no resend."}
-```
+SQLite `user_version=1` and the `state(id,json)` table remain unchanged.
+The first load of pre-adapter native JSON performs one additive conversion to
+`adapter: 2`: preserve the entire old JSON verbatim in `legacy`, retain binding,
+cursor and notification identity, and extract only deduplication/result and
+quote metadata. Old queued/abandoned/rejected records become non-runnable
+`skipped` results; ambiguous intents/unknowns stay `unknown`. Original facts,
+including their original stages, remain in `legacy`. Runtime code never reads
+that snapshot to dispatch work. No legacy queue implementation is retained.
 
-This is an explicit loss-accepting disposition, not proof that the remote side
-did not act or a rollback. It never resends. Revision mismatch rejects stale
-operator action. After diagnosing a transient general fault, `POST /recheck`
-with `{"revision":42,"note":"Reason for explicitly resuming passive checks"}` clears
-only that fault and permits a new read cycle. It does not clear any unknown
-mutation or discard an anchor; a persistent problem blocks again. Missing
-history anchors or corrupt storage require diagnosis; do not delete or edit the
-database to manufacture success.
+Credentials, configuration, and private file bytes/paths are untouched.
+An already-presented current question is retained only with its confirmed
+successful send and presentation time. Unsupported database/JSON schemas still
+fail explicitly. This does not discover or migrate former standalone CLI data.
+See the [deployment preservation boundary](DELIVERY.md#existing-native-data).
 
-## Output and history
+## Media, quotes, and protocol identities
 
-Primary `assistant.message` events provide prompt capture of live local file
-references. The module claims each output before capture and freezes its own
-bytes. A duplicate callback cannot recapture a changed source. Shared-session
-text is mirrored regardless of which authorized interface initiated the turn.
-No topic matching, text similarity, or subagent output guessing is used.
+Inbound image/video/file media comes directly from the fixed WeChat CDN and is
+decrypted, bounded, checked, and stored privately. Native `prompt` receives file
+attachments. No Files module or cross-module upload/reference API is required.
+Outgoing explicit Markdown file references are recognized only outside code.
+Narrow configured roots, regular-file checks, and denied credential/private
+locations constrain access. Copies are hashed and checked before encrypted
+upload, and are not executable.
 
-Passive `session/chat` reads use persisted backward pages, bounded to 40 pages
-of 64 events per recovery pass, with an exact retained event anchor. Cursor
-source/direction and shape are validated. Initial history establishes a boundary
-without replaying pre-binding messages. A missing anchor or invalid page blocks
-instead of silently jumping forward. A historical output containing local file
-links without a previously captured snapshot becomes unresolved; replay does
-not reread a mutable file to impersonate the old attachment.
+Images support PNG/JPEG up to 4 MiB; file/video limit is 25 MiB. Redirects and
+unapproved origins are refused. AES-128-ECB follows Tencent's protocol;
+size/hash checks are not a claim of cryptographic authenticity. These limits
+are connector policy, not Tencent quota guarantees.
 
-## Local media boundary (independent of Files)
+Envelope `message_id`, send receipts, and quote `svr_id` preserve decimal uint64
+identities. Item `msg_id` is opaque metadata, including quoted items, never an
+envelope identity or a deduplication key. Quotes resolve only exact IDs within
+the same binding and authorized account/peer. Ambiguous or absent IDs retain
+only supplied quote context; partial selections remain unverified. No topic or
+text-similarity matching is used.
 
-Inbound image/video/file media is downloaded directly from the fixed WeChat CDN,
-decrypted locally, bounded, checked, and retained as a private module-owned file.
-Ordinary native `prompt` receives `text` plus `type: "file"` attachments with local
-paths. No Files module, old upload endpoint, `files/get`, managed URL attachment,
-or cross-module service is required. Optional Files prompt middleware remains
-transparent and independently owned by that module.
+## Shutdown
 
-Outbound explicit Markdown file links/images are interpreted only outside code.
-The configured narrow file roots and real local path checks authorize reads;
-ordinary files only, no symlinks, devices, directories, broad scans, or remote
-URL downloads. Credential names/locations and native/module private roots are
-denied. File bytes are independently captured, then hashed and checked before
-encrypted CDN upload. No retry or display reads the original source again.
-The optional Files module may capture its own copy; no cross-module snapshot
-identity is claimed.
-
-Images are PNG/JPEG with a 4 MiB limit; file/video limit is 25 MiB. Small header
-checks distinguish supported image/video formats; extensions are not authority.
-CDN redirects and unapproved origins are refused. AES-128-ECB follows Tencent's
-protocol; optional sizes/hashes detect corruption, not cryptographic authenticity.
-Files are not executed. Limits are connector policy, not a claim about Tencent
-quotas or permanent API availability.
-
-Quotes resolve only exact retained server IDs within the same account, peer,
-and binding generation. Outgoing IDs refer to an exact delivered part, not
-necessarily an entire assistant message. Unknown or conflicting IDs retain only
-explicitly supplied quote metadata. Partial selections are unverified context;
-no text matching recovers missing history.
-
-## Graceful shutdown
-
-`context.stopping` synchronously gates new business effects and cancels long polls.
-Already-started sends use `context.signal`, retained until final disposal, so
-their acceptance or uncertainty can be durably recorded. `onStop` joins producers
-and active capture/send/persistence work. `dispose` releases database and leases
-afterward. Failures propagate to the host drain; the module never exits or
-restarts the host. A stopped-between-upload-and-send intent remains unknown and
-will not be retried automatically.
+Host stopping gates new effects and cancels polling. Shutdown awaits current
+process-local operations so known API outcomes can be recorded before storage
+closes. This is lifecycle cleanup, not a durable drain/recovery workflow.
+Unfinished effects are not resumed on restart. The module never exits or
+restarts the Host.

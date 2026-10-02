@@ -22,11 +22,13 @@ export function moduleProduct(root) {
   const source = readFileSync(join(root, 'native/state.ts'), 'utf8');
   assert.match(source, /existing && version\?\.user_version !== 1/);
   assert.match(source, /value\?\.schema === 1/);
+  assert.match(source, /value\.adapter === 2/);
   const directory = mkdtempSync(join(tmpdir(), 'wechat-schema-'));
   let store;
   let db;
   try {
     store = new Store(directory, 'synthetic-contract-only');
+    assert.equal(store.read().adapter, 2);
     store.close(); store = undefined;
     db = new DatabaseSync(join(directory, 'native-v1.sqlite'), { readOnly: true });
     const schema = db.prepare('PRAGMA user_version').get().user_version;

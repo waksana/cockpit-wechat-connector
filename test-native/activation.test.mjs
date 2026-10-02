@@ -2,8 +2,8 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { copyFileSync, mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { tmpdir } from 'node:os';
 import { pathToFileURL } from 'node:url';
+import { DatabaseSync } from 'node:sqlite';
 import { accountLease, readConfig, credentials, identity } from '../dist/config.js';
 import { activate } from '../dist/index.js';
 import { Store } from '../dist/state.js';
@@ -18,7 +18,7 @@ function context(root, config = {}) {
       async call() { throw new Error('NO_HOST_CALL_EXPECTED'); } } }, stopping };
 }
 test('unconfigured installation stays unavailable without reading credentials or calling host', async t => {
-  const root = mkdtempSync(join(tmpdir(), 'wechat-config-'));
+  const root = mkdtempSync(join(process.cwd(), '.wechat-config-'));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const fixture = context(root);
   const backend = await activate(fixture.context);
@@ -28,12 +28,16 @@ test('unconfigured installation stays unavailable without reading credentials or
   const status = await backend.routes.find(route => route.path === '/status').handler({});
   assert.equal(status.body.configured, false);
   assert.equal(status.body.binding, null);
+  assert.equal(status.body.lastError, null);
+  assert.deepEqual(status.body.receipts, []);
+  assert.deepEqual(backend.routes.map(({ method, path }) => ({ method, path })), [{ method: 'GET', path: '/status' }]);
+  for (const obsolete of ['inputs', 'outputs', 'fault']) assert(!(obsolete in status.body));
   fixture.stopping.abort();
   await backend.onStop();
   await backend.dispose();
 });
 test('credential provisioning requires exact identity and private regular file', t => {
-  const root = mkdtempSync(join(tmpdir(), 'wechat-credentials-'));
+  const root = mkdtempSync(join(process.cwd(), '.wechat-credentials-'));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const path = join(root, 'credentials.json');
   writeFileSync(path, JSON.stringify({ account: 'a', peer: 'p', token: 'synthetic-only' }), { mode: 0o600 });
@@ -51,13 +55,19 @@ test('account lease rejects a second native consumer and releases after close', 
   await new Promise(resolve => next.close(resolve));
 });
 test('private state refuses identity changes and unknown schema without rewriting old bytes', t => {
-  const root = mkdtempSync(join(tmpdir(), 'wechat-state-'));
+  const root = mkdtempSync(join(process.cwd(), '.wechat-state-'));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const store = new Store(root, 'original');
   store.close();
   const before = readFileSync(join(root, 'native-v1.sqlite'));
   assert.throws(() => new Store(root, 'other'), /ACCOUNT_CONFIGURATION_CHANGED/);
   assert.deepEqual(readFileSync(join(root, 'native-v1.sqlite')), before);
+  const db = new DatabaseSync(join(root, 'native-v1.sqlite'));
+  db.exec('PRAGMA user_version=99');
+  db.close();
+  const unsupported = readFileSync(join(root, 'native-v1.sqlite'));
+  assert.throws(() => new Store(root, 'original'), /STATE_SCHEMA_UNSUPPORTED/);
+  assert.deepEqual(readFileSync(join(root, 'native-v1.sqlite')), unsupported);
 });
 test('module manifest is neutral and version matches package', () => {
   const manifest = JSON.parse(readFileSync(new URL('../cockpit.module.json', import.meta.url)));
@@ -68,7 +78,7 @@ test('module manifest is neutral and version matches package', () => {
   assert.equal(pkg.devDependencies['@waksana/cockpit-module-sdk'], '0.15.0');
 });
 test('bundled backend imports outside the checkout with no installed dependencies', async t => {
-  const root = mkdtempSync(join(tmpdir(), 'wechat-bundle-'));
+  const root = mkdtempSync(join(process.cwd(), '.wechat-bundle-'));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const bundle = join(root, 'backend.mjs');
   copyFileSync(new URL('../dist/index.js', import.meta.url), bundle);
@@ -77,7 +87,7 @@ test('bundled backend imports outside the checkout with no installed dependencie
   assert.throws(() => isolated.capabilities({ host: {} }), /REQUIRED_HOST_CAPABILITIES_MISSING/);
 });
 test('invalid config still reports retained occupancy and query uncertainty', async t => {
-  const root = mkdtempSync(join(tmpdir(), 'wechat-existing-'));
+  const root = mkdtempSync(join(process.cwd(), '.wechat-existing-'));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const store = new Store(root, 'prior-account');
   store.change(state => { state.generation = 1; state.binding = { sessionId: 'retained', generation: 1 }; });
@@ -93,26 +103,26 @@ test('invalid config still reports retained occupancy and query uncertainty', as
   await backend.onStop();
   await backend.dispose();
 });
-test('public role callbacks replace deleted bindings and serve only fresh traffic with fake transport', async t => {
+test('public availability, permit and saved callbacks replace deletion or unbound unknown history and serve fresh traffic', async t => {
   for (const alreadyRetired of [false, true]) await t.test(`already retired: ${alreadyRetired}`, { timeout: 10000 }, async t => {
-    const root = mkdtempSync(join(tmpdir(), 'wechat-role-flow-'));
+    const root = mkdtempSync(join(process.cwd(), '.wechat-role-flow-'));
     const config = { enabled: true, exclusiveAccountConfirmed: true, account: `fixture-${process.pid}`,
       peer: 'fake-peer', fileRoots: [], webUrl: 'https://example.test' };
     const store = new Store(root, identity(config));
     store.change(state => {
       state.generation = alreadyRetired ? 2 : 1;
       state.binding = alreadyRetired ? null : { sessionId: 'deleted', generation: 1, anchor: null };
-      if (alreadyRetired) state.retired.push({ sessionId: 'deleted', generation: 1, at: Date.now() });
-      state.outputs.push(...['unknown', 'queued'].map(stage => ({
-        key: `old-${stage}`, generation: 1, kind: 'reply', stage, text: `old ${stage}`, files: [],
-        parts: [{ stage, clientId: `old-${stage}`, text: `old ${stage}` }],
-        ...(stage === 'unknown' ? { reason: 'WECHAT_API_REJECTED' } : {}),
+      state.lastError = 'WECHAT_API_REJECTED';
+      state.receipts.push(...['unknown', 'skipped'].map(status => ({
+        key: `old-${status}`, generation: 1, direction: 'output', status, text: `old ${status}`, media: [],
+        reason: status === 'unknown' ? 'WECHAT_API_REJECTED' : 'LEGACY_RECORD_NOT_REPLAYED',
       })));
     });
     store.close();
     writeFileSync(join(root, 'credentials.json'), JSON.stringify({
       account: config.account, peer: config.peer, token: 'synthetic-only',
     }), { mode: 0o600 });
+    const credentialBytes = readFileSync(join(root, 'credentials.json'));
     const fixture = context(root, config);
     const calls = [];
     const sent = [];
@@ -136,7 +146,8 @@ test('public role callbacks replace deleted bindings and serve only fresh traffi
     t.mock.method(globalThis, 'fetch', async (url, init) => {
       if (url.pathname === '/ilink/bot/getupdates') {
         if (polled) return new Promise((resolve, reject) => {
-          init.signal.addEventListener('abort', () => reject(init.signal.reason), { once: true });
+          if (init.signal.aborted) reject(init.signal.reason);
+          else init.signal.addEventListener('abort', () => reject(init.signal.reason), { once: true });
         });
         polled = true;
         return new Response(JSON.stringify({ get_updates_buf: 'fresh-cursor', msgs: [{
@@ -163,17 +174,23 @@ test('public role callbacks replace deleted bindings and serve only fresh traffi
     assert.deepEqual((await backend.roleAssignments.availability(selection, signal)).reasons, []);
     assert.deepEqual(await backend.roleAssignments.permit(selection, signal), { allowed: true });
     await backend.roleAssignments.saved({ ...selection, notificationId: 'saved' }, signal);
+    await backend.roleAssignments.saved({ ...selection, notificationId: 'saved' }, signal);
+    assert(!calls.some(call => ['prompt', 'session/load', 'session/new'].includes(call.name)));
     await backend.onReady();
     await received;
     fixture.stopping.abort();
     await backend.onStop();
     const status = (await backend.routes.find(route => route.path === '/status').handler({})).body;
     assert.equal(status.binding.sessionId, 'replacement');
-    assert.equal(status.fault, null);
-    assert.equal(status.outputs.find(output => output.key === 'old-unknown').stage, 'unknown');
-    assert.equal(status.outputs.find(output => output.key === 'old-unknown').reason, 'WECHAT_API_REJECTED');
-    assert.equal(status.outputs.find(output => output.key === 'old-queued').stage, 'abandoned');
+    assert.equal(status.lastError, 'WECHAT_API_REJECTED');
+    assert.equal(status.receipts.find(receipt => receipt.key === 'old-unknown').status, 'unknown');
+    assert.equal(status.receipts.find(receipt => receipt.key === 'old-unknown').reason, 'WECHAT_API_REJECTED');
+    assert.equal(status.receipts.find(receipt => receipt.key === 'old-skipped').status, 'skipped');
+    assert.deepEqual(backend.routes.map(({ method, path }) => ({ method, path })), [{ method: 'GET', path: '/status' }]);
+    for (const obsolete of ['inputs', 'outputs', 'fault']) assert(!(obsolete in status));
+    assert.deepEqual(readFileSync(join(root, 'credentials.json')), credentialBytes);
     assert.deepEqual(calls.filter(call => call.name === 'prompt').map(call => call.body.sessionId), ['replacement']);
+    assert.equal(calls.find(call => call.name === 'prompt').body.mode, 'immediate');
     assert.deepEqual(sent.map(message => message.item_list[0].text_item.text), ['fresh reply only']);
   });
 });

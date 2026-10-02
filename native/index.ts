@@ -53,44 +53,9 @@ export async function activate(context: ModuleBackendContext): Promise<ModuleBac
         const state = store?.read();
         return { body: { configured: problems.length === 0, problems, running: !!accountLock,
           revision: state?.revision, binding: state?.binding ? { sessionId: state.binding.sessionId, generation: state.binding.generation } : null,
-          fault: state?.fault ?? null,
-          inputs: state?.inputs.map(input => ({ key: input.key, stage: input.stage, operation: input.operation, reason: input.reason })) ?? [],
-          outputs: state?.outputs.map(output => ({ key: output.key, stage: output.stage, reason: output.reason })) ?? [] } };
-      } },
-      { method: 'POST', path: '/resolve', body: 'json', bodyLimit: 4096, handler: request => {
-        context.stopping.throwIfAborted();
-        invariant(store, 'SERVICE_UNCONFIGURED');
-        const body = request.body;
-        invariant(typeof body === 'object' && body !== null && 'revision' in body && 'key' in body && 'note' in body
-          && 'action' in body && body.action === 'abandon' && typeof body.key === 'string'
-          && typeof body.note === 'string' && body.note.trim().length >= 8 && body.note.length <= 1000, 'RESOLUTION_INVALID');
-        const { key, note, revision } = body;
-        store.change(state => {
-          invariant(state.revision === revision, 'STATE_REVISION_CHANGED');
-          const input = state.inputs.find(input => input.key === key);
-          const output = state.outputs.find(output => output.key === key);
-          const retiredInput = input?.stage === 'queued' && input.generation !== state.binding?.generation;
-          const retiredOutput = output?.stage === 'queued' && output.generation !== state.binding?.generation;
-          invariant(input?.stage === 'unknown' || output?.stage === 'unknown' || retiredInput || retiredOutput, 'RESOLUTION_NOT_UNKNOWN');
-          if (input) input.stage = 'abandoned';
-          if (output) output.stage = 'abandoned';
-          state.resolutions.push({ key, note, at: Date.now() });
-        });
-        return { body: { ok: true, meaning: 'Abandoned locally; no retry, remote rollback, or non-delivery claim.' } };
-      } },
-      { method: 'POST', path: '/recheck', body: 'json', bodyLimit: 4096, handler: request => {
-        context.stopping.throwIfAborted();
-        invariant(store, 'SERVICE_UNCONFIGURED');
-        const body = request.body;
-        invariant(typeof body === 'object' && body !== null && 'revision' in body && 'note' in body
-          && typeof body.note === 'string' && body.note.trim().length >= 8 && body.note.length <= 1000, 'RECHECK_INVALID');
-        const { revision, note } = body;
-        store.change(state => {
-          invariant(state.revision === revision && state.fault, 'RECHECK_STATE_CHANGED');
-          state.resolutions.push({ key: `fault:${state.fault}`, note, at: Date.now() });
-          delete state.fault;
-        });
-        return { body: { ok: true, meaning: 'Explicitly permit another read cycle; unknown effects remain blocked.' } };
+          lastError: state?.lastError ?? null,
+          receipts: state?.receipts.map(receipt => ({ key: receipt.key, direction: receipt.direction,
+            status: receipt.status, reason: receipt.reason })) ?? [] } };
       } },
     ],
     roleAssignments: {
