@@ -10,3 +10,5 @@ coverage/
 tokens/
 state/
 credentials*.json
+dist/
+*.tgz

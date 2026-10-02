@@ -1,0 +1,14 @@
+{
+  "apiVersion": 1,
+  "id": "wechat",
+  "name": "WeChat",
+  "version": "0.2.0",
+  "backend": "dist/index.js",
+  "roles": [
+    {
+      "id": "wechat",
+      "name": "WeChat",
+      "description": "Bind this session to the single explicitly authorized WeChat private conversation."
+    }
+  ]
+}

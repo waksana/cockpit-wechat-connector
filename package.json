@@ -1,14 +1,24 @@
 {
-  "name": "weixin-cockpit-bridge",
-  "version": "0.1.6",
+  "name": "@waksana/cockpit-wechat-connector",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "engines": {
     "node": ">=24.0.0"
   },
   "scripts": {
-    "start": "node src/cli.js run",
-    "test": "node --test test/*.test.js",
-    "check": "node --check src/cli.js && node --check src/bridge.js && node --check src/module-adopt.js"
+    "build": "tsc -p tsconfig.json && node scripts/bundle.mjs",
+    "test": "node --test --test-concurrency=2 test-native/*.test.mjs",
+    "test:legacy": "node --test test/*.test.js",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "pack:module": "npm pack --ignore-scripts"
+  },
+  "files": ["dist/index.js", "dist/THIRD_PARTY_LICENSES.txt", "cockpit.module.json", "LICENSE", "LICENSE.tencent", "THIRD_PARTY_NOTICES.md", "README.md", "docs/MODULE.md", "docs/DELIVERY.md"],
+  "devDependencies": {
+    "@types/node": "24.10.1",
+    "@waksana/cockpit-module-sdk": "0.15.0",
+    "esbuild": "0.25.11",
+    "mdast-util-from-markdown": "2.0.2",
+    "typescript": "5.9.3"
   }
 }

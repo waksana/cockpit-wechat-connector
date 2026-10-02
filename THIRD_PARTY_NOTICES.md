@@ -1,5 +1,31 @@
 # Protocol provenance
 
+## Native module
+
+`native/transport.ts` and `native/media.ts` independently implement the same
+Tencent iLink envelopes, numeric message types, lossless server IDs, CDN paths,
+and AES-128-ECB media protocol described below. Copyright (C) 2026 Tencent;
+the retained MIT license is [LICENSE.tencent](LICENSE.tencent).
+No OpenClaw runtime, account store, installer, logger, lifecycle, legacy bridge
+CLI, or standalone service is imported into the module.
+
+The native module downloads/decrypts inbound media into its own private local
+files and supplies standard native file attachments. It captures outbound local
+Markdown references independently. It does **not** use the legacy managed-upload
+endpoints or `files/get` discussed in the historical notes below.
+
+The public interaction-capability review used Tencent revision
+[`24de5c9eb0dd5e595d7e2d090ed8a3f82870d42c`](https://github.com/Tencent/openclaw-weixin/tree/24de5c9eb0dd5e595d7e2d090ed8a3f82870d42c),
+specifically `src/api/types.ts` and `docs/protocol_zh_CN.md`. These sources expose
+text/media/tool-status messages, not interactive buttons, card choices, or
+selection callbacks. AskUser is therefore bridged through ordinary text and
+the public Cockpit `respondAsk` intent, not an invented WeChat card API.
+
+Bundled runtime dependencies retain their source license comments/notices through
+the bundle. The module SDK and TypeScript compiler are build-time dependencies.
+
+## Historical CLI provenance
+
 `src/weixin.js` adapts request headers, version encoding, text-message envelopes
 and QR login states from **Tencent `@tencent-weixin/openclaw-weixin@2.4.8`**,
 published 2026-09-01T02:49:09.161Z. Copyright (C) 2026 Tencent. Its MIT notice
