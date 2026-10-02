@@ -1,0 +1,56 @@
+name: Rolling
+on:
+  pull_request_target:
+    branches: [master]
+    types: [closed]
+
+permissions:
+  contents: read
+  packages: read
+
+# Keep this workflow: its run_number owns the sequence. Do not cancel queued merges.
+jobs:
+  checks:
+    if: github.event.pull_request.merged == true
+    uses: ./.github/workflows/delivery-ci.yml
+    with:
+      source_sha: ${{ github.event.pull_request.merge_commit_sha }}
+      sequence: ${{ format('{0}', github.run_number) }}
+    permissions:
+      contents: read
+      packages: read
+  publish:
+    needs: checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      packages: read
+      actions: read
+    env:
+      ROLLING_SEQUENCE: ${{ github.run_number }}
+      ROLLING_SOURCE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: '24.20.0'
+          registry-url: https://npm.pkg.github.com
+          scope: '@waksana'
+          cache: npm
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+        env:
+          NODE_AUTH_TOKEN: ${{ github.token }}
+      - run: npm run build
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: wechat-${{ github.event.pull_request.merge_commit_sha }}-linux-x64
+          path: release-artifact
+      - name: Verify exact bytes, then publish once
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/rolling-release.mjs release-artifact

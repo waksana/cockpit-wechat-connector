@@ -38,9 +38,11 @@ npm run pack:module
 ```
 
 The `.tgz` contains `cockpit.module.json`, bundled backend ESM, and license
-notices. No dependency installation is required by the host. CI only checks and
-uploads this module artifact: there is no production transfer, dispatch, tag,
-release, or restart workflow. See [delivery boundaries](docs/DELIVERY.md).
+notices, build inventory, and (for Rolling) an embedded deployment descriptor.
+No dependency installation is required by the host. Output is in a new
+`module-output/` directory; preserve or remove that output explicitly before
+packaging again. Merged PRs publish real Rolling prereleases, never install or
+restart production. See [release and deployment boundaries](docs/DELIVERY.md).
 
 ## Installation and configuration
 

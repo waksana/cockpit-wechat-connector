@@ -4,28 +4,56 @@ on:
     branches: [master]
   push:
     branches: [master]
+  workflow_call:
+    inputs:
+      source_sha:
+        type: string
+        required: true
+      sequence:
+        type: string
+        required: true
 permissions:
   contents: read
   packages: read
 jobs:
   build:
     name: Required checks
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
-          node-version: '24'
+          ref: ${{ inputs.source_sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: '24.20.0'
           registry-url: https://npm.pkg.github.com
           scope: '@waksana'
           cache: npm
       - run: npm ci --ignore-scripts --no-audit --no-fund
         env:
           NODE_AUTH_TOKEN: ${{ github.token }}
-      - run: npm run build && npm test && npm run pack:module
-      - uses: actions/upload-artifact@v4
+      - name: Build and check module and release contracts
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          SEQUENCE: ${{ inputs.sequence }}
+        run: |
+          if [ -n "$SEQUENCE" ]; then
+            export ROLLING_SEQUENCE="$SEQUENCE" ROLLING_SOURCE_SHA="$SOURCE_SHA"
+          fi
+          npm run build
+          mkdir -p "$RUNNER_TEMP/wechat-test/home" "$RUNNER_TEMP/wechat-test/copilot" "$RUNNER_TEMP/wechat-test/cockpit"
+          HOME="$RUNNER_TEMP/wechat-test/home" \
+          COPILOT_HOME="$RUNNER_TEMP/wechat-test/copilot" \
+          COCKPIT_HOME="$RUNNER_TEMP/wechat-test/cockpit" npm test
+          npm run pack:module
+          if [ -n "$SEQUENCE" ]; then
+            node scripts/package-release.mjs verify module-output
+          fi
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: wechat-native-module
-          path: waksana-cockpit-wechat-connector-*.tgz
+          name: wechat-${{ inputs.source_sha || github.sha }}-linux-x64
+          path: module-output/*
           if-no-files-found: error
+          retention-days: 7
