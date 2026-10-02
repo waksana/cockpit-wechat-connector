@@ -38,6 +38,74 @@ test('unauthorized and group messages are never enqueued, even with malformed it
   assert.equal((await transport.poll('')).messages.length, 1);
 });
 
+test('opaque item identities do not use the envelope uint64 identity contract', async () => {
+  const item = {
+    type: 1, msg_id: 'synthetic-part:alpha/001', text_item: { text: 'hello' },
+    ref_msg: { svr_id: '18446744073709551614',
+      message_item: { type: 1, msg_id: 'synthetic-part:quoted/01', text_item: { text: 'quoted' } } },
+  };
+  const transport = new WechatTransport(config, async () => json({
+    msgs: [message({ item_list: [item] })], get_updates_buf: 'next',
+  }));
+  const result = await transport.poll('before');
+  assert.equal(result.messages[0].id, '18446744073709551615');
+  assert.deepEqual(result.messages[0].items, [item]);
+  assert.deepEqual(result.messages[0].quotes, [item.ref_msg]);
+});
+
+test('item IDs remain bounded strings without normalization, including quoted items and outgoing metadata', async () => {
+  for (const id of ['', '00042', '18446744073709551616', 'opaque/part:ABC-1', 'x'.repeat(1024)]) {
+    const item = { type: 1, msg_id: id, text_item: { text: 'hello' },
+      ref_msg: { svr_id: '42', message_item: { type: 1, msg_id: id } } };
+    let sent;
+    const transport = new WechatTransport(config, async (url, init) => {
+      if (url.pathname.endsWith('/getupdates')) return json({ msgs: [message({ item_list: [item] })], get_updates_buf: 'next' });
+      sent = JSON.parse(init.body).msg.item_list[0];
+      return json({ ret: 0, message_id: '43' });
+    });
+    const result = await transport.poll('');
+    assert.deepEqual(result.messages[0].items[0], item);
+    await transport.send([item], 'context', 'client');
+    assert.deepEqual(sent, item);
+  }
+  for (const id of [null, true, {}, [], 'x'.repeat(1025), 'bad\nid', 'bad\u0000id', 'bad\u007fid']) {
+    for (const item of [
+      { type: 1, msg_id: id, text_item: { text: 'hello' } },
+      { type: 1, text_item: { text: 'hello' }, ref_msg: { message_item: { type: 1, msg_id: id } } },
+    ]) {
+      const transport = new WechatTransport(config, async () => json({ msgs: [message({ item_list: [item] })], get_updates_buf: 'unsafe' }));
+      await assert.rejects(transport.poll('before'), /ITEM_MESSAGE_ID_INVALID/);
+      await assert.rejects(transport.send([item], 'context', 'client'), /ITEM_MESSAGE_ID_INVALID/);
+    }
+  }
+});
+
+test('legacy integer item IDs use original JSON tokens without server-ID range checks or numeric rounding', async () => {
+  const transport = new WechatTransport(config, async () => new Response(
+    '{"msgs":[{"message_id":18446744073709551615,"from_user_id":"test-peer","to_user_id":"test-bot","message_type":1,"message_state":2,"context_token":"test-context","item_list":[{"type":1,"msg_id":18446744073709551616,"text_item":{"text":"hello"},"ref_msg":{"svr_id":"42","message_item":{"type":1,"msg_id":9007199254740993}}}]}],"get_updates_buf":"next"}',
+  ));
+  const { messages } = await transport.poll('');
+  assert.equal(messages[0].items[0].msg_id, '18446744073709551616');
+  assert.equal(messages[0].quotes[0].message_item.msg_id, '9007199254740993');
+  for (const token of ['-1', '1.5', '1e3']) {
+    const raw = JSON.stringify({ msgs: [message({ item_list: [{ type: 1, msg_id: '__ID__', text_item: { text: 'hello' } }] })], get_updates_buf: 'unsafe' });
+    await assert.rejects(new WechatTransport(config, async () => new Response(raw.replace('"__ID__"', token))).poll(''), /RESPONSE_JSON_INVALID/);
+  }
+  for (const id of [42, 9007199254740992]) {
+    await assert.rejects(new WechatTransport(config, async () => assert.fail('unsafe outbound ID must not send'))
+      .send([{ type: 1, msg_id: id, text_item: { text: 'hello' } }], 'context', 'client'), /ITEM_MESSAGE_ID_INVALID/);
+  }
+});
+
+test('invalid item metadata on unrelated senders is filtered before item validation', async () => {
+  const transport = new WechatTransport(config, async () => json({
+    msgs: [message({ from_user_id: 'stranger', item_list: [{ type: 1, msg_id: null }] }),
+      message({ group_id: 'group', item_list: [{ type: 1, msg_id: {} }] }), message()],
+    get_updates_buf: 'next',
+  }));
+  assert.equal((await transport.poll('')).messages.length, 1);
+});
+
 test('malformed known-authorized messages reject the entire poll without exposing a new cursor', async () => {
   for (const malformed of [
     { message_state: 1 }, { message_type: 2 }, { context_token: '' }, { item_list: [] },

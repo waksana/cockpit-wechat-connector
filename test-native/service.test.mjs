@@ -73,6 +73,47 @@ function message(id,text='hello',extra={}) {
 test('required capabilities checked before activation can open storage',() => {
   assert.throws(() => capabilities({ host: {} }),/REQUIRED_HOST_CAPABILITIES_MISSING/);
 });
+test('opaque item IDs survive polling while only envelope IDs deduplicate and resolve quotes',async t => {
+  const f=fixture(t);
+  await bind(f);
+  let batch=0;
+  const transport=new WechatTransport({ account: 'account',peer: 'peer',token: 'synthetic-only' },async () => {
+    const itemId=batch++===0?'synthetic-part:alpha/001':'synthetic-part:changed/1';
+    return new Response(JSON.stringify({
+      get_updates_buf: `cursor-${batch}`,msgs: [{
+        message_id: '9007199254740993',from_user_id: 'peer',to_user_id: 'account',
+        message_type: 1,message_state: 2,context_token: 'fake-context',
+        item_list: [{ type: 1,msg_id: itemId,text_item: { text: 'first envelope' } }],
+      }, {
+        message_id: '9007199254740994',from_user_id: 'peer',to_user_id: 'account',
+        message_type: 1,message_state: 2,context_token: 'fake-context',
+        item_list: [{ type: 1,msg_id: itemId,text_item: { text: 'second envelope' },
+          ref_msg: { svr_id: '42',message_item: {
+            type: 1,msg_id: '9007199254740993',text_item: { text: 'provided context, not an envelope match' },
+          } } }],
+      }],
+    }));
+  });
+  const service=new Service(f.context,f.config,f.store,transport);
+  await service.poll();
+  assert.equal(f.store.read().inputs.length,2);
+  assert.equal(f.store.read().inputs[0].message.items[0].msg_id,'synthetic-part:alpha/001');
+  assert.equal(f.store.read().cursor,'cursor-1');
+  await service.tick();
+  await service.tick();
+  await service.poll();
+  await service.tick();
+  const inputs=f.store.read().inputs;
+  assert.equal(inputs.length,2);
+  assert(inputs.every(input => input.stage==='accepted'));
+  assert.equal(inputs[0].key,'account:9007199254740993');
+  assert.equal(inputs[1].key,'account:9007199254740994');
+  assert.equal(f.store.read().cursor,'cursor-2');
+  const prompts=f.calls.filter(call => call.name==='prompt');
+  assert.equal(prompts.length,2);
+  assert(prompts[1].body.text.includes('"resolution":"unresolved"'));
+  assert(!prompts[1].body.text.includes('exact-local-id'));
+});
 test('without Files, encrypted incoming attachments and immutable outgoing copies traverse native prompt and CDN',async t => {
   const f=fixture(t);
   await bind(f);
@@ -91,7 +132,7 @@ test('without Files, encrypted incoming attachments and immutable outgoing copie
         message_id: '700',from_user_id: 'peer',to_user_id: 'account',
         message_type: 1,message_state: 2,context_token: 'fake-context',
         item_list: [{
-          type: 4,file_item: {
+          type: 4,msg_id: 'synthetic-file-part/001',file_item: {
             file_name: 'in.txt',len: String(original.length),
             media: { encrypt_query_param: 'fake',aes_key: key.toString('base64'),encrypt_type: 1 }
           }
@@ -136,7 +177,7 @@ test('without Files, encrypted incoming attachments and immutable outgoing copie
   service.ingest([message('701','Quote file',{
     items: [{
       type: 1,text_item: { text: 'Quote file' },
-      ref_msg: { svr_id: String(801+fileSendIndex),message_item: { type: 4 } }
+      ref_msg: { svr_id: String(801+fileSendIndex),message_item: { type: 4,msg_id: 'synthetic-file-part/quoted' } }
     }]
   })],'quote-cursor',f.store.read().binding);
   await service.tick();

@@ -34,6 +34,22 @@ Unknown schema/account changes refuse startup. It is not the old bridge schema.
 All files and receipts stay in this module's host-provided data root.
 
 Inbound messages and poll cursor are committed together. IDs are account-scoped.
+Envelope `message_id`, send receipts, and quote `svr_id` use lossless decimal
+uint64 server identities. Item `msg_id` (including a quoted `message_item.msg_id`)
+is instead opaque string metadata: it is preserved without numeric conversion,
+trimming, or case folding. Empty/default item IDs are permitted; a local 1,024
+character limit and control-character rejection bound this metadata. Legacy
+integer JSON item IDs are preserved from their original decimal token, never a
+rounded JavaScript number; outgoing item IDs must already be strings.
+Item IDs never identify a persisted
+input, correlate a receipt, or resolve a retained quoted file; only the scoped
+server identity does that. An invalid authorized message rejects the whole poll
+before its cursor is committed.
+
+This distinction follows Tencent's [item and envelope type declarations](https://github.com/Tencent/openclaw-weixin/blob/24de5c9eb0dd5e595d7e2d090ed8a3f82870d42c/src/api/types.ts#L175-L206)
+and [nonnumeric quoted-item example](https://github.com/Tencent/openclaw-weixin/blob/24de5c9eb0dd5e595d7e2d090ed8a3f82870d42c/src/messaging/inbound.test.ts#L352-L375).
+The item length/control limits are connector policy, not claimed server limits.
+
 Before load, prompt, answer, or outbound upload/send, an intent is persisted.
 Only a positively validated result records acceptance. Crash-interrupted intents
 recover as unknown, not queued. Unknown load/prompt/answer/send results block
