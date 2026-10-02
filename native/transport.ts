@@ -287,9 +287,9 @@ export class WechatTransport {
     let value: unknown;
     try {
       value = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes), ((key: string, item: unknown, context?: { source?: string }) => {
-        if (['message_id', 'svr_id'].includes(key) && typeof item === 'number') {
+        if (['message_id', 'msg_id', 'svr_id'].includes(key) && typeof item === 'number') {
           assert(typeof context?.source === 'string' && /^(0|[1-9]\d*)$/u.test(context.source), 'MESSAGE_ID_INVALID');
-          return serverMessageId(context.source);
+          return key === 'msg_id' ? itemMessageId(context.source) : serverMessageId(context.source);
         }
         return item;
       }) as Parameters<typeof JSON.parse>[1]);

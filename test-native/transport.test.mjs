@@ -16,7 +16,7 @@ test('poll pins official origin and preserves uint64 message and quote IDs lossl
   let request;
   const transport = new WechatTransport(config, async (url, init) => {
     request = { url: url.href, ...init };
-    return new Response('{"msgs":[{"message_id":18446744073709551615,"from_user_id":"test-peer","to_user_id":"test-bot","message_type":1,"message_state":2,"context_token":"test-context","create_time_ms":1234,"item_list":[{"type":1,"msg_id":"9007199254740993","text_item":{"text":"hello"},"ref_msg":{"svr_id":18446744073709551614,"partial_text":{"start":"first","end":"last"}}}]}],"get_updates_buf":"next"}');
+    return new Response('{"msgs":[{"message_id":18446744073709551615,"from_user_id":"test-peer","to_user_id":"test-bot","message_type":1,"message_state":2,"context_token":"test-context","create_time_ms":1234,"item_list":[{"type":1,"msg_id":9007199254740993,"text_item":{"text":"hello"},"ref_msg":{"svr_id":18446744073709551614,"partial_text":{"start":"first","end":"last"}}}]}],"get_updates_buf":"next"}');
   });
   const result = await transport.poll('previous');
   assert.equal(result.cursor, 'next');
@@ -68,7 +68,7 @@ test('item IDs remain bounded strings without normalization, including quoted it
     await transport.send([item], 'context', 'client');
     assert.deepEqual(sent, item);
   }
-  for (const id of [null, true, {}, [], 42, 9007199254740992, 'x'.repeat(1025), 'bad\nid', 'bad\u0000id', 'bad\u007fid']) {
+  for (const id of [null, true, {}, [], 'x'.repeat(1025), 'bad\nid', 'bad\u0000id', 'bad\u007fid']) {
     for (const item of [
       { type: 1, msg_id: id, text_item: { text: 'hello' } },
       { type: 1, text_item: { text: 'hello' }, ref_msg: { message_item: { type: 1, msg_id: id } } },
@@ -80,9 +80,26 @@ test('item IDs remain bounded strings without normalization, including quoted it
   }
 });
 
+test('legacy integer item IDs use original JSON tokens without server-ID range checks or numeric rounding', async () => {
+  const transport = new WechatTransport(config, async () => new Response(
+    '{"msgs":[{"message_id":18446744073709551615,"from_user_id":"test-peer","to_user_id":"test-bot","message_type":1,"message_state":2,"context_token":"test-context","item_list":[{"type":1,"msg_id":18446744073709551616,"text_item":{"text":"hello"},"ref_msg":{"svr_id":"42","message_item":{"type":1,"msg_id":9007199254740993}}}]}],"get_updates_buf":"next"}',
+  ));
+  const { messages } = await transport.poll('');
+  assert.equal(messages[0].items[0].msg_id, '18446744073709551616');
+  assert.equal(messages[0].quotes[0].message_item.msg_id, '9007199254740993');
+  for (const token of ['-1', '1.5', '1e3']) {
+    const raw = JSON.stringify({ msgs: [message({ item_list: [{ type: 1, msg_id: '__ID__', text_item: { text: 'hello' } }] })], get_updates_buf: 'unsafe' });
+    await assert.rejects(new WechatTransport(config, async () => new Response(raw.replace('"__ID__"', token))).poll(''), /RESPONSE_JSON_INVALID/);
+  }
+  for (const id of [42, 9007199254740992]) {
+    await assert.rejects(new WechatTransport(config, async () => assert.fail('unsafe outbound ID must not send'))
+      .send([{ type: 1, msg_id: id, text_item: { text: 'hello' } }], 'context', 'client'), /ITEM_MESSAGE_ID_INVALID/);
+  }
+});
+
 test('invalid item metadata on unrelated senders is filtered before item validation', async () => {
   const transport = new WechatTransport(config, async () => json({
-    msgs: [message({ from_user_id: 'stranger', item_list: [{ type: 1, msg_id: -1 }] }),
+    msgs: [message({ from_user_id: 'stranger', item_list: [{ type: 1, msg_id: null }] }),
       message({ group_id: 'group', item_list: [{ type: 1, msg_id: {} }] }), message()],
     get_updates_buf: 'next',
   }));
