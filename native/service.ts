@@ -141,6 +141,14 @@ export class Service {
           && message.createdAt >= binding.boundAt), 'PREBINDING_INPUT_NOT_FORWARDED');
         this.store.change(state => { state.binding!.contextToken = message.contextToken; });
         binding.contextToken = message.contextToken;
+        if (question?.generation === binding.generation && question.inactiveAt !== undefined) {
+          invariant(message.createdAt !== undefined && message.createdAt > question.inactiveAt, 'ANSWER_NO_LONGER_PENDING');
+        }
+        const quotedIds = message.items.flatMap(item => item.ref_msg ? [item.ref_msg.svr_id] : []);
+        invariant(!this.store.read().receipts.some(receipt => receipt.generation === binding.generation
+          && receipt.key.startsWith(`ask:${binding.generation}:`)
+          && receipt.key !== `ask:${binding.generation}:${askId}`
+          && receipt.sent?.some(part => part.messageId && quotedIds.includes(part.messageId))), 'ANSWER_NO_LONGER_PENDING');
         let meta = await sessionMeta(this.context, binding.sessionId);
         this.current(binding);
         invariant(meta, 'TARGET_SESSION_MISSING');
@@ -158,10 +166,13 @@ export class Service {
           const ask = meta.ask;
           staleQuestion = askId !== undefined && ask?.requestId !== askId;
           const choice = ask?.choices?.find(choice => choice === message.text);
-          invariant(ask && ask.requestId === askId && question
-            && (message.createdAt === undefined || message.createdAt >= question.presentedAt)
-            && message.items.every(item => item.type === 1) && message.text.trim()
-            && (choice !== undefined || ask.allowFreeform !== false), 'ANSWER_NOT_CURRENT_OR_NOT_ALLOWED');
+          invariant(ask, 'ANSWER_NO_LONGER_PENDING');
+          invariant(askId && question, 'ANSWER_QUESTION_NOT_PRESENTED');
+          invariant(ask.requestId === askId, 'ANSWER_QUESTION_CHANGED');
+          invariant(message.createdAt === undefined || message.createdAt >= question.presentedAt, 'ANSWER_PREDATES_QUESTION');
+          invariant(message.items.every(item => item.type === 1), 'ANSWER_TEXT_ONLY');
+          invariant(message.text.trim(), 'ANSWER_EMPTY');
+          invariant(choice !== undefined || ask.allowFreeform !== false, 'ANSWER_CHOICE_NOT_ALLOWED');
           submitted = true;
           const answer = await this.context.host.call('respondAsk', { sessionId: binding.sessionId,
             requestId: ask.requestId, answer: choice ?? message.text, wasFreeform: choice === undefined });
@@ -199,7 +210,10 @@ export class Service {
         this.report(error, binding);
         if (this.matches(binding) && !this.stopped && !this.context.stopping.aborted) {
           if (askId && (staleQuestion || rejected)) this.store.change(state => {
-            if (state.question?.request.requestId === askId) state.question.answered = true;
+            if (state.question?.request.requestId === askId) {
+              state.question.answered = true;
+              state.question.inactiveAt ??= Date.now();
+            }
           });
           await this.output(binding, `input-error:${key}`, `Message not confirmed: ${rejected ? 'REQUEST_NOT_PENDING' : safeError(error)}. It will not be retried automatically.`);
         }
@@ -299,7 +313,7 @@ export class Service {
   tick(): Promise<void> { return this.track(this.watch()); }
   private async watch(): Promise<void> {
     this.accepting();
-    const binding = this.store.read().binding;
+    const { binding, question } = this.store.read();
     if (!binding) return;
     try {
       const meta = await sessionMeta(this.context, binding.sessionId);
@@ -307,7 +321,17 @@ export class Service {
       if (!meta) { this.store.change(state => retireBinding(state, binding)); return; }
       invariant(!binding.cwd || binding.cwd === meta.cwd, 'SESSION_CWD_CHANGED');
       binding.cwd = meta.cwd;
-      this.store.change(state => { state.binding!.cwd = meta.cwd; });
+      this.store.change(state => {
+        state.binding!.cwd = meta.cwd;
+        // Retire only the association captured before this authoritative read, not a newer display.
+        if (meta.loaded && question?.generation === binding.generation && !question.answered
+          && meta.ask?.requestId !== question.request.requestId
+          && state.question?.request.requestId === question.request.requestId
+          && state.question.presentedAt === question.presentedAt && !state.question.answered) {
+          state.question.answered = true;
+          state.question.inactiveAt = Date.now();
+        }
+      });
       await this.history(binding);
       this.current(binding);
       if (!meta.loaded || !this.store.read().binding?.contextToken) return;
