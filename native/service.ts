@@ -6,7 +6,7 @@ import type { ModuleBackendContext, NativeAttachment, NativeChatEvent, NativeObs
 import { type Config } from './config.js';
 import { sessionMeta } from './binding.js';
 import { type Binding, type Receipt, invariant, retireBinding, Store } from './state.js';
-import { WechatTransport, type InboundMessage, type Item } from './transport.js';
+import { WechatApiError, WechatTransport, type InboundMessage, type Item } from './transport.js';
 import { downloadInbound, uploadOutbound, verifySnapshot, type Snapshot } from './media.js';
 import { captureReferences, hasLocalReferences } from './references.js';
 
@@ -57,8 +57,11 @@ export class Service {
   }
   private report(error: unknown, binding?: Binding): void {
     const code = safeError(error);
-    if (!binding || this.matches(binding)) this.store.change(state => { state.lastError = code; });
-    this.context.report(new Error(code));
+    if (!binding || this.matches(binding)) this.store.change(state => {
+      state.lastError = code;
+      if (error instanceof WechatApiError) state.lastApiFailure = error.apiFailure;
+    });
+    this.context.report(error instanceof WechatApiError ? error : new Error(code));
     this.context.invalidate();
   }
   private cancelled(error: unknown): boolean {
@@ -287,7 +290,8 @@ export class Service {
         this.result(key, { status: 'accepted', reason: undefined });
         return true;
       } catch (error) {
-        this.result(key, { status: attempted ? 'unknown' : 'failed', reason: safeError(error) });
+        this.result(key, { status: attempted ? 'unknown' : 'failed', reason: safeError(error),
+          ...(error instanceof WechatApiError ? { apiFailure: error.apiFailure } : {}) });
         this.report(error, binding);
         return false;
       }

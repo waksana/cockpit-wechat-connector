@@ -153,6 +153,44 @@ test('origin overrides, credential URLs and redirects cannot leak authorization'
   assert.equal(calls, 1);
 });
 
+test('API rejection diagnostics retain only operation and bounded response classifications', async () => {
+  const secret = 'private-token-and-message';
+  for (const endpoint of ['getupdates', 'sendmessage', 'getuploadurl']) {
+    for (const [response, expected, code] of [
+      [{ ret: 7, errcode: 123, errmsg: secret }, { ret: 7, errcode: 123, errmsg: 'present' }, 'WECHAT_API_REJECTED'],
+      [{ ret: -14, errmsg: secret }, { ret: -14, errcode: 'absent', errmsg: 'present' }, 'WECHAT_TOKEN_EXPIRED'],
+      [{ errcode: -14 }, { ret: 'absent', errcode: -14, errmsg: 'absent' }, 'WECHAT_TOKEN_EXPIRED'],
+      [{ ret: 0, errcode: 0, errmsg: secret }, { ret: 0, errcode: 0, errmsg: 'present' }, 'WECHAT_API_REJECTED'],
+      [{ ret: secret, errcode: {}, errmsg: null }, { ret: 'invalid', errcode: 'invalid', errmsg: 'invalid' }, 'WECHAT_API_REJECTED'],
+      [{ ret: Number.MAX_SAFE_INTEGER + 1, errcode: 0.5, errmsg: '' },
+        { ret: 'invalid', errcode: 'invalid', errmsg: 'empty' }, 'WECHAT_API_REJECTED'],
+    ]) {
+      let calls = 0;
+      const transport = new WechatTransport(config, async () => {
+        calls++;
+        return json({ ...response, extra: secret, context_token: secret });
+      });
+      const before = Date.now();
+      await assert.rejects(transport.call(`ilink/bot/${endpoint}`, { text: secret }), error => {
+        assert.equal(error.message, code);
+        assert.deepEqual(error.apiFailure, {
+          endpoint: `ilink/bot/${endpoint}`, httpStatus: 200, ...expected, observedAt: error.apiFailure?.observedAt,
+        });
+        assert(error.apiFailure.observedAt >= before && error.apiFailure.observedAt <= Date.now());
+        assert(!JSON.stringify(error).includes(secret));
+        assert(!error.stack.includes(secret));
+        assert(!('cause' in error));
+        return true;
+      });
+      assert.equal(calls, 1);
+    }
+  }
+  for (const response of [{}, { ret: 0 }, { ret: 0, errcode: 0, errmsg: '' }]) {
+    assert.deepEqual(await new WechatTransport(config, async () => json(response))
+      .call('ilink/bot/getupdates', {}), response);
+  }
+});
+
 test('JSON responses have bounded body sizes and exact declared lengths', async () => {
   for (const response of [
     new Response('x', { headers: { 'content-length': String(5 * 1024 * 1024) } }),

@@ -328,6 +328,88 @@ test('displayed pending questions route exact choice and freeform answers to res
     assert.equal(f.store.read().question.answered, true);
   });
 });
+test('rejected API sends preserve safe diagnostics without replay or changing unknown delivery semantics', async t => {
+  const f = fixture(t);
+  await bind(f);
+  await establishContext(f);
+  const errors = [];
+  f.context.report = error => errors.push(error);
+  let attempts = 0;
+  const transport = new WechatTransport({ account: 'account', peer: 'peer', token: 'synthetic-only' }, async () => {
+    attempts++;
+    return new Response(JSON.stringify(attempts === 1
+      ? { ret: 1, errcode: 123, errmsg: 'SECRET_RESPONSE_TEXT', token: 'SECRET_RESPONSE_TOKEN' }
+      : { ret: 0, message_id: '101' }));
+  });
+  const service = f.serviceWith(transport);
+  const observation = { sessionId: 'session-original', event: event('rejected', 'reply') };
+  await service.observe(observation);
+  const failure = outputs(f)[0];
+  assert.equal(failure.status, 'unknown');
+  assert.equal(failure.reason, 'WECHAT_API_REJECTED');
+  assert.deepEqual(failure.apiFailure, {
+    endpoint: 'ilink/bot/sendmessage', httpStatus: 200, ret: 1, errcode: 123, errmsg: 'present',
+    observedAt: failure.apiFailure.observedAt,
+  });
+  assert.deepEqual(f.store.read().lastApiFailure, failure.apiFailure);
+  assert.deepEqual(errors[0].apiFailure, failure.apiFailure);
+  assert(!JSON.stringify([errors, f.store.read()]).includes('SECRET_RESPONSE'));
+  await service.observe(observation);
+  assert.equal(attempts, 1);
+  await service.observe({ sessionId: 'session-original', event: event('independent', 'new reply') });
+  assert.equal(attempts, 2);
+  assert.equal(outputs(f).at(-1).status, 'accepted');
+  assert.deepEqual(f.store.read().lastApiFailure, failure.apiFailure);
+  const reopened = new Store(f.store.root, 'fixture-account');
+  try {
+    assert.deepEqual(reopened.read().lastApiFailure, failure.apiFailure);
+    assert.deepEqual(reopened.read().receipts.find(receipt => receipt.key === failure.key), failure);
+  } finally { reopened.close(); }
+});
+test('poll rejection diagnostics reach the existing loop report without creating message receipts', async t => {
+  const f = fixture(t);
+  await bind(f);
+  const reported = deferred();
+  f.context.report = error => reported.resolve(error);
+  const transport = new WechatTransport({ account: 'account', peer: 'peer', token: 'synthetic-only' }, async () =>
+    new Response(JSON.stringify({ ret: -14, errmsg: 'SECRET_RESPONSE_TEXT' })));
+  const service = f.serviceWith(transport);
+  await service.start();
+  const error = await reported.promise;
+  await service.stop();
+  assert.equal(error.message, 'WECHAT_TOKEN_EXPIRED');
+  assert.equal(error.apiFailure.endpoint, 'ilink/bot/getupdates');
+  assert.equal(error.apiFailure.ret, -14);
+  assert.deepEqual(f.store.read().lastApiFailure, error.apiFailure);
+  assert.equal(f.store.read().receipts.length, 0);
+  assert(!JSON.stringify(error).includes('SECRET_RESPONSE'));
+});
+test('upload URL rejection is attributed to the media output rather than to sendmessage', async t => {
+  const f = fixture(t);
+  await bind(f);
+  await establishContext(f);
+  writeFileSync(join(f.source, 'result.txt'), 'synthetic file');
+  const endpoints = [];
+  const transport = new WechatTransport({ account: 'account', peer: 'peer', token: 'synthetic-only' }, async url => {
+    endpoints.push(url.pathname);
+    if (url.pathname.endsWith('/getuploadurl')) return new Response(JSON.stringify({ ret: 1, errcode: 456 }));
+    assert.equal(url.pathname, '/ilink/bot/sendmessage');
+    return new Response(JSON.stringify({ ret: 0, message_id: '101' }));
+  });
+  const service = f.serviceWith(transport);
+  const observation = { sessionId: 'session-original', cwd: f.source,
+    event: event('file', `[result](${join(f.source, 'result.txt')})`) };
+  await service.observe(observation);
+  const output = outputs(f)[0];
+  assert.equal(output.status, 'unknown');
+  assert.equal(output.apiFailure.endpoint, 'ilink/bot/getuploadurl');
+  assert.equal(output.apiFailure.errcode, 456);
+  assert.deepEqual(f.store.read().lastApiFailure, output.apiFailure);
+  const before = endpoints.length;
+  await service.observe(observation);
+  assert.equal(endpoints.length, before);
+  assert.equal(endpoints.filter(endpoint => endpoint.endsWith('/getuploadurl')).length, 1);
+});
 test('unpresented, disallowed, pre-presentation and media replies cannot answer a question or become prompts', async t => {
   for (const kind of ['unpresented', 'choice-only', 'old-timestamp', 'media']) await t.test(kind, async t => {
     const f = fixture(t);

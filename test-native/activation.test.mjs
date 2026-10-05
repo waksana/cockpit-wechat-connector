@@ -7,6 +7,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { accountLease, readConfig, credentials, identity } from '../dist/config.js';
 import { activate } from '../dist/index.js';
 import { Store } from '../dist/state.js';
+import { WechatTransport } from '../dist/transport.js';
 
 function context(root, config = {}) {
   const stopping = new AbortController();
@@ -29,12 +30,45 @@ test('unconfigured installation stays unavailable without reading credentials or
   assert.equal(status.body.configured, false);
   assert.equal(status.body.binding, null);
   assert.equal(status.body.lastError, null);
+  assert.equal(status.body.lastApiFailure, null);
   assert.deepEqual(status.body.receipts, []);
   assert.deepEqual(backend.routes.map(({ method, path }) => ({ method, path })), [{ method: 'GET', path: '/status' }]);
   for (const obsolete of ['inputs', 'outputs', 'fault']) assert(!(obsolete in status.body));
   fixture.stopping.abort();
   await backend.onStop();
   await backend.dispose();
+});
+test('status exposes persisted allowlisted API diagnostics without response or message text', async t => {
+  const root = mkdtempSync(join(process.cwd(), '.wechat-api-status-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  let failure;
+  await assert.rejects(new WechatTransport({ account: 'synthetic-account', peer: 'synthetic-peer', token: 'synthetic-token' },
+    async () => new Response(JSON.stringify({ ret: 1, errcode: 123, errmsg: 'SECRET_RESPONSE', token: 'SECRET_TOKEN' })))
+    .send([{ type: 1, text_item: { text: 'SECRET_MESSAGE' } }], 'SECRET_CONTEXT', 'client'), error => {
+    failure = error.apiFailure;
+    return error.message === 'WECHAT_API_REJECTED';
+  });
+  const store = new Store(root, 'retained-identity');
+  store.change(state => {
+    state.lastError = 'WECHAT_API_REJECTED';
+    state.lastApiFailure = failure;
+    state.receipts.push(
+      { key: 'legacy', generation: 0, direction: 'output', status: 'unknown', reason: 'WECHAT_API_REJECTED',
+        text: 'SECRET_MESSAGE', media: [] },
+      { key: 'current', generation: 0, direction: 'output', status: 'unknown', reason: 'WECHAT_API_REJECTED',
+        text: 'SECRET_MESSAGE', media: [], apiFailure: failure },
+    );
+  });
+  store.close();
+  const fixture = context(root);
+  const backend = await activate(fixture.context);
+  try {
+    const status = (await backend.routes.find(route => route.path === '/status').handler({})).body;
+    assert.deepEqual(status.lastApiFailure, failure);
+    assert.deepEqual(status.receipts[1].apiFailure, failure);
+    assert(!('apiFailure' in status.receipts[0]));
+    assert(!JSON.stringify(status).includes('SECRET_'));
+  } finally { await backend.dispose(); }
 });
 test('credential provisioning requires exact identity and private regular file', t => {
   const root = mkdtempSync(join(process.cwd(), '.wechat-credentials-'));

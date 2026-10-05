@@ -3,6 +3,7 @@ import { constants, closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, open
 import { join, resolve } from 'node:path';
 import type { AskRequest } from '@waksana/cockpit-module-sdk/backend';
 import type { Snapshot } from './media.js';
+import type { ApiFailure } from './transport.js';
 
 export function invariant(value: unknown, code: string): asserts value {
   if (!value) throw new Error(code);
@@ -28,6 +29,7 @@ export interface Receipt {
   direction: 'input' | 'output';
   status: 'unknown' | 'accepted' | 'failed' | 'skipped';
   reason?: string;
+  apiFailure?: ApiFailure;
   text: string;
   messageId?: string;
   nativeMessageId?: string;
@@ -46,6 +48,7 @@ export interface State {
   receipts: Receipt[];
   question?: { generation: number; request: AskRequest; presentedAt: number; answered: boolean };
   lastError?: string;
+  lastApiFailure?: ApiFailure;
   legacy?: unknown;
 }
 function validate(value: State): void {
