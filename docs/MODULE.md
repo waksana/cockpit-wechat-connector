@@ -78,6 +78,23 @@ gate. Errors are also reported to the Host; input failures attempt a WeChat
 notice, whose failure is separately visible. The former `POST /resolve` and
 `POST /recheck` routes are removed. There is no unlock/drop/retry replacement.
 
+API-level rejections retain an optional `apiFailure` on the affected output
+receipt and a historical `lastApiFailure` in state and `GET /status`. Host error
+reports retain the same safe diagnostic object: fixed API endpoint, HTTP 200,
+safe-integer `ret`/`errcode` (or `absent`/`invalid`), `errmsg` classification
+(`absent`/`empty`/`present`/`invalid`), and `observedAt` epoch milliseconds.
+Raw response bodies, `errmsg` text, extra fields, headers and request payloads
+are never retained in diagnostics. `getupdates` rejection has no message receipt;
+`getuploadurl` and `sendmessage` failures belong to the attempted output.
+
+These fields diagnose rejection; they do not change success criteria, trigger
+reauthentication/retry, or prove that an ambiguous send was not delivered.
+Historical errors remain visible after a later successful operation, so compare
+timestamps and subsequent receipts rather than treating the panel as a current
+health probe. Old generic `WECHAT_API_REJECTED` records have no recoverable
+response detail; missing diagnostics are not zero-valued API success codes.
+HTTP, network, parsing and CDN failures retain their existing separate errors.
+
 ### Upgrading existing native data
 
 SQLite `user_version=1` and the `state(id,json)` table remain unchanged.

@@ -70,10 +70,33 @@ function itemMessageId(value: unknown): string {
   assert(string(value, 1024) && !/[\x00-\x1f\x7f]/u.test(value), 'ITEM_MESSAGE_ID_INVALID');
   return value;
 }
-export function apiSuccess(value: Record<string, unknown>): void {
-  assert((value.ret === undefined || value.ret === 0) && (value.errcode === undefined || value.errcode === 0),
-    value.ret === -14 || value.errcode === -14 ? 'WECHAT_TOKEN_EXPIRED' : 'WECHAT_API_REJECTED');
-  assert(value.errmsg === undefined || value.errmsg === '', 'WECHAT_API_REJECTED');
+type ApiEndpoint = 'ilink/bot/getupdates' | 'ilink/bot/sendmessage' | 'ilink/bot/getuploadurl';
+export interface ApiFailure {
+  endpoint: ApiEndpoint;
+  httpStatus: 200;
+  ret: number | 'absent' | 'invalid';
+  errcode: number | 'absent' | 'invalid';
+  errmsg: 'absent' | 'empty' | 'present' | 'invalid';
+  observedAt: number;
+}
+export class WechatApiError extends Error {
+  readonly apiFailure: ApiFailure;
+  constructor(value: Record<string, unknown>, endpoint: ApiEndpoint) {
+    super(value.ret === -14 || value.errcode === -14 ? 'WECHAT_TOKEN_EXPIRED' : 'WECHAT_API_REJECTED');
+    const numeric = (value: unknown): ApiFailure['ret'] => value === undefined ? 'absent'
+      : typeof value === 'number' && Number.isSafeInteger(value) ? value : 'invalid';
+    // Never retain response text, extra fields, request payloads or credentials.
+    this.apiFailure = {
+      endpoint, httpStatus: 200, ret: numeric(value.ret), errcode: numeric(value.errcode),
+      errmsg: value.errmsg === undefined ? 'absent' : value.errmsg === '' ? 'empty'
+        : typeof value.errmsg === 'string' ? 'present' : 'invalid',
+      observedAt: Date.now(),
+    };
+  }
+}
+export function apiSuccess(value: Record<string, unknown>, endpoint: ApiEndpoint): void {
+  if ((value.ret !== undefined && value.ret !== 0) || (value.errcode !== undefined && value.errcode !== 0)
+    || (value.errmsg !== undefined && value.errmsg !== '')) throw new WechatApiError(value, endpoint);
 }
 export function cdnUrl(value: string, operation: 'upload' | 'download'): URL {
   let url: URL;
@@ -272,7 +295,7 @@ export class WechatTransport {
       throw new Error('NETWORK_ERROR');
     } finally { clearTimeout(timeout); }
   }
-  async call(endpoint: 'ilink/bot/getupdates' | 'ilink/bot/sendmessage' | 'ilink/bot/getuploadurl',
+  async call(endpoint: ApiEndpoint,
     body: Record<string, unknown>, signal?: AbortSignal): Promise<Record<string, unknown>> {
     assert(['ilink/bot/getupdates', 'ilink/bot/sendmessage', 'ilink/bot/getuploadurl'].includes(endpoint), 'API_ENDPOINT_REFUSED');
     const encoded = JSON.stringify({ ...body, base_info: { channel_version: '2.4.8', bot_agent: 'CockpitWechat/1.0' } });
@@ -295,7 +318,7 @@ export class WechatTransport {
       }) as Parameters<typeof JSON.parse>[1]);
     } catch { throw new Error('RESPONSE_JSON_INVALID'); }
     assert(record(value), 'RESPONSE_JSON_INVALID');
-    apiSuccess(value);
+    apiSuccess(value, endpoint);
     return value;
   }
   async poll(cursor: string, signal?: AbortSignal): Promise<{ messages: InboundMessage[]; cursor: string }> {

@@ -54,8 +54,10 @@ export async function activate(context: ModuleBackendContext): Promise<ModuleBac
         return { body: { configured: problems.length === 0, problems, running: !!accountLock,
           revision: state?.revision, binding: state?.binding ? { sessionId: state.binding.sessionId, generation: state.binding.generation } : null,
           lastError: state?.lastError ?? null,
+          lastApiFailure: state?.lastApiFailure ?? null,
           receipts: state?.receipts.map(receipt => ({ key: receipt.key, direction: receipt.direction,
-            status: receipt.status, reason: receipt.reason })) ?? [] } };
+            status: receipt.status, reason: receipt.reason,
+            ...(receipt.apiFailure ? { apiFailure: receipt.apiFailure } : {}) })) ?? [] } };
       } },
     ],
     roleAssignments: {
