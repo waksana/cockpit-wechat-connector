@@ -55,6 +55,14 @@ export async function activate(context: ModuleBackendContext): Promise<ModuleBac
           revision: state?.revision, binding: state?.binding ? { sessionId: state.binding.sessionId, generation: state.binding.generation } : null,
           lastError: state?.lastError ?? null,
           lastApiFailure: state?.lastApiFailure ?? null,
+          outbound: {
+            state: !state?.binding ? 'unbound' : !state.binding.contextToken ? 'no_context'
+              : state.binding.replyContextRejection ? 'awaiting_new_context' : 'ready',
+            ...(state?.binding?.replyContextRejection ? {
+              reason: 'WECHAT_REPLY_CONTEXT_REJECTED', observedAt: state.binding.replyContextRejection.observedAt,
+              action: 'Wait for a natural inbound WeChat message with a different reply context. Old outputs will not be replayed.',
+            } : {}),
+          },
           receipts: state?.receipts.map(receipt => ({ key: receipt.key, direction: receipt.direction,
             status: receipt.status, reason: receipt.reason,
             ...(receipt.apiFailure ? { apiFailure: receipt.apiFailure } : {}) })) ?? [] } };

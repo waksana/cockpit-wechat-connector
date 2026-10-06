@@ -50,6 +50,13 @@ export class Service {
     this.accepting();
     invariant(this.matches(binding), 'BINDING_CHANGED');
   }
+  private replyContext(binding: Binding, token: string | undefined): asserts token is string {
+    this.current(binding);
+    invariant(token, 'WECHAT_CONTEXT_UNAVAILABLE');
+    const current = this.store.read().binding!;
+    invariant(current.contextToken === token, 'WECHAT_REPLY_CONTEXT_CHANGED');
+    invariant(!current.replyContextRejection, 'WECHAT_REPLY_CONTEXT_REJECTED');
+  }
   private track<T>(work: Promise<T>): Promise<T> {
     this.pending.add(work);
     void work.then(() => this.pending.delete(work), () => this.pending.delete(work));
@@ -142,7 +149,10 @@ export class Service {
         this.current(binding);
         invariant(binding.generation <= 1 || (message.createdAt !== undefined && binding.boundAt !== undefined
           && message.createdAt >= binding.boundAt), 'PREBINDING_INPUT_NOT_FORWARDED');
-        this.store.change(state => { state.binding!.contextToken = message.contextToken; });
+        this.store.change(state => {
+          if (state.binding!.contextToken !== message.contextToken) delete state.binding!.replyContextRejection;
+          state.binding!.contextToken = message.contextToken;
+        });
         binding.contextToken = message.contextToken;
         let meta = await sessionMeta(this.context, binding.sessionId);
         this.current(binding);
@@ -243,6 +253,7 @@ export class Service {
     await this.output(binding, `reply:${binding.generation}:${event.id}`, event.data.content, observation.cwd ?? binding.cwd, live, true);
   }
   private output(binding: Binding, key: string, content: string, cwd?: string | null, live = true, references = false): Promise<boolean> {
+    const token = this.matches(binding) ? this.store.read().binding?.contextToken : undefined;
     if (!this.claim({ key, generation: binding.generation, direction: 'output', status: 'unknown',
       reason: 'DELIVERY_NOT_CONFIRMED', text: content, media: [], sent: [] })) return Promise.resolve(false);
     const prepare = async () => {
@@ -266,9 +277,7 @@ export class Service {
       if (!captured) return false;
       let attempted = false;
       try {
-        this.current(binding);
-        const token = this.store.read().binding?.contextToken;
-        invariant(token, 'WECHAT_CONTEXT_UNAVAILABLE');
+        this.replyContext(binding, token);
         this.result(key, { media: captured.files });
         const parts: { text?: string; file?: Snapshot }[] = [...split(captured.text).map(text => ({ text })),
           ...captured.files.map(file => ({ file }))];
@@ -276,12 +285,12 @@ export class Service {
         const quoted = this.store.read().receipts.find(receipt => receipt.direction === 'input' && receipt.status === 'accepted'
           && binding.userMessageId !== undefined && receipt.generation === binding.generation && receipt.nativeMessageId === binding.userMessageId);
         for (const part of parts) {
-          this.current(binding);
+          this.replyContext(binding, token);
           attempted = true;
           const item: Item = part.file ? await uploadOutbound(this.transport, part.file, this.context.signal,
-            () => this.current(binding)) : { type: 1, text_item: { text: part.text! } };
+            () => this.replyContext(binding, token)) : { type: 1, text_item: { text: part.text! } };
           if (quoted?.messageId) item.ref_msg = { svr_id: quoted.messageId };
-          this.current(binding);
+          this.replyContext(binding, token);
           const result = await this.transport.send([item], token, `wx-${randomUUID()}`, this.context.signal);
           this.store.change(state => {
             state.receipts.find(receipt => receipt.key === key)!.sent!.push({ ...part, messageId: result.messageId });
@@ -290,7 +299,14 @@ export class Service {
         this.result(key, { status: 'accepted', reason: undefined });
         return true;
       } catch (error) {
-        this.result(key, { status: attempted ? 'unknown' : 'failed', reason: safeError(error),
+        if (error instanceof WechatApiError && error.apiFailure.endpoint === 'ilink/bot/sendmessage'
+          && error.apiFailure.ret === -2 && this.matches(binding)) this.store.change(state => {
+          // An old in-flight request cannot suspend a newer inbound reply context.
+          if (state.binding!.contextToken === token) state.binding!.replyContextRejection = { observedAt: error.apiFailure.observedAt };
+        });
+        const reason = safeError(error);
+        const suppressed = ['WECHAT_REPLY_CONTEXT_REJECTED', 'WECHAT_REPLY_CONTEXT_CHANGED'].includes(reason);
+        this.result(key, { status: attempted ? 'unknown' : suppressed ? 'skipped' : 'failed', reason,
           ...(error instanceof WechatApiError ? { apiFailure: error.apiFailure } : {}) });
         this.report(error, binding);
         return false;

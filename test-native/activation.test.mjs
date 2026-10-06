@@ -31,12 +31,34 @@ test('unconfigured installation stays unavailable without reading credentials or
   assert.equal(status.body.binding, null);
   assert.equal(status.body.lastError, null);
   assert.equal(status.body.lastApiFailure, null);
+  assert.deepEqual(status.body.outbound, { state: 'unbound' });
   assert.deepEqual(status.body.receipts, []);
   assert.deepEqual(backend.routes.map(({ method, path }) => ({ method, path })), [{ method: 'GET', path: '/status' }]);
   for (const obsolete of ['inputs', 'outputs', 'fault']) assert(!(obsolete in status.body));
   fixture.stopping.abort();
   await backend.onStop();
   await backend.dispose();
+});
+test('status distinguishes suspended outbound context from historical errors without disclosing its token', async t => {
+  const root = mkdtempSync(join(process.cwd(), '.wechat-context-status-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const store = new Store(root, 'retained-identity');
+  store.change(state => {
+    state.generation = 1;
+    state.binding = { sessionId: 'retained-session', generation: 1, contextToken: 'SECRET_CONTEXT',
+      replyContextRejection: { observedAt: 1234 } };
+  });
+  store.close();
+  const fixture = context(root);
+  const backend = await activate(fixture.context);
+  try {
+    const status = (await backend.routes.find(route => route.path === '/status').handler({})).body;
+    assert.equal(status.outbound.state, 'awaiting_new_context');
+    assert.equal(status.outbound.reason, 'WECHAT_REPLY_CONTEXT_REJECTED');
+    assert.equal(status.outbound.observedAt, 1234);
+    assert.match(status.outbound.action, /natural inbound.*different reply context/);
+    assert(!JSON.stringify(status).includes('SECRET_CONTEXT'));
+  } finally { await backend.dispose(); }
 });
 test('status exposes persisted allowlisted API diagnostics without response or message text', async t => {
   const root = mkdtempSync(join(process.cwd(), '.wechat-api-status-'));
