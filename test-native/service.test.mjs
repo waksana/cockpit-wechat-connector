@@ -411,7 +411,7 @@ test('upload URL rejection is attributed to the media output rather than to send
   assert.equal(endpoints.filter(endpoint => endpoint.endsWith('/getuploadurl')).length, 1);
 });
 test('unpresented, disallowed, pre-presentation and media replies cannot answer a question or become prompts', async t => {
-  for (const kind of ['unpresented', 'choice-only', 'old-timestamp', 'media']) await t.test(kind, async t => {
+  for (const kind of ['unpresented', 'choice-only', 'old-timestamp', 'media', 'empty']) await t.test(kind, async t => {
     const f = fixture(t);
     await bind(f);
     await establishContext(f);
@@ -419,9 +419,12 @@ test('unpresented, disallowed, pre-presentation and media replies cannot answer 
     if (kind !== 'unpresented') await f.service.tick();
     const extra = kind === 'old-timestamp' ? { createdAt: f.store.read().question.presentedAt - 1 }
       : kind === 'media' ? { items: [{ type: 4 }] } : {};
-    await f.service.ingest([message('answer', 'custom', extra)], 'answer', f.store.read().binding);
+    await f.service.ingest([message('answer', kind === 'empty' ? ' ' : 'custom', extra)], 'answer', f.store.read().binding);
     assert.equal(inputs(f).at(-1).status, 'failed');
-    assert.equal(inputs(f).at(-1).reason, 'ANSWER_NOT_CURRENT_OR_NOT_ALLOWED');
+    assert.equal(inputs(f).at(-1).reason, {
+      unpresented: 'ANSWER_QUESTION_NOT_PRESENTED', 'choice-only': 'ANSWER_CHOICE_NOT_ALLOWED',
+      'old-timestamp': 'ANSWER_PREDATES_QUESTION', media: 'ANSWER_TEXT_ONLY', empty: 'ANSWER_EMPTY',
+    }[kind]);
     assert(!f.calls.some(call => call.name === 'respondAsk'));
     assert.equal(f.calls.filter(call => call.name === 'prompt').length, 1);
   });
@@ -447,7 +450,7 @@ test('invalid choices and query failures preserve a displayed pending question f
       'unsuccessful-cursor', f.store.read().binding);
     assert.equal(inputs(f).at(-1).status, 'failed');
     assert.equal(inputs(f).at(-1).reason,
-      kind === 'invalid-choice' ? 'ANSWER_NOT_CURRENT_OR_NOT_ALLOWED' : 'SESSION_QUERY_FAILED');
+      kind === 'invalid-choice' ? 'ANSWER_CHOICE_NOT_ALLOWED' : 'SESSION_QUERY_FAILED');
     assert.deepEqual(f.store.read().question, displayed);
     assert(!f.calls.some(call => call.name === 'respondAsk'));
     f.setHook(undefined);
@@ -481,6 +484,10 @@ test('Web-answer races do not fall through to prompts or freeze the next questio
     });
     await f.service.ingest([message('answer', 'my answer')], 'answer', f.store.read().binding);
     assert.equal(inputs(f).at(-1).status, 'failed');
+    assert.equal(inputs(f).at(-1).reason, {
+      'already-answered': 'ANSWER_NO_LONGER_PENDING', 'different-request': 'ANSWER_QUESTION_CHANGED',
+      'rejected-at-submit': 'REQUEST_NOT_PENDING',
+    }[kind]);
     assert.equal(f.calls.filter(call => call.name === 'prompt').length, 1);
     assert.equal(f.calls.filter(call => call.name === 'respondAsk').length, kind === 'rejected-at-submit' ? 1 : 0);
     assert.equal(f.store.read().question.answered, true);
@@ -489,6 +496,143 @@ test('Web-answer races do not fall through to prompts or freeze the next questio
     await f.service.tick();
     assert(f.sent.some(send => send.items[0].text_item?.text.includes('Next question?')));
   });
+});
+test('authoritative question withdrawal allows only new ordinary inputs, without replaying old answers', async t => {
+  const f = fixture(t);
+  await bind(f);
+  await establishContext(f);
+  f.getMeta().ask = { requestId: 'ask-1', question: 'Which color?', choices: ['Blue'] };
+  await f.service.tick();
+  const displayed = f.store.read().question;
+  f.getMeta().ask = null;
+  await f.service.tick();
+  const inactive = f.store.read().question;
+  assert.equal(inactive.answered, true);
+  assert(inactive.inactiveAt >= displayed.presentedAt);
+  for (const [id, createdAt] of [['old', displayed.presentedAt], ['boundary', inactive.inactiveAt], ['unknown', undefined]]) {
+    await f.service.ingest([message(id, 'Blue', { createdAt })], id, f.store.read().binding);
+    assert.equal(inputs(f).at(-1).reason, 'ANSWER_NO_LONGER_PENDING');
+  }
+  await f.service.ingest([message('new', 'A new request', { createdAt: inactive.inactiveAt + 1 })],
+    'new', f.store.read().binding);
+  assert.equal(inputs(f).at(-1).status, 'accepted');
+  assert.deepEqual(f.calls.filter(call => call.name === 'prompt').map(call => call.body.text), ['hello', 'A new request']);
+  assert(!f.calls.some(call => call.name === 'respondAsk'));
+  await f.service.ingest([message('old', 'Blue', { createdAt: inactive.inactiveAt + 2 })], 'duplicate', f.store.read().binding);
+  assert.equal(f.calls.filter(call => call.name === 'prompt').length, 2);
+  const reopened = new Store(f.store.root, 'fixture-account');
+  try { assert.deepEqual(reopened.read().question, inactive); } finally { reopened.close(); }
+});
+test('question reconciliation is independent of failed history forwarding', async t => {
+  const f = fixture(t);
+  await bind(f);
+  await establishContext(f);
+  f.getMeta().ask = { requestId: 'ask-1', question: 'Question?' };
+  await f.service.tick();
+  f.getMeta().ask = null;
+  f.setHook(name => { if (name === 'session/chat') throw new Error('HISTORY_UNAVAILABLE'); });
+  await assert.rejects(f.service.tick(), /HISTORY_UNAVAILABLE/);
+  assert.equal(f.store.read().question.answered, true);
+});
+test('unloaded and uncertain native metadata do not retire a displayed question', async t => {
+  for (const kind of ['unloaded', 'failure', 'malformed']) await t.test(kind, async t => {
+    const f = fixture(t);
+    await bind(f);
+    await establishContext(f);
+    f.getMeta().ask = { requestId: 'ask-1', question: 'Question?' };
+    await f.service.tick();
+    const displayed = f.store.read().question;
+    if (kind === 'unloaded') {
+      f.setMeta({ ...f.getMeta(), loaded: false, status: 'unloaded', ask: null });
+      await f.service.tick();
+    } else {
+      f.setHook(name => {
+        if (name === 'session/get') {
+          if (kind === 'failure') throw new Error('SESSION_QUERY_FAILED');
+          return { meta: { ...f.getMeta(), ask: undefined } };
+        }
+      });
+      await assert.rejects(f.service.tick(), /SESSION_QUERY_/);
+    }
+    assert.deepEqual(f.store.read().question, displayed);
+  });
+});
+test('a captured answer cannot become a prompt when the watcher retires its question in flight', async t => {
+  const f = fixture(t);
+  await bind(f);
+  await establishContext(f);
+  f.getMeta().ask = { requestId: 'ask-1', question: 'Question?' };
+  await f.service.tick();
+  const entered = deferred(), gate = deferred();
+  f.setHook(name => {
+    if (name === 'session/get') { entered.resolve(); return gate.promise; }
+  });
+  const receive = f.service.ingest([message('answer', 'Old answer')], 'answer', f.store.read().binding);
+  await entered.promise;
+  f.setHook(undefined);
+  f.getMeta().ask = null;
+  await f.service.tick();
+  gate.resolve({ meta: f.getMeta() });
+  await receive;
+  assert.equal(inputs(f).at(-1).reason, 'ANSWER_NO_LONGER_PENDING');
+  assert.equal(f.calls.filter(call => call.name === 'prompt').length, 1);
+  assert(!f.calls.some(call => call.name === 'respondAsk'));
+});
+test('a delayed watcher snapshot cannot retire a newly displayed question', async t => {
+  const f = fixture(t);
+  await bind(f);
+  await establishContext(f);
+  f.getMeta().ask = { requestId: 'ask-1', question: 'First question?' };
+  await f.service.tick();
+  const entered = deferred(), gate = deferred();
+  const oldMeta = { ...f.getMeta(), ask: null };
+  f.setHook(name => {
+    if (name === 'session/get') { entered.resolve(); return gate.promise; }
+  });
+  const oldTick = f.service.tick();
+  await entered.promise;
+  f.setHook(undefined);
+  f.getMeta().ask = { requestId: 'ask-2', question: 'Second question?' };
+  await f.service.tick();
+  const current = f.store.read().question;
+  gate.resolve({ meta: oldMeta });
+  await oldTick;
+  assert.equal(current.request.requestId, 'ask-2');
+  assert.deepEqual(f.store.read().question, current);
+});
+test('explicit quotes of retired questions cannot become prompts or answers to a replacement question', async t => {
+  for (const replacement of [false, true]) await t.test(`replacement: ${replacement}`, async t => {
+    const f = fixture(t);
+    await bind(f);
+    await establishContext(f);
+    f.getMeta().ask = { requestId: 'ask-1', question: 'First question?' };
+    await f.service.tick();
+    const oldId = outputs(f).find(receipt => receipt.key === 'ask:1:ask-1').sent[0].messageId;
+    f.getMeta().ask = replacement ? { requestId: 'ask-2', question: 'Second question?' } : null;
+    await f.service.tick();
+    const question = f.store.read().question;
+    await f.service.ingest([message('late-quoted-answer', 'Old answer', {
+      createdAt: Math.max(question.presentedAt, question.inactiveAt ?? 0) + 1,
+      items: [{ type: 1, text_item: { text: 'Old answer' }, ref_msg: { svr_id: oldId } }],
+    })], 'quoted', f.store.read().binding);
+    assert.equal(inputs(f).at(-1).reason, 'ANSWER_NO_LONGER_PENDING');
+    assert.equal(f.calls.filter(call => call.name === 'prompt').length, 1);
+    assert(!f.calls.some(call => call.name === 'respondAsk'));
+    assert.deepEqual(f.store.read().question, question);
+  });
+});
+test('all answers in one captured batch retain their original question identity', async t => {
+  const f = fixture(t);
+  await bind(f);
+  await establishContext(f);
+  f.getMeta().ask = { requestId: 'ask-1', question: 'Question?' };
+  await f.service.tick();
+  await f.service.ingest([message('first', 'First answer'), message('second', 'Second answer')],
+    'batch', f.store.read().binding);
+  assert.equal(inputs(f).at(-2).status, 'accepted');
+  assert.equal(inputs(f).at(-1).reason, 'ANSWER_NO_LONGER_PENDING');
+  assert.equal(f.calls.filter(call => call.name === 'respondAsk').length, 1);
+  assert.equal(f.calls.filter(call => call.name === 'prompt').length, 1);
 });
 test('history anchors omit old events, walk new pages in order and suppress live/history duplicates', async t => {
   const f = fixture(t);
