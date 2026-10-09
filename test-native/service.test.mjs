@@ -10,7 +10,7 @@ import { Store } from '../dist/state.js';
 import { BindingManager } from '../dist/binding.js';
 import { Service } from '../dist/service.js';
 import { capabilities } from '../dist/index.js';
-import { WechatTransport } from '../dist/transport.js';
+import { WechatApiError, WechatTransport } from '../dist/transport.js';
 
 function directory(t) {
   const root = mkdtempSync(join(process.cwd(), '.wechat-service-'));
@@ -383,6 +383,177 @@ test('poll rejection diagnostics reach the existing loop report without creating
   assert.deepEqual(f.store.read().lastApiFailure, error.apiFailure);
   assert.equal(f.store.read().receipts.length, 0);
   assert(!JSON.stringify(error).includes('SECRET_RESPONSE'));
+});
+test('rejected reply contexts survive restart and resume only NEW output after different inbound context', async t => {
+  const f = fixture(t);
+  await bind(f);
+  await establishContext(f);
+  let attempts = 0;
+  const transport = { ...f.transport, async send() {
+    attempts++;
+    if (attempts === 1) throw new WechatApiError({ ret: -2, errmsg: 'private' }, 'ilink/bot/sendmessage');
+    return { messageId: '123' };
+  } };
+  const service = f.serviceWith(transport);
+  const observe = id => service.observe({ sessionId: 'session-original', event: event(id, id) });
+  await observe('rejected');
+  assert.equal(outputs(f).at(-1).status, 'unknown');
+  assert(f.store.read().binding.replyContextRejection);
+  await observe('suppressed');
+  assert.equal(attempts, 1);
+  assert.equal(outputs(f).at(-1).status, 'skipped');
+  assert.equal(outputs(f).at(-1).reason, 'WECHAT_REPLY_CONTEXT_REJECTED');
+  await service.ingest([message('initial', 'duplicate', { contextToken: 'not-a-new-input' })], 'duplicate', f.store.read().binding);
+  await assert.rejects(service.ingest([message('unauthorized', 'no', {
+    peer: 'other-peer', contextToken: 'not-authorized',
+  })], 'unauthorized', f.store.read().binding), /INBOUND_IDENTITY/);
+  assert(f.store.read().binding.replyContextRejection);
+  const reopened = new Store(f.store.root, 'fixture-account');
+  const restarted = new Service(f.context, f.config, reopened, transport);
+  try {
+    await restarted.observe({ sessionId: 'session-original', event: event('restart', 'new') });
+    assert.equal(attempts, 1);
+    assert.equal(reopened.read().receipts.at(-1).reason, 'WECHAT_REPLY_CONTEXT_REJECTED');
+  } finally { await restarted.stop(); reopened.close(); }
+  await service.ingest([message('same-token')], 'same', f.store.read().binding);
+  await observe('same-still-rejected');
+  assert.equal(attempts, 1);
+  await service.ingest([message('new-token', 'new request', { contextToken: 'new-context' })], 'new', f.store.read().binding);
+  assert.equal(f.store.read().binding.replyContextRejection, undefined);
+  await observe('suppressed');
+  await observe('rejected');
+  assert.equal(attempts, 1);
+  await observe('fresh-output');
+  assert.equal(attempts, 2);
+  assert.equal(outputs(f).at(-1).status, 'accepted');
+  assert.equal(f.store.read().lastApiFailure.ret, -2);
+});
+test('only sendmessage ret=-2 suspends context; other API failures remain independent', async t => {
+  for (const [endpoint, body] of [
+    ['ilink/bot/getuploadurl', { ret: -2 }], ['ilink/bot/getupdates', { ret: -2 }],
+    ['ilink/bot/sendmessage', { ret: -14 }], ['ilink/bot/sendmessage', { ret: 1 }],
+    ['ilink/bot/sendmessage', { ret: 0, errcode: -2 }],
+  ]) await t.test(`${endpoint}:${JSON.stringify(body)}`, async t => {
+    const f = fixture(t);
+    await bind(f);
+    await establishContext(f);
+    let attempts = 0;
+    const service = f.serviceWith({ ...f.transport, async send() {
+      attempts++;
+      if (attempts === 1) throw new WechatApiError(body, endpoint);
+      return {};
+    } });
+    await service.observe({ sessionId: 'session-original', event: event('bad', 'one') });
+    assert.equal(f.store.read().binding.replyContextRejection, undefined);
+    await service.observe({ sessionId: 'session-original', event: event('good', 'two') });
+    assert.equal(attempts, 2);
+    assert.equal(outputs(f).at(-1).status, 'accepted');
+  });
+});
+test('queued old-context output is never borrowed into a new context and late rejection cannot poison it', async t => {
+  const f = fixture(t);
+  await bind(f);
+  await establishContext(f);
+  const entered = deferred(), gate = deferred();
+  const tokens = [];
+  const service = f.serviceWith({ ...f.transport, async send(_items, token) {
+    tokens.push(token);
+    if (tokens.length === 1) { entered.resolve(); await gate.promise; }
+    return {};
+  } });
+  const first = service.observe({ sessionId: 'session-original', event: event('first', 'one') });
+  await entered.promise;
+  const queued = service.observe({ sessionId: 'session-original', event: event('queued', 'two') });
+  await service.ingest([message('fresh', 'new request', { contextToken: 'new-context' })], 'fresh', f.store.read().binding);
+  gate.reject(new WechatApiError({ ret: -2 }, 'ilink/bot/sendmessage'));
+  await Promise.all([first, queued]);
+  assert.equal(f.store.read().binding.replyContextRejection, undefined);
+  assert.equal(outputs(f).at(-1).reason, 'WECHAT_REPLY_CONTEXT_CHANGED');
+  assert.equal(outputs(f).at(-1).status, 'skipped');
+  await service.observe({ sessionId: 'session-original', event: event('new', 'three') });
+  assert.deepEqual(tokens, ['synthetic-context', 'new-context']);
+});
+test('rejection suspends multipart tails and queued media without another API call', async t => {
+  const f = fixture(t);
+  await bind(f);
+  await establishContext(f);
+  writeFileSync(join(f.source, 'file.txt'), 'file');
+  const entered = deferred(), gate = deferred();
+  let attempts = 0;
+  const transport = new WechatTransport({ account: 'account', peer: 'peer', token: 'synthetic-only' }, async url => {
+    attempts++;
+    assert.equal(url.pathname, '/ilink/bot/sendmessage');
+    if (attempts === 1) return new Response('{"ret":0,"message_id":"1"}');
+    entered.resolve();
+    await gate.promise;
+    return new Response('{"ret":-2}');
+  });
+  const service = f.serviceWith(transport);
+  const first = service.observe({ sessionId: 'session-original', event: event('multipart', 'x'.repeat(8000)) });
+  await entered.promise;
+  const queued = service.observe({ sessionId: 'session-original', cwd: f.source,
+    event: event('media', `[file](${join(f.source, 'file.txt')})`) });
+  gate.resolve();
+  await Promise.all([first, queued]);
+  assert.equal(attempts, 2);
+  assert.equal(outputs(f)[0].sent.length, 1);
+  assert.equal(outputs(f)[0].status, 'unknown');
+  assert.equal(outputs(f)[1].status, 'skipped');
+  assert.equal(outputs(f)[1].reason, 'WECHAT_REPLY_CONTEXT_REJECTED');
+});
+test('a rejected old binding cannot block its replacement even with the same token', async t => {
+  const f = fixture(t);
+  await bind(f);
+  await establishContext(f);
+  const entered = deferred(), gate = deferred();
+  let attempts = 0;
+  const service = f.serviceWith({ ...f.transport, async send() {
+    attempts++;
+    if (attempts === 1) { entered.resolve(); await gate.promise; }
+    return {};
+  } });
+  const pending = service.observe({ sessionId: 'session-original', event: event('old', 'one') });
+  await entered.promise;
+  const binding = await replace(f);
+  await service.ingest([message('replacement', 'hello', { createdAt: binding.boundAt })], 'new', binding);
+  gate.reject(new WechatApiError({ ret: -2 }, 'ilink/bot/sendmessage'));
+  await pending;
+  assert.equal(f.store.read().binding.replyContextRejection, undefined);
+  await service.observe({ sessionId: 'replacement', event: event('new', 'two') });
+  assert.equal(attempts, 2);
+});
+test('new inbound during a file upload prevents its old-context send', async t => {
+  const f = fixture(t);
+  await bind(f);
+  await establishContext(f);
+  writeFileSync(join(f.source, 'upload.txt'), 'file');
+  const entered = deferred(), gate = deferred();
+  const sentTokens = [];
+  const transport = new WechatTransport({ account: 'account', peer: 'peer', token: 'synthetic-only' }, async (url, init) => {
+    if (url.pathname === '/ilink/bot/getuploadurl') return new Response('{"upload_param":"synthetic-upload"}');
+    if (url.pathname === '/c2c/upload') {
+      entered.resolve();
+      await gate.promise;
+      return new Response('', { headers: { 'x-encrypted-param': 'synthetic-receipt' } });
+    }
+    assert.equal(url.pathname, '/ilink/bot/sendmessage');
+    sentTokens.push(JSON.parse(init.body).msg.context_token);
+    return new Response('{"ret":0,"message_id":"42"}');
+  });
+  const service = f.serviceWith(transport);
+  const output = service.observe({ sessionId: 'session-original', cwd: f.source,
+    event: event('upload-race', `[file](${join(f.source, 'upload.txt')})`) });
+  await entered.promise;
+  await service.ingest([message('fresh', 'new', { contextToken: 'fresh-context' })], 'fresh', f.store.read().binding);
+  gate.resolve();
+  await output;
+  assert.equal(outputs(f).at(-1).reason, 'WECHAT_REPLY_CONTEXT_CHANGED');
+  assert.equal(outputs(f).at(-1).status, 'unknown');
+  assert(sentTokens.every(token => token === 'synthetic-context'));
+  const before = sentTokens.length;
+  await service.observe({ sessionId: 'session-original', event: event('fresh-reply', 'new') });
+  assert.equal(sentTokens.length, before + 1);
+  assert.equal(sentTokens.at(-1), 'fresh-context');
 });
 test('upload URL rejection is attributed to the media output rather than to sendmessage', async t => {
   const f = fixture(t);

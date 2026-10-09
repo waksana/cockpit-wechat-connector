@@ -19,6 +19,7 @@ export interface Binding {
   generation: number;
   anchor?: string | null;
   contextToken?: string;
+  replyContextRejection?: { observedAt: number };
   cwd?: string;
   userMessageId?: string;
   boundAt?: number;
@@ -59,6 +60,10 @@ function validate(value: State): void {
   invariant(value.binding === null || (typeof value.binding?.sessionId === 'string' && value.binding.sessionId.length > 0
     && value.binding.generation === value.generation
     && (value.binding.anchor === undefined || value.binding.anchor === null || typeof value.binding.anchor === 'string')), 'STATE_BINDING_INVALID');
+  invariant(value.binding?.replyContextRejection === undefined || (typeof value.binding.replyContextRejection === 'object'
+    && value.binding.replyContextRejection !== null && typeof value.binding.contextToken === 'string'
+    && value.binding.contextToken.length > 0 && Number.isSafeInteger(value.binding.replyContextRejection.observedAt)
+    && value.binding.replyContextRejection.observedAt >= 0), 'STATE_REPLY_CONTEXT_INVALID');
   invariant(Array.isArray(value.receipts) && value.receipts.length <= 20_000 && value.receipts.every(receipt =>
     typeof receipt.key === 'string' && Number.isSafeInteger(receipt.generation) && typeof receipt.text === 'string'
     && ['input', 'output'].includes(receipt.direction) && ['unknown', 'accepted', 'failed', 'skipped'].includes(receipt.status)

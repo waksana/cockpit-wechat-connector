@@ -43,6 +43,42 @@ resolution workflow. A failed capture/send does not block the next independent
 reply or binding. A missing WeChat context token is a visible failure, not a
 message queued for later delivery.
 
+### Rejected reply contexts
+
+An explicit `sendmessage` response with numeric `ret: -2` suspends further
+outbound API calls for that binding's current reply context. This is a
+conservative response to an observed server rejection, not a claim that `-2`
+uniquely means quota exhaustion or that every context permits ten replies.
+No fixed quota, expiry timer, token refresh call or login change is introduced.
+Other response codes and `getupdates`/`getuploadurl` failures do not trigger it.
+
+The private binding retains only a rejection timestamp alongside its existing
+context token; this survives restart, without a new queue or credential copy.
+Subsequent outputs are recorded `skipped` with
+`WECHAT_REPLY_CONTEXT_REJECTED`, not retried or saved for later dispatch.
+The triggering attempted output remains `unknown`, including any confirmed
+multipart prefix. A genuine authorized, nonduplicate inbound message carrying
+a **different** `context_token` removes the suspension for new output. Web
+messages, repeated tokens, duplicate polling, ticks and restarts do not.
+Old unknown/skipped outputs are never replayed.
+
+Each output captures its context before asynchronous file preparation or
+process-local send ordering. A context change prevents its remaining sends
+(`WECHAT_REPLY_CONTEXT_CHANGED`); an old in-flight failure cannot suspend a new
+context or replacement binding. Already-started requests may still complete.
+Media is not uploaded while the current context is suspended. Old generic
+receipts and Rolling.4 diagnostics lack the attempted context identity, so
+upgrade does not retroactively infer suspension from them; it begins with the
+next naturally occurring qualifying rejection.
+
+The `outbound` field of `GET /status` distinguishes `unbound`, `no_context`,
+`awaiting_new_context` and `ready`. A suspended result includes its timestamp
+and guidance to wait for natural inbound context, but no token. `ready` means
+only that no local context suspension applies, not verified API health.
+Fresh context must come from normal WeChat use, not automatic test messages,
+replay, cursor resets or reauthentication. This mitigation cannot increase
+server allowances or guarantee delivery of long-running unsolicited replies.
+
 Polling remains necessary for the WeChat protocol. The native observation pass
 reads persisted chat using its retained anchor and observes pending questions.
 It does not drain pending input/output records. Unseen native events can be
