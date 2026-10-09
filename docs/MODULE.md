@@ -15,6 +15,26 @@ A reply associated with an already displayed, still-pending question instead
 uses `respondAsk` with its exact request ID. Stale or ambiguous answers are
 reported, not silently treated as new prompts or answers to a different question.
 
+Before history forwarding, the observation pass retires a displayed association
+when an authoritative **loaded** session no longer has that request pending.
+Unloaded sessions and failed/malformed reads do not prove withdrawal. Retirement
+records an `inactiveAt` boundary, not proof that someone answered the question.
+Subsequent unquoted input newer than that boundary can follow the normal prompt
+path when no question is pending. Input at/before the boundary, or with no
+timestamp, is rejected rather than guessed to be a new request. A captured batch
+keeps its original question identity even if observation retires it in flight;
+explicit quotes of retired question messages cannot become prompts or answer
+another question. No failed input is replayed or reclassified.
+
+Answer failures report distinct reason codes: `ANSWER_NO_LONGER_PENDING`,
+`ANSWER_QUESTION_NOT_PRESENTED`, `ANSWER_QUESTION_CHANGED`,
+`ANSWER_PREDATES_QUESTION`, `ANSWER_TEXT_ONLY`, `ANSWER_EMPTY`, or
+`ANSWER_CHOICE_NOT_ALLOWED`. Native submit races remain `REQUEST_NOT_PENDING`.
+These reasons appear in the existing result/status/error surfaces without
+including question or answer text. Older retained receipts keep their original
+compound `ANSWER_NOT_CURRENT_OR_NOT_ALLOWED` reason; it is not enough on its own
+to diagnose a stale answer.
+
 Primary assistant message observations call WeChat send/upload APIs directly.
 Multipart sends use a process-local promise chain to retain order; local files
 are captured when observed, before waiting for an earlier send. There is no

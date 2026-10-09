@@ -47,7 +47,7 @@ export interface State {
   notifications: string[];
   cursor: string;
   receipts: Receipt[];
-  question?: { generation: number; request: AskRequest; presentedAt: number; answered: boolean };
+  question?: { generation: number; request: AskRequest; presentedAt: number; answered: boolean; inactiveAt?: number };
   lastError?: string;
   lastApiFailure?: ApiFailure;
   legacy?: unknown;
