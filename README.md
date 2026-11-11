@@ -104,6 +104,13 @@ There is no connector-owned durable inbox/outbox, retry worker, or manual
 unlock workflow. A failed/unknown message does not block independent later
 messages or role selection, and is never automatically retried.
 
+The designated WeChat do-not-disturb response persistently silences outbound
+text, files and questions for that peer until genuinely new inbound WeChat
+input arrives. This is quiet suppression, not a retry queue: suppressed output
+is never backfilled. A new message may reuse the same reply context, but
+duplicate/historical or missing-timestamp input does not lift the gate.
+See [the exact signature and concurrency boundary](docs/MODULE.md#peer-do-not-disturb-and-rejected-reply-contexts).
+
 An unloaded existing session still owns its binding. Only a real inbound message
 loads that same ID through `session/load`; passive availability/history never
 loads, creates, or reloads a session. Only a valid `session/get` response with

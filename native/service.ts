@@ -6,7 +6,7 @@ import type { ModuleBackendContext, NativeAttachment, NativeChatEvent, NativeObs
 import { type Config } from './config.js';
 import { sessionMeta } from './binding.js';
 import { type Binding, type Receipt, invariant, retireBinding, Store } from './state.js';
-import { WechatApiError, WechatTransport, type InboundMessage, type Item } from './transport.js';
+import { isDoNotDisturb, WechatApiError, WechatTransport, type InboundMessage, type Item } from './transport.js';
 import { downloadInbound, uploadOutbound, verifySnapshot, type Snapshot } from './media.js';
 import { captureReferences, hasLocalReferences } from './references.js';
 
@@ -28,6 +28,14 @@ function primary(event: NativeChatEvent): boolean {
 function safeError(error: unknown): string {
   const message = error instanceof Error ? error.message : '';
   return /^[A-Z][A-Z0-9_]{0,100}$/u.test(message) ? message : 'SERVICE_OPERATION_FAILED';
+}
+interface OutputFence { token?: string; epoch: number; paused: boolean }
+interface OutputOptions {
+  cwd?: string | null;
+  live?: boolean;
+  references?: boolean;
+  historicalSuppressed?: boolean;
+  fence?: OutputFence;
 }
 
 export class Service {
@@ -56,6 +64,26 @@ export class Service {
     const current = this.store.read().binding!;
     invariant(current.contextToken === token, 'WECHAT_REPLY_CONTEXT_CHANGED');
     invariant(!current.replyContextRejection, 'WECHAT_REPLY_CONTEXT_REJECTED');
+  }
+  private outboundGate(epoch: number): void {
+    const gate = this.store.read().outboundGate;
+    invariant(gate?.pausedAt === undefined, 'WECHAT_DO_NOT_DISTURB');
+    invariant((gate?.epoch ?? 0) === epoch, 'WECHAT_OUTBOUND_EPOCH_CHANGED');
+  }
+  private outputFence(binding: Binding): OutputFence {
+    const state = this.store.read();
+    return {
+      token: state.binding?.generation === binding.generation && state.binding.sessionId === binding.sessionId
+        ? state.binding.contextToken : undefined,
+      epoch: state.outboundGate?.epoch ?? 0, paused: state.outboundGate?.pausedAt !== undefined,
+    };
+  }
+  private suppress(key: string, reason: string, error?: WechatApiError): void {
+    // Keep confirmed prefix IDs, but never retain suppressed bodies or attachment references.
+    const sent = this.store.read().receipts.find(receipt => receipt.key === key)?.sent ?? [];
+    this.result(key, { status: 'skipped', reason, text: '', media: [],
+      sent: sent.map(({ messageId }) => ({ messageId })),
+      ...(error ? { apiFailure: error.apiFailure } : {}) });
   }
   private track<T>(work: Promise<T>): Promise<T> {
     this.pending.add(work);
@@ -129,19 +157,29 @@ export class Service {
     }
     const question = this.store.read().question;
     const askId = question?.generation === binding.generation && !question.answered ? question.request.requestId : undefined;
-    const fresh: InboundMessage[] = [];
+    const fresh: { message: InboundMessage; recoveryEpoch?: number }[] = [];
     this.store.change(state => {
       for (const message of messages) {
         const key = `${this.config.account}:${message.id}`;
         if (state.receipts.some(receipt => receipt.key === key)) continue;
         state.receipts.push({ key, generation: binding.generation, direction: 'input', status: 'unknown',
           reason: 'DELIVERY_NOT_CONFIRMED', text: message.text, messageId: message.id, media: [] });
-        fresh.push(message);
+        const received: (typeof fresh)[number] = { message };
+        fresh.push(received);
+        const sameBinding = state.binding?.generation === binding.generation && state.binding.sessionId === binding.sessionId;
+        const gate = state.outboundGate;
+        if (sameBinding && !this.stopped && !this.context.stopping.aborted && !this.context.signal.aborted
+          && message.createdAt !== undefined && message.createdAt >= (binding.boundAt ?? 0)
+          && message.createdAt > (gate?.lastInboundAt ?? 0) && message.createdAt > (gate?.pausedAt ?? 0)) {
+          // Record receipt-time causality before any asynchronous native submission.
+          state.outboundGate = { ...gate, epoch: (gate?.epoch ?? 0) + 1, lastInboundAt: message.createdAt };
+          if (gate?.pausedAt !== undefined) received.recoveryEpoch = state.outboundGate.epoch;
+        }
       }
       // Advancing the protocol cursor is not a promise to replay unfinished submissions after a crash.
       state.cursor = cursor;
     });
-    for (const message of fresh) {
+    for (const { message, recoveryEpoch } of fresh) {
       const key = `${this.config.account}:${message.id}`;
       let submitted = false;
       let staleQuestion = false;
@@ -154,14 +192,6 @@ export class Service {
           state.binding!.contextToken = message.contextToken;
         });
         binding.contextToken = message.contextToken;
-        if (question?.generation === binding.generation && question.inactiveAt !== undefined) {
-          invariant(message.createdAt !== undefined && message.createdAt > question.inactiveAt, 'ANSWER_NO_LONGER_PENDING');
-        }
-        const quotedIds = message.items.flatMap(item => item.ref_msg ? [item.ref_msg.svr_id] : []);
-        invariant(!this.store.read().receipts.some(receipt => receipt.generation === binding.generation
-          && receipt.key.startsWith(`ask:${binding.generation}:`)
-          && receipt.key !== `ask:${binding.generation}:${askId}`
-          && receipt.sent?.some(part => part.messageId && quotedIds.includes(part.messageId))), 'ANSWER_NO_LONGER_PENDING');
         let meta = await sessionMeta(this.context, binding.sessionId);
         this.current(binding);
         invariant(meta, 'TARGET_SESSION_MISSING');
@@ -175,6 +205,34 @@ export class Service {
           this.current(binding);
           invariant(meta?.loaded, 'LOAD_NOT_CONFIRMED');
         }
+        if (recoveryEpoch !== undefined) {
+          const pendingKeys = [
+            ...(meta.ask ? [`ask:${binding.generation}:${meta.ask.requestId}`] : []),
+            ...[meta.planRequest, meta.elicitation].flatMap(decision =>
+              decision ? [`decision:${binding.generation}:${decision.requestId}`] : []),
+          ];
+          this.store.change(state => {
+            const gate = state.outboundGate;
+            if (gate?.epoch !== recoveryEpoch || gate.pausedAt === undefined) return;
+            // Atomically consume pending requests from the paused period before reopening.
+            for (const key of pendingKeys) if (!state.receipts.some(receipt => receipt.key === key)) {
+              state.receipts.push({ key, generation: binding.generation, direction: 'output', status: 'skipped',
+                reason: 'WECHAT_DO_NOT_DISTURB', text: '', media: [], sent: [] });
+            }
+            delete gate.pausedAt;
+            gate.resumedAt = Date.now();
+            delete state.binding!.replyContextRejection;
+          });
+          this.context.invalidate();
+        }
+        if (question?.generation === binding.generation && question.inactiveAt !== undefined) {
+          invariant(message.createdAt !== undefined && message.createdAt > question.inactiveAt, 'ANSWER_NO_LONGER_PENDING');
+        }
+        const quotedIds = message.items.flatMap(item => item.ref_msg ? [item.ref_msg.svr_id] : []);
+        invariant(!this.store.read().receipts.some(receipt => receipt.generation === binding.generation
+          && receipt.key.startsWith(`ask:${binding.generation}:`)
+          && receipt.key !== `ask:${binding.generation}:${askId}`
+          && receipt.sent?.some(part => part.messageId && quotedIds.includes(part.messageId))), 'ANSWER_NO_LONGER_PENDING');
         if (askId || meta.ask) {
           const ask = meta.ask;
           staleQuestion = askId !== undefined && ask?.requestId !== askId;
@@ -264,12 +322,27 @@ export class Service {
     }
     if (event.type !== 'assistant.message' || typeof event.data.content !== 'string' || !event.data.content.trim()) return;
     if (this.stopped || this.context.stopping.aborted) return;
-    await this.output(binding, `reply:${binding.generation}:${event.id}`, event.data.content, observation.cwd ?? binding.cwd, live, true);
+    const resumedAt = this.store.read().outboundGate?.resumedAt;
+    const timestamp = typeof event.timestamp === 'number' ? event.timestamp
+      : typeof event.timestamp === 'string' ? Date.parse(event.timestamp) : NaN;
+    const historicalSuppressed = resumedAt !== undefined
+      && (Number.isFinite(timestamp) ? timestamp <= resumedAt : !live);
+    await this.output(binding, `reply:${binding.generation}:${event.id}`, event.data.content,
+      { cwd: observation.cwd ?? binding.cwd, live, references: true, historicalSuppressed });
   }
-  private output(binding: Binding, key: string, content: string, cwd?: string | null, live = true, references = false): Promise<boolean> {
-    const token = this.matches(binding) ? this.store.read().binding?.contextToken : undefined;
+  private output(binding: Binding, key: string, content: string, options: OutputOptions = {}): Promise<boolean> {
+    const { cwd, live = true, references = false, historicalSuppressed = false } = options;
+    const current = this.outputFence(binding);
+    const { token, epoch, paused } = options.fence ?? current;
+    const suppressionReason = paused || current.paused ? 'WECHAT_DO_NOT_DISTURB'
+      : epoch !== current.epoch ? 'WECHAT_OUTBOUND_EPOCH_CHANGED'
+        : historicalSuppressed ? 'WECHAT_SUPPRESSED_HISTORY' : undefined;
     if (!this.claim({ key, generation: binding.generation, direction: 'output', status: 'unknown',
-      reason: 'DELIVERY_NOT_CONFIRMED', text: content, media: [], sent: [] })) return Promise.resolve(false);
+      reason: 'DELIVERY_NOT_CONFIRMED', text: suppressionReason ? '' : content, media: [], sent: [] })) return Promise.resolve(false);
+    if (suppressionReason) {
+      this.suppress(key, suppressionReason);
+      return Promise.resolve(false);
+    }
     const prepare = async () => {
       try {
         invariant(content.length <= 250_000, 'REPLY_TOO_LARGE');
@@ -290,7 +363,10 @@ export class Service {
       const captured = await prepared;
       if (!captured) return false;
       let attempted = false;
+      let sendStartedAt = 0;
+      const beforeEffect = () => { this.outboundGate(epoch); this.replyContext(binding, token); };
       try {
+        this.outboundGate(epoch);
         this.replyContext(binding, token);
         this.result(key, { media: captured.files });
         const parts: { text?: string; file?: Snapshot }[] = [...split(captured.text).map(text => ({ text })),
@@ -299,12 +375,13 @@ export class Service {
         const quoted = this.store.read().receipts.find(receipt => receipt.direction === 'input' && receipt.status === 'accepted'
           && binding.userMessageId !== undefined && receipt.generation === binding.generation && receipt.nativeMessageId === binding.userMessageId);
         for (const part of parts) {
-          this.replyContext(binding, token);
+          beforeEffect();
           attempted = true;
           const item: Item = part.file ? await uploadOutbound(this.transport, part.file, this.context.signal,
-            () => this.replyContext(binding, token)) : { type: 1, text_item: { text: part.text! } };
+            beforeEffect) : { type: 1, text_item: { text: part.text! } };
           if (quoted?.messageId) item.ref_msg = { svr_id: quoted.messageId };
-          this.replyContext(binding, token);
+          beforeEffect();
+          sendStartedAt = Date.now();
           const result = await this.transport.send([item], token, `wx-${randomUUID()}`, this.context.signal);
           this.store.change(state => {
             state.receipts.find(receipt => receipt.key === key)!.sent!.push({ ...part, messageId: result.messageId });
@@ -313,12 +390,22 @@ export class Service {
         this.result(key, { status: 'accepted', reason: undefined });
         return true;
       } catch (error) {
-        if (error instanceof WechatApiError && error.apiFailure.endpoint === 'ilink/bot/sendmessage'
-          && error.apiFailure.ret === -2 && this.matches(binding)) this.store.change(state => {
-          // An old in-flight request cannot suspend a newer inbound reply context.
-          if (state.binding!.contextToken === token) state.binding!.replyContextRejection = { observedAt: error.apiFailure.observedAt };
-        });
+        if (isDoNotDisturb(error)) {
+          this.store.change(state => {
+            const gate = state.outboundGate;
+            // Only a genuinely newer peer input, not a binding change, supersedes this rejection.
+            if ((gate?.epoch ?? 0) === epoch || (gate?.lastInboundAt ?? 0) <= sendStartedAt) state.outboundGate = {
+              ...gate, epoch: (gate?.epoch ?? 0) + 1, pausedAt: error.apiFailure.observedAt,
+            };
+          });
+          this.suppress(key, 'WECHAT_DO_NOT_DISTURB', error);
+          return false;
+        }
         const reason = safeError(error);
+        if (['WECHAT_DO_NOT_DISTURB', 'WECHAT_OUTBOUND_EPOCH_CHANGED'].includes(reason)) {
+          this.suppress(key, reason);
+          return false;
+        }
         const suppressed = ['WECHAT_REPLY_CONTEXT_REJECTED', 'WECHAT_REPLY_CONTEXT_CHANGED'].includes(reason);
         this.result(key, { status: attempted ? 'unknown' : suppressed ? 'skipped' : 'failed', reason,
           ...(error instanceof WechatApiError ? { apiFailure: error.apiFailure } : {}) });
@@ -335,6 +422,7 @@ export class Service {
     this.accepting();
     const { binding, question } = this.store.read();
     if (!binding) return;
+    const fence = this.outputFence(binding);
     try {
       const meta = await sessionMeta(this.context, binding.sessionId);
       this.current(binding);
@@ -352,22 +440,28 @@ export class Service {
           state.question.inactiveAt = Date.now();
         }
       });
+      const pendingRequests = async () => {
+        if (meta.ask) {
+          const ask = meta.ask;
+          const text = `${ask.question}${ask.choices?.length ? '\n\n' + ask.choices.map((choice, i) => `${i + 1}. ${choice}`).join('\n') : ''}\n\nReply with the option text${ask.allowFreeform !== false ? ' or your own answer' : ''}.`;
+          if (await this.output(binding, `ask:${binding.generation}:${ask.requestId}`, text, { fence })) {
+            if (this.matches(binding)) this.store.change(state => {
+              state.question = { generation: binding.generation, request: ask, presentedAt: Date.now(), answered: false };
+            });
+          }
+        }
+        for (const decision of [meta.planRequest, meta.elicitation]) {
+          if (decision) await this.output(binding, `decision:${binding.generation}:${decision.requestId}`,
+            `This session needs a Web decision:\n${this.config.webUrl}/session/${encodeURIComponent(binding.sessionId)}`,
+            { fence });
+        }
+      };
+      // Persist already-observed suppressed requests before history or inbound can resume output.
+      if (meta.loaded && fence.paused) await pendingRequests();
       await this.history(binding);
       this.current(binding);
-      if (!meta.loaded || !this.store.read().binding?.contextToken) return;
-      if (meta.ask) {
-        const ask = meta.ask;
-        const text = `${ask.question}${ask.choices?.length ? '\n\n' + ask.choices.map((choice, i) => `${i + 1}. ${choice}`).join('\n') : ''}\n\nReply with the option text${ask.allowFreeform !== false ? ' or your own answer' : ''}.`;
-        if (await this.output(binding, `ask:${binding.generation}:${ask.requestId}`, text)) {
-          if (this.matches(binding)) this.store.change(state => {
-            state.question = { generation: binding.generation, request: ask, presentedAt: Date.now(), answered: false };
-          });
-        }
-      }
-      for (const decision of [meta.planRequest, meta.elicitation]) {
-        if (decision) await this.output(binding, `decision:${binding.generation}:${decision.requestId}`,
-          `This session needs a Web decision:\n${this.config.webUrl}/session/${encodeURIComponent(binding.sessionId)}`);
-      }
+      if (!meta.loaded || fence.paused || !this.store.read().binding?.contextToken) return;
+      await pendingRequests();
     } catch (error) {
       if (this.matches(binding)) throw error;
       this.report(error, binding);

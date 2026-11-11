@@ -94,6 +94,11 @@ export class WechatApiError extends Error {
     };
   }
 }
+export function isDoNotDisturb(error: unknown): error is WechatApiError {
+  return error instanceof WechatApiError && error.apiFailure.endpoint === 'ilink/bot/sendmessage'
+    && error.apiFailure.ret === -2 && error.apiFailure.errcode === 'absent'
+    && error.apiFailure.errmsg === 'present';
+}
 export function apiSuccess(value: Record<string, unknown>, endpoint: ApiEndpoint): void {
   if ((value.ret !== undefined && value.ret !== 0) || (value.errcode !== undefined && value.errcode !== 0)
     || (value.errmsg !== undefined && value.errmsg !== '')) throw new WechatApiError(value, endpoint);

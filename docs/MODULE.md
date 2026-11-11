@@ -43,41 +43,66 @@ resolution workflow. A failed capture/send does not block the next independent
 reply or binding. A missing WeChat context token is a visible failure, not a
 message queued for later delivery.
 
-### Rejected reply contexts
+### Peer do-not-disturb and rejected reply contexts
 
-An explicit `sendmessage` response with numeric `ret: -2` suspends further
-outbound API calls for that binding's current reply context. This is a
-conservative response to an observed server rejection, not a claim that `-2`
-uniquely means quota exhaustion or that every context permits ten replies.
-No fixed quota, expiry timer, token refresh call or login change is introduced.
-Other response codes and `getupdates`/`getuploadurl` failures do not trigger it.
+The operator-designated do-not-disturb (DND) response is exactly HTTP 200 on
+`sendmessage`, numeric `ret: -2`, absent `errcode`, and a nonempty string
+`errmsg`. Its text is never inspected or retained. This narrow signature is a
+local behavior policy for the observed response, not a claim that every `-2`
+universally means DND. Other shapes/codes, token expiry, polling/upload
+rejections, network uncertainty, and file access failures remain ordinary
+visible failures. There is no timer, retry, quota guess, login or token refresh.
 
-The private binding retains only a rejection timestamp alongside its existing
-context token; this survives restart, without a new queue or credential copy.
-Subsequent outputs are recorded `skipped` with
-`WECHAT_REPLY_CONTEXT_REJECTED`, not retried or saved for later dispatch.
-The triggering attempted output remains `unknown`, including any confirmed
-multipart prefix. A genuine authorized, nonduplicate inbound message carrying
-a **different** `context_token` removes the suspension for new output. Web
-messages, repeated tokens, duplicate polling, ticks and restarts do not.
-Old unknown/skipped outputs are never replayed.
+DND persists outside the binding, scoped by the database's existing
+account/peer identity. It survives restart and binding retirement/replacement.
+All new output paths (text, files, AskUser, decision links, input-error notices,
+and history) are suppressed before file capture when already paused.
+Process-local queued output, later chunks, upload-URL requests, CDN uploads,
+and final sends also recheck the gate. Already-started effects may complete.
+No DND report is sent to the Host or model, and no retry incentive is emitted.
+Other errors remain visible, including historical faults in `lastError`.
 
-Each output captures its context before asynchronous file preparation or
-process-local send ordering. A context change prevents its remaining sends
-(`WECHAT_REPLY_CONTEXT_CHANGED`); an old in-flight failure cannot suspend a new
-context or replacement binding. Already-started requests may still complete.
-Media is not uploaded while the current context is suspended. Old generic
-receipts and Rolling.4 diagnostics lack the attempted context identity, so
-upgrade does not retroactively infer suspension from them; it begins with the
-next naturally occurring qualifying rejection.
+Only a nonduplicate message from the configured peer for the current binding
+can resume output. Its protocol `create_time_ms` must be strictly newer than
+both the pause boundary and the latest qualifying inbound timestamp, and not
+precede the binding. Missing, equal, or older timestamps cannot establish
+freshness and do not resume output. A **same-token** fresh message is sufficient;
+another peer, a duplicate ID with a changed timestamp, Web input, internal
+events, ticks, and startup are not. Timestamp ambiguity fails closed; no reset
+or synthetic message is used to bypass it.
 
-The `outbound` field of `GET /status` distinguishes `unbound`, `no_context`,
-`awaiting_new_context` and `ready`. A suspended result includes its timestamp
-and guidance to wait for natural inbound context, but no token. `ready` means
-only that no local context suspension applies, not verified API health.
-Fresh context must come from normal WeChat use, not automatic test messages,
-replay, cursor resets or reauthentication. This mitigation cannot increase
-server allowances or guarantee delivery of long-running unsolicited replies.
+An epoch is captured when output is observed and changes on qualifying inbound
+or DND. This fences queued/captured work even if pause and resume happen before
+its send turn. Inbound causality is persisted before native submission awaits:
+a rejection from a send started before a newer inbound timestamp cannot
+re-pause that peer. Historical inbound received during a send cannot defeat
+the rejection; a clock-ahead input already seen before the send cannot defeat
+it either. Recovery keeps the gate closed through the authoritative native
+metadata read (and load if needed), atomically marking existing pending
+asks/decisions skipped before opening. Thus pending requests from the paused
+period are not backfilled even if no watcher saw them. A failed/interrupted
+recovery leaves the gate paused; it is not resumed from a stored work item.
+Existing context-token and binding fences still prevent sending
+an old output with a newer context or replacement session.
+
+The triggering rejection and suppressed outputs are `skipped` (not delivered
+in full), never `accepted`. Their receipts contain no body, media references,
+or sent-part bodies; confirmed multipart prefix IDs and allowlisted rejection
+diagnostics remain. `WECHAT_DO_NOT_DISTURB`, `WECHAT_OUTBOUND_EPOCH_CHANGED`,
+and `WECHAT_SUPPRESSED_HISTORY` distinguish the reasons. Actual network/crash
+unknowns remain `unknown`. No old receipt is replayed. On recovery, unseen
+historical assistant events at/before the recovery boundary, or lacking a valid
+timestamp, are also skipped rather than drained into WeChat.
+
+Prior releases' explicit `replyContextRejection` markers remain readable and
+retain their original context guard. Old generic errors/unknown receipts are
+not retroactively classified as DND. No schema reset or credential copy is
+needed for the additive peer gate.
+
+`GET /status` distinguishes `do_not_disturb`, `unbound`, `no_context`,
+`awaiting_new_context` (a retained old context marker), and `ready`. DND includes
+only its reason, timestamp, and guidance to wait for genuine peer input, never
+a token or response text. `ready` describes the local gate, not API health.
 
 Polling remains necessary for the WeChat protocol. The native observation pass
 reads persisted chat using its retained anchor and observes pending questions.
@@ -145,6 +170,8 @@ are never retained in diagnostics. `getupdates` rejection has no message receipt
 
 These fields diagnose rejection; they do not change success criteria, trigger
 reauthentication/retry, or prove that an ambiguous send was not delivered.
+The exact DND signature has the explicit suppression behavior above and is
+retained on its bodyless receipt rather than reported as a new Host error.
 Historical errors remain visible after a later successful operation, so compare
 timestamps and subsequent receipts rather than treating the panel as a current
 health probe. Old generic `WECHAT_API_REJECTED` records have no recoverable
