@@ -384,7 +384,7 @@ test('poll rejection diagnostics reach the existing loop report without creating
   assert.equal(f.store.read().receipts.length, 0);
   assert(!JSON.stringify(error).includes('SECRET_RESPONSE'));
 });
-test('rejected reply contexts survive restart and resume only NEW output after different inbound context', async t => {
+test('DND survives restart and resumes only NEW output after fresh inbound, even with the same token', async t => {
   const f = fixture(t);
   await bind(f);
   await establishContext(f);
@@ -397,42 +397,57 @@ test('rejected reply contexts survive restart and resume only NEW output after d
   const service = f.serviceWith(transport);
   const observe = id => service.observe({ sessionId: 'session-original', event: event(id, id) });
   await observe('rejected');
-  assert.equal(outputs(f).at(-1).status, 'unknown');
-  assert(f.store.read().binding.replyContextRejection);
+  assert.equal(outputs(f).at(-1).status, 'skipped');
+  assert(f.store.read().outboundGate.pausedAt);
+  const pausedAt = f.store.read().outboundGate.pausedAt;
   await observe('suppressed');
   assert.equal(attempts, 1);
   assert.equal(outputs(f).at(-1).status, 'skipped');
-  assert.equal(outputs(f).at(-1).reason, 'WECHAT_REPLY_CONTEXT_REJECTED');
+  assert.equal(outputs(f).at(-1).reason, 'WECHAT_DO_NOT_DISTURB');
   await service.ingest([message('initial', 'duplicate', { contextToken: 'not-a-new-input' })], 'duplicate', f.store.read().binding);
   await assert.rejects(service.ingest([message('unauthorized', 'no', {
     peer: 'other-peer', contextToken: 'not-authorized',
   })], 'unauthorized', f.store.read().binding), /INBOUND_IDENTITY/);
-  assert(f.store.read().binding.replyContextRejection);
+  assert(f.store.read().outboundGate.pausedAt);
   const reopened = new Store(f.store.root, 'fixture-account');
   const restarted = new Service(f.context, f.config, reopened, transport);
   try {
     await restarted.observe({ sessionId: 'session-original', event: event('restart', 'new') });
     assert.equal(attempts, 1);
-    assert.equal(reopened.read().receipts.at(-1).reason, 'WECHAT_REPLY_CONTEXT_REJECTED');
+    assert.equal(reopened.read().receipts.at(-1).reason, 'WECHAT_DO_NOT_DISTURB');
   } finally { await restarted.stop(); reopened.close(); }
-  await service.ingest([message('same-token')], 'same', f.store.read().binding);
+  await service.ingest([message('missing-time'), message('historical', 'old', {
+    createdAt: pausedAt, contextToken: 'different-but-old',
+  })], 'same', f.store.read().binding);
   await observe('same-still-rejected');
   assert.equal(attempts, 1);
-  await service.ingest([message('new-token', 'new request', { contextToken: 'new-context' })], 'new', f.store.read().binding);
-  assert.equal(f.store.read().binding.replyContextRejection, undefined);
+  await service.ingest([message('fresh', 'new request', {
+    contextToken: 'different-but-old', createdAt: pausedAt + 1,
+  })], 'new', f.store.read().binding);
+  assert.equal(f.store.read().outboundGate.pausedAt, undefined);
   await observe('suppressed');
   await observe('rejected');
   assert.equal(attempts, 1);
   await observe('fresh-output');
   assert.equal(attempts, 2);
   assert.equal(outputs(f).at(-1).status, 'accepted');
-  assert.equal(f.store.read().lastApiFailure.ret, -2);
+  assert.equal(f.store.read().lastApiFailure, undefined);
+  assert.equal(f.store.read().lastError, undefined);
+  assert.deepEqual(f.reports, []);
+  assert(outputs(f).filter(receipt => receipt.status === 'skipped')
+    .every(receipt => receipt.text === '' && receipt.media.length === 0 && receipt.sent.length === 0));
 });
-test('only sendmessage ret=-2 suspends context; other API failures remain independent', async t => {
+test('only the exact DND signature is quiet; all other API failures remain independent and reported', async t => {
   for (const [endpoint, body] of [
     ['ilink/bot/getuploadurl', { ret: -2 }], ['ilink/bot/getupdates', { ret: -2 }],
     ['ilink/bot/sendmessage', { ret: -14 }], ['ilink/bot/sendmessage', { ret: 1 }],
     ['ilink/bot/sendmessage', { ret: 0, errcode: -2 }],
+    ['ilink/bot/sendmessage', { ret: -2, errcode: -14, errmsg: 'private' }],
+    ['ilink/bot/sendmessage', { ret: -2, errcode: 0, errmsg: 'private' }],
+    ['ilink/bot/sendmessage', { ret: '-2', errmsg: 'private' }],
+    ['ilink/bot/sendmessage', { ret: -2 }],
+    ['ilink/bot/sendmessage', { ret: -2, errmsg: '' }],
+    ['ilink/bot/sendmessage', { ret: -2, errmsg: {} }],
   ]) await t.test(`${endpoint}:${JSON.stringify(body)}`, async t => {
     const f = fixture(t);
     await bind(f);
@@ -445,6 +460,8 @@ test('only sendmessage ret=-2 suspends context; other API failures remain indepe
     } });
     await service.observe({ sessionId: 'session-original', event: event('bad', 'one') });
     assert.equal(f.store.read().binding.replyContextRejection, undefined);
+    assert.equal(f.store.read().outboundGate?.pausedAt, undefined);
+    assert.equal(f.reports.length, 1);
     await service.observe({ sessionId: 'session-original', event: event('good', 'two') });
     assert.equal(attempts, 2);
     assert.equal(outputs(f).at(-1).status, 'accepted');
@@ -464,11 +481,14 @@ test('queued old-context output is never borrowed into a new context and late re
   const first = service.observe({ sessionId: 'session-original', event: event('first', 'one') });
   await entered.promise;
   const queued = service.observe({ sessionId: 'session-original', event: event('queued', 'two') });
-  await service.ingest([message('fresh', 'new request', { contextToken: 'new-context' })], 'fresh', f.store.read().binding);
-  gate.reject(new WechatApiError({ ret: -2 }, 'ilink/bot/sendmessage'));
+  await service.ingest([message('fresh', 'new request', {
+    contextToken: 'new-context', createdAt: Date.now() + 1,
+  })], 'fresh', f.store.read().binding);
+  gate.reject(new WechatApiError({ ret: -2, errmsg: 'private' }, 'ilink/bot/sendmessage'));
   await Promise.all([first, queued]);
   assert.equal(f.store.read().binding.replyContextRejection, undefined);
-  assert.equal(outputs(f).at(-1).reason, 'WECHAT_REPLY_CONTEXT_CHANGED');
+  assert.equal(f.store.read().outboundGate.pausedAt, undefined);
+  assert.equal(outputs(f).at(-1).reason, 'WECHAT_OUTBOUND_EPOCH_CHANGED');
   assert.equal(outputs(f).at(-1).status, 'skipped');
   await service.observe({ sessionId: 'session-original', event: event('new', 'three') });
   assert.deepEqual(tokens, ['synthetic-context', 'new-context']);
@@ -486,7 +506,7 @@ test('rejection suspends multipart tails and queued media without another API ca
     if (attempts === 1) return new Response('{"ret":0,"message_id":"1"}');
     entered.resolve();
     await gate.promise;
-    return new Response('{"ret":-2}');
+    return new Response('{"ret":-2,"errmsg":"private"}');
   });
   const service = f.serviceWith(transport);
   const first = service.observe({ sessionId: 'session-original', event: event('multipart', 'x'.repeat(8000)) });
@@ -497,9 +517,11 @@ test('rejection suspends multipart tails and queued media without another API ca
   await Promise.all([first, queued]);
   assert.equal(attempts, 2);
   assert.equal(outputs(f)[0].sent.length, 1);
-  assert.equal(outputs(f)[0].status, 'unknown');
+  assert.equal(outputs(f)[0].status, 'skipped');
+  assert.deepEqual(outputs(f)[0].sent, [{ messageId: '1' }]);
   assert.equal(outputs(f)[1].status, 'skipped');
-  assert.equal(outputs(f)[1].reason, 'WECHAT_REPLY_CONTEXT_REJECTED');
+  assert.equal(outputs(f)[1].reason, 'WECHAT_DO_NOT_DISTURB');
+  assert.deepEqual(f.reports, []);
 });
 test('a rejected old binding cannot block its replacement even with the same token', async t => {
   const f = fixture(t);
@@ -515,12 +537,288 @@ test('a rejected old binding cannot block its replacement even with the same tok
   const pending = service.observe({ sessionId: 'session-original', event: event('old', 'one') });
   await entered.promise;
   const binding = await replace(f);
-  await service.ingest([message('replacement', 'hello', { createdAt: binding.boundAt })], 'new', binding);
-  gate.reject(new WechatApiError({ ret: -2 }, 'ilink/bot/sendmessage'));
+  await service.ingest([message('replacement', 'hello', { createdAt: Date.now() + 1 })], 'new', binding);
+  gate.reject(new WechatApiError({ ret: -2, errmsg: 'private' }, 'ilink/bot/sendmessage'));
   await pending;
   assert.equal(f.store.read().binding.replyContextRejection, undefined);
   await service.observe({ sessionId: 'replacement', event: event('new', 'two') });
   assert.equal(attempts, 2);
+});
+test('same-token fresh input fences an in-flight DND rejection before native input submission finishes', async t => {
+  const f = fixture(t);
+  let now = Date.now();
+  t.mock.method(Date, 'now', () => now);
+  await bind(f);
+  await establishContext(f);
+  const sending = deferred(), sendGate = deferred(), submitting = deferred(), submitGate = deferred();
+  let attempts = 0;
+  f.transport.send = async () => {
+    if (++attempts === 1) { sending.resolve(); await sendGate.promise; }
+    return {};
+  };
+  const first = observe(f, 'race-old', 'old');
+  await sending.promise;
+  const queued = observe(f, 'race-queued', 'queued');
+  f.setHook(name => {
+    if (name === 'prompt') { submitting.resolve(); return submitGate.promise; }
+  });
+  now += 10;
+  const incoming = f.service.ingest([message('new-same-token', 'fresh', { createdAt: now })], 'new', f.store.read().binding);
+  await submitting.promise;
+  sendGate.reject(new WechatApiError({ ret: -2, errmsg: 'private' }, 'ilink/bot/sendmessage'));
+  await Promise.all([first, queued]);
+  assert.equal(f.store.read().outboundGate.pausedAt, undefined);
+  assert.equal(outputs(f)[1].reason, 'WECHAT_OUTBOUND_EPOCH_CHANGED');
+  submitGate.resolve({ ok: true, messageId: 'native-new' });
+  await incoming;
+  await observe(f, 'new-after-race', 'new');
+  assert.equal(attempts, 2);
+  assert.deepEqual(f.reports, []);
+});
+test('a clock-ahead inbound already processed before sending cannot defeat a subsequent DND rejection', async t => {
+  const f = fixture(t);
+  const now = Date.now();
+  t.mock.method(Date, 'now', () => now);
+  await bind(f);
+  await f.service.ingest([message('ahead', 'new', { createdAt: now + 100 })], 'ahead', f.store.read().binding);
+  let attempts = 0;
+  f.transport.send = async () => {
+    attempts++;
+    throw new WechatApiError({ ret: -2, errmsg: 'private' }, 'ilink/bot/sendmessage');
+  };
+  await observe(f, 'skew-rejection', 'stop');
+  await observe(f, 'skew-suppressed', 'do not send');
+  assert.equal(f.store.read().outboundGate.pausedAt, now);
+  assert.equal(attempts, 1);
+  assert.deepEqual(f.reports, []);
+});
+test('unseen historical inbound during a send does not supersede its DND rejection', async t => {
+  const f = fixture(t);
+  let now = Date.now();
+  t.mock.method(Date, 'now', () => now);
+  await bind(f);
+  await establishContext(f);
+  now += 100;
+  const entered = deferred(), gate = deferred();
+  f.transport.send = async () => { entered.resolve(); await gate.promise; return {}; };
+  const output = observe(f, 'pending-historical', 'stop');
+  await entered.promise;
+  await f.service.ingest([message('old-unseen', 'old', { createdAt: now - 1 })], 'old', f.store.read().binding);
+  gate.reject(new WechatApiError({ ret: -2, errmsg: 'private' }, 'ilink/bot/sendmessage'));
+  await output;
+  assert.equal(f.store.read().outboundGate.pausedAt, now);
+});
+test('observed asks and decisions cannot escape a pause/resume while history is awaiting', async t => {
+  for (const initiallyPaused of [false, true]) await t.test(`paused: ${initiallyPaused}`, async t => {
+    const f = fixture(t);
+    let now = Date.now();
+    t.mock.method(Date, 'now', () => now);
+    await bind(f);
+    await establishContext(f);
+    let attempts = 0;
+    f.transport.send = async () => {
+      attempts++;
+      throw new WechatApiError({ ret: -2, errmsg: 'private' }, 'ilink/bot/sendmessage');
+    };
+    if (initiallyPaused) await observe(f, 'pause-before-observation', 'stop');
+    f.setMeta({ ...f.getMeta(), ask: { requestId: 'old-ask', question: 'PRIVATE_ASK' },
+      planRequest: { requestId: 'old-plan' }, elicitation: { requestId: 'old-elicit' } });
+    const historyEntered = deferred(), historyGate = deferred();
+    f.setHook((name, body) => {
+      if (name === 'session/chat') {
+        historyEntered.resolve();
+        return historyGate.promise.then(() => page(body, []));
+      }
+    });
+    const tick = f.service.tick();
+    await historyEntered.promise;
+    if (!initiallyPaused) await observe(f, 'pause-after-observation', 'stop');
+    f.setMeta({ ...f.getMeta(), ask: null, planRequest: null, elicitation: null });
+    now += 10;
+    await f.service.ingest([message('resume-pending', 'new', { createdAt: now })], 'resume', f.store.read().binding);
+    historyGate.resolve();
+    await tick;
+    assert.equal(attempts, 1);
+    const requests = outputs(f).filter(receipt => /^(ask|decision):/.test(receipt.key));
+    assert.equal(requests.length, 3);
+    assert(requests.every(receipt => receipt.status === 'skipped' && receipt.text === ''));
+    assert.equal(f.store.read().question, undefined);
+    assert.deepEqual(f.reports, []);
+    f.setMeta({ ...f.getMeta(), ask: { requestId: 'old-ask', question: 'PRIVATE_ASK' } });
+    await f.service.tick();
+    assert.equal(attempts, 1);
+  });
+});
+test('recovery consumes requests created during DND even when no watcher observed them', async t => {
+  const f = fixture(t);
+  let now = Date.now();
+  t.mock.method(Date, 'now', () => now);
+  await bind(f);
+  await establishContext(f);
+  let attempts = 0;
+  f.transport.send = async items => {
+    if (++attempts === 1) throw new WechatApiError({ ret: -2, errmsg: 'private' }, 'ilink/bot/sendmessage');
+    f.sent.push(items);
+    return {};
+  };
+  await observe(f, 'pause-unseen-requests', 'stop');
+  f.setMeta({ ...f.getMeta(), ask: { requestId: 'unseen-ask', question: 'PRIVATE_QUESTION' },
+    planRequest: { requestId: 'unseen-plan' }, elicitation: { requestId: 'unseen-elicit' } });
+  now += 10;
+  await f.service.ingest([message('recover-unseen', 'fresh', { createdAt: now })], 'recover', f.store.read().binding);
+  assert.equal(f.store.read().outboundGate.pausedAt, undefined);
+  const requests = outputs(f).filter(receipt => /^(ask|decision):/.test(receipt.key));
+  assert.equal(requests.length, 3);
+  assert(requests.every(receipt => receipt.status === 'skipped' && receipt.text === '' && receipt.sent.length === 0));
+  const before = attempts;
+  await f.service.tick();
+  assert.equal(attempts, before);
+  assert(!JSON.stringify(f.sent).includes('PRIVATE_QUESTION'));
+  assert.equal(f.store.read().question, undefined);
+  assert.deepEqual(f.reports, ['ANSWER_QUESTION_NOT_PRESENTED']);
+});
+test('recovery stays paused through native metadata lookup and fences overlapping inbound recoveries', async t => {
+  const f = fixture(t);
+  let now = Date.now();
+  t.mock.method(Date, 'now', () => now);
+  await bind(f);
+  await establishContext(f);
+  f.transport.send = async () => { throw new WechatApiError({ ret: -2, errmsg: 'private' }, 'ilink/bot/sendmessage'); };
+  await observe(f, 'pause-recovery-race', 'stop');
+  const firstEntered = deferred(), firstGate = deferred(), secondEntered = deferred(), secondGate = deferred();
+  let lookups = 0;
+  f.setHook(name => {
+    if (name !== 'session/get') return;
+    if (++lookups === 1) { firstEntered.resolve(); return firstGate.promise; }
+    if (lookups === 2) { secondEntered.resolve(); return secondGate.promise; }
+  });
+  now += 10;
+  const first = f.service.ingest([message('recovery-one', 'one', { createdAt: now })], 'one', f.store.read().binding);
+  await firstEntered.promise;
+  now += 10;
+  const second = f.service.ingest([message('recovery-two', 'two', { createdAt: now })], 'two', f.store.read().binding);
+  await secondEntered.promise;
+  firstGate.resolve({ meta: f.getMeta() });
+  await first;
+  assert(f.store.read().outboundGate.pausedAt);
+  await observe(f, 'still-paused', 'not sent');
+  assert.equal(outputs(f).at(-1).reason, 'WECHAT_DO_NOT_DISTURB');
+  secondGate.resolve({ meta: f.getMeta() });
+  await second;
+  assert.equal(f.store.read().outboundGate.pausedAt, undefined);
+  assert.deepEqual(f.reports, []);
+});
+test('DND survives binding replacement, suppresses asks/decisions/files, and never opens files while paused', async t => {
+  const f = fixture(t);
+  await bind(f);
+  await establishContext(f);
+  let attempts = 0;
+  f.transport.send = async () => {
+    attempts++;
+    throw new WechatApiError({ ret: -2, errmsg: 'private' }, 'ilink/bot/sendmessage');
+  };
+  await observe(f, 'pause', 'pause');
+  const pausedAt = f.store.read().outboundGate.pausedAt;
+  await replace(f);
+  f.store.change(state => { state.binding.contextToken = 'replacement-context'; });
+  f.setMeta({ ...f.getMeta(), ask: { requestId: 'suppressed-ask', question: 'PRIVATE_QUESTION', choices: ['yes'] },
+    planRequest: { requestId: 'plan' }, elicitation: { requestId: 'elicit' } });
+  await f.service.tick();
+  await observe(f, 'denied-file', '[PRIVATE_FILE](/outside/unauthorized/file.txt)');
+  await f.service.observe({ sessionId: 'replacement',
+    event: { id: 'web-input', type: 'user.message', data: { messageId: 'web-message' } } });
+  await f.service.tick();
+  assert.equal(attempts, 1);
+  assert.equal(f.store.read().outboundGate.pausedAt, pausedAt);
+  assert.equal(f.store.read().question, undefined);
+  assert.equal(outputs(f).length, 5);
+  assert(outputs(f).every(receipt => receipt.status === 'skipped' && receipt.text === '' && receipt.media.length === 0));
+  assert(!JSON.stringify(outputs(f)).includes('PRIVATE_'));
+  assert.deepEqual(f.reports, []);
+});
+test('DND fences queued capture through pause and resume, while later outputs and only new history can send', async t => {
+  const f = fixture(t);
+  let now = Date.now();
+  t.mock.method(Date, 'now', () => now);
+  await bind(f);
+  await establishContext(f);
+  const path = join(f.source, 'delayed.txt');
+  writeFileSync(path, 'private file bytes');
+  const sending = deferred(), sendGate = deferred(), capturing = deferred(), captureGate = deferred();
+  let attempts = 0;
+  f.transport.send = async () => {
+    if (++attempts === 1) { sending.resolve(); await sendGate.promise; }
+    return {};
+  };
+  const original = fsPromises.open;
+  const mock = t.mock.method(fsPromises, 'open', async (...args) => {
+    if (args[0] === path) { capturing.resolve(); await captureGate.promise; }
+    return original(...args);
+  });
+  syncBuiltinESMExports();
+  try {
+    const first = observe(f, 'pause-capture', 'pause');
+    await sending.promise;
+    const queued = observe(f, 'queued-capture', `[private](${path})`);
+    await capturing.promise;
+    sendGate.reject(new WechatApiError({ ret: -2, errmsg: 'private' }, 'ilink/bot/sendmessage'));
+    await first;
+    await observe(f, 'during-pause', 'never replay');
+    now += 10;
+    await f.service.ingest([message('resume', 'new', { createdAt: now })], 'resume', f.store.read().binding);
+    captureGate.resolve();
+    await queued;
+    assert.equal(outputs(f).find(receipt => receipt.key.endsWith('queued-capture')).reason, 'WECHAT_OUTBOUND_EPOCH_CHANGED');
+    assert.equal(attempts, 1);
+    for (const [id, timestamp] of [['old-unseen', now - 1], ['unknown-unseen', undefined]]) {
+      await f.service.observe({ sessionId: 'session-original', event: event(id, 'old history', { timestamp }) }, false);
+    }
+    assert.equal(attempts, 1);
+    await observe(f, 'during-pause', 'never replay');
+    now += 10;
+    await f.service.observe({ sessionId: 'session-original', event: event('new-history', 'new history', {
+      timestamp: new Date(now).toISOString(),
+    }) }, false);
+    await observe(f, 'new-live', 'new live');
+    assert.equal(attempts, 3);
+    assert.deepEqual(f.reports, []);
+  } finally { captureGate.resolve(); mock.mock.restore(); syncBuiltinESMExports(); }
+});
+test('historical, duplicate and foreign input cannot lift DND, including after a prior recovery', async t => {
+  const f = fixture(t);
+  let now = Date.now();
+  t.mock.method(Date, 'now', () => now);
+  await bind(f);
+  await establishContext(f);
+  f.transport.send = async () => { throw new WechatApiError({ ret: -2, errmsg: 'private' }, 'ilink/bot/sendmessage'); };
+  await observe(f, 'first-pause', 'one');
+  now += 10;
+  await f.service.ingest([message('resume-once', 'new', { createdAt: now })], 'new', f.store.read().binding);
+  now += 10;
+  await observe(f, 'second-pause', 'two');
+  const paused = f.store.read().outboundGate;
+  await f.service.ingest([message('resume-once', 'duplicate', { createdAt: now + 100 }),
+    message('historical-unseen', 'old', { createdAt: now - 1 }),
+    message('no-timestamp')], 'old', f.store.read().binding);
+  await assert.rejects(f.service.ingest([message('foreign', 'other', {
+    peer: 'other', createdAt: now + 100,
+  })], 'foreign', f.store.read().binding), /INBOUND_IDENTITY/);
+  assert.deepEqual(f.store.read().outboundGate, paused);
+  await observe(f, 'blocked', 'blocked');
+  assert.equal(outputs(f).at(-1).reason, 'WECHAT_DO_NOT_DISTURB');
+});
+test('unknown network outcomes and file permission failures are not swallowed or replayed', async t => {
+  const f = fixture(t);
+  await bind(f);
+  await establishContext(f);
+  f.transport.send = async () => { throw new Error('NETWORK_UNKNOWN'); };
+  await observe(f, 'unknown', 'possibly delivered');
+  assert.equal(outputs(f).at(-1).status, 'unknown');
+  assert.equal(f.store.read().outboundGate?.pausedAt, undefined);
+  await observe(f, 'file-refused', '[file](/outside/not-authorized.txt)');
+  assert.equal(outputs(f).at(-1).status, 'failed');
+  assert.equal(f.reports.length, 2);
+  assert.equal(f.store.read().outboundGate?.pausedAt, undefined);
 });
 test('new inbound during a file upload prevents its old-context send', async t => {
   const f = fixture(t);

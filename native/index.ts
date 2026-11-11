@@ -56,9 +56,13 @@ export async function activate(context: ModuleBackendContext): Promise<ModuleBac
           lastError: state?.lastError ?? null,
           lastApiFailure: state?.lastApiFailure ?? null,
           outbound: {
-            state: !state?.binding ? 'unbound' : !state.binding.contextToken ? 'no_context'
+            state: state?.outboundGate?.pausedAt !== undefined ? 'do_not_disturb'
+              : !state?.binding ? 'unbound' : !state.binding.contextToken ? 'no_context'
               : state.binding.replyContextRejection ? 'awaiting_new_context' : 'ready',
-            ...(state?.binding?.replyContextRejection ? {
+            ...(state?.outboundGate?.pausedAt !== undefined ? {
+              reason: 'WECHAT_DO_NOT_DISTURB', observedAt: state.outboundGate.pausedAt,
+              action: 'Wait for a genuinely new inbound WeChat message from this peer. Suppressed outputs will not be replayed.',
+            } : state?.binding?.replyContextRejection ? {
               reason: 'WECHAT_REPLY_CONTEXT_REJECTED', observedAt: state.binding.replyContextRejection.observedAt,
               action: 'Wait for a natural inbound WeChat message with a different reply context. Old outputs will not be replayed.',
             } : {}),

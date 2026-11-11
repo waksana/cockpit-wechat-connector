@@ -50,6 +50,7 @@ export interface State {
   question?: { generation: number; request: AskRequest; presentedAt: number; answered: boolean; inactiveAt?: number };
   lastError?: string;
   lastApiFailure?: ApiFailure;
+  outboundGate?: { epoch: number; lastInboundAt?: number; pausedAt?: number; resumedAt?: number };
   legacy?: unknown;
 }
 function validate(value: State): void {
@@ -64,6 +65,10 @@ function validate(value: State): void {
     && value.binding.replyContextRejection !== null && typeof value.binding.contextToken === 'string'
     && value.binding.contextToken.length > 0 && Number.isSafeInteger(value.binding.replyContextRejection.observedAt)
     && value.binding.replyContextRejection.observedAt >= 0), 'STATE_REPLY_CONTEXT_INVALID');
+  invariant(value.outboundGate === undefined || (value.outboundGate !== null
+    && Number.isSafeInteger(value.outboundGate.epoch) && value.outboundGate.epoch >= 0
+    && [value.outboundGate.lastInboundAt, value.outboundGate.pausedAt, value.outboundGate.resumedAt]
+      .every(time => time === undefined || (Number.isSafeInteger(time) && time >= 0))), 'STATE_OUTBOUND_GATE_INVALID');
   invariant(Array.isArray(value.receipts) && value.receipts.length <= 20_000 && value.receipts.every(receipt =>
     typeof receipt.key === 'string' && Number.isSafeInteger(receipt.generation) && typeof receipt.text === 'string'
     && ['input', 'output'].includes(receipt.direction) && ['unknown', 'accepted', 'failed', 'skipped'].includes(receipt.status)

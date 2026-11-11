@@ -70,6 +70,25 @@ test('status exposes persisted allowlisted API diagnostics without response or m
     failure = error.apiFailure;
     return error.message === 'WECHAT_API_REJECTED';
   });
+  test('DND is a safe peer status independent of binding and historical faults', async t => {
+    const root = mkdtempSync(join(process.cwd(), '.wechat-dnd-status-'));
+    t.after(() => rmSync(root, { recursive: true, force: true }));
+    const store = new Store(root, 'retained-identity');
+    store.change(state => {
+      state.outboundGate = { epoch: 2, pausedAt: 1234 };
+      state.lastError = 'WECHAT_TOKEN_EXPIRED';
+    });
+    store.close();
+    const backend = await activate(context(root).context);
+    try {
+      const status = (await backend.routes.find(route => route.path === '/status').handler({})).body;
+      assert.equal(status.outbound.state, 'do_not_disturb');
+      assert.equal(status.outbound.reason, 'WECHAT_DO_NOT_DISTURB');
+      assert.equal(status.outbound.observedAt, 1234);
+      assert.equal(status.lastError, 'WECHAT_TOKEN_EXPIRED');
+      assert(!JSON.stringify(status).includes('retained-identity'));
+    } finally { await backend.dispose(); }
+  });
   const store = new Store(root, 'retained-identity');
   store.change(state => {
     state.lastError = 'WECHAT_API_REJECTED';
