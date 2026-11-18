@@ -162,8 +162,13 @@ export class Service {
       for (const message of messages) {
         const key = `${this.config.account}:${message.id}`;
         if (state.receipts.some(receipt => receipt.key === key)) continue;
-        state.receipts.push({ key, generation: binding.generation, direction: 'input', status: 'unknown',
-          reason: 'DELIVERY_NOT_CONFIRMED', text: message.text, messageId: message.id, media: [] });
+        const voiceOnly = !!message.skippedVoiceItems && message.items.length === 0;
+        state.receipts.push({ key, generation: binding.generation, direction: 'input', status: voiceOnly ? 'skipped' : 'unknown',
+          reason: voiceOnly ? 'VOICE_ITEMS_SKIPPED' : 'DELIVERY_NOT_CONFIRMED',
+          text: message.text, messageId: message.id, media: [],
+          ...(message.skippedVoiceItems ? { skippedVoiceItems: message.skippedVoiceItems } : {}) });
+        // A discarded voice must not answer a question or reopen outbound delivery.
+        if (voiceOnly) continue;
         const received: (typeof fresh)[number] = { message };
         fresh.push(received);
         const sameBinding = state.binding?.generation === binding.generation && state.binding.sessionId === binding.sessionId;
@@ -241,7 +246,7 @@ export class Service {
           invariant(askId && question, 'ANSWER_QUESTION_NOT_PRESENTED');
           invariant(ask.requestId === askId, 'ANSWER_QUESTION_CHANGED');
           invariant(message.createdAt === undefined || message.createdAt >= question.presentedAt, 'ANSWER_PREDATES_QUESTION');
-          invariant(message.items.every(item => item.type === 1), 'ANSWER_TEXT_ONLY');
+          invariant(!message.skippedVoiceItems && message.items.every(item => item.type === 1), 'ANSWER_TEXT_ONLY');
           invariant(message.text.trim(), 'ANSWER_EMPTY');
           invariant(choice !== undefined || ask.allowFreeform !== false, 'ANSWER_CHOICE_NOT_ALLOWED');
           submitted = true;

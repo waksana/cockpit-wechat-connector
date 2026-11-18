@@ -104,6 +104,17 @@ needed for the additive peer gate.
 only its reason, timestamp, and guidance to wait for genuine peer input, never
 a token or response text. `ready` describes the local gate, not API health.
 
+Inbound voice items (`type: 3` with a voice object) are unsupported and explicitly
+omitted; their audio, transcription and quoted metadata are not forwarded.
+The input receipt records `skippedVoiceItems`. A voice-only message is marked
+`skipped` with `VOICE_ITEMS_SKIPPED`, without loading a session, answering an Ask,
+refreshing a reply context or reopening a paused outbound gate. Mixed messages
+retain their supported text/images/files/video; mixed voice/text is not accepted
+as an Ask answer. Other malformed or unknown item types still fail validation.
+Voice skips and supported messages share the existing atomic receipt/cursor
+commit, so one voice no longer blocks following text or photos, and repeats or
+restart do not resubmit processed inputs. No voice support or replay queue is added.
+
 Polling remains necessary for the WeChat protocol. The native observation pass
 reads persisted chat using its retained anchor and observes pending questions.
 It does not drain pending input/output records. Unseen native events can be

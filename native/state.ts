@@ -34,6 +34,7 @@ export interface Receipt {
   text: string;
   messageId?: string;
   nativeMessageId?: string;
+  skippedVoiceItems?: number;
   media: Snapshot[];
   sent?: { messageId?: string; text?: string; file?: Snapshot }[];
 }
@@ -72,6 +73,8 @@ function validate(value: State): void {
   invariant(Array.isArray(value.receipts) && value.receipts.length <= 20_000 && value.receipts.every(receipt =>
     typeof receipt.key === 'string' && Number.isSafeInteger(receipt.generation) && typeof receipt.text === 'string'
     && ['input', 'output'].includes(receipt.direction) && ['unknown', 'accepted', 'failed', 'skipped'].includes(receipt.status)
+    && (receipt.skippedVoiceItems === undefined || (Number.isSafeInteger(receipt.skippedVoiceItems)
+      && receipt.skippedVoiceItems > 0 && receipt.skippedVoiceItems <= 100))
     && Array.isArray(receipt.media) && (receipt.sent === undefined || Array.isArray(receipt.sent))), 'STATE_RECEIPT_INVALID');
   invariant(Array.isArray(value.notifications) && value.notifications.length <= 10_000
     && value.notifications.every(id => typeof id === 'string'), 'STATE_NOTIFICATION_INVALID');

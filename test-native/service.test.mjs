@@ -119,6 +119,54 @@ async function establishContext(f) {
 test('required capabilities checked before activation can open storage', () => {
   assert.throws(() => capabilities({ host: {} }), /REQUIRED_HOST_CAPABILITIES_MISSING/);
 });
+test('voice skip and following text commit together, deduplicate and survive restart without native voice effects', async t => {
+  const f = fixture(t);
+  await bind(f);
+  const wire = (id, items) => ({ message_id: id, from_user_id: 'peer', to_user_id: 'account',
+    message_type: 1, message_state: 2, context_token: 'fresh-context', item_list: items });
+  const voice = { type: 3, voice_item: { text: 'do not transcribe' } };
+  const transport = new WechatTransport({ account: 'account', peer: 'peer', token: 'fake' }, async url => {
+    assert.equal(url.pathname, '/ilink/bot/getupdates');
+    return new Response(JSON.stringify({ msgs: [
+      wire('41', [voice]), wire('42', [{ type: 1, text_item: { text: 'next text' } }]),
+      wire('43', [voice, { type: 1, text_item: { text: 'mixed text' } }]),
+    ], get_updates_buf: 'after-voice' }));
+  });
+  const service = f.serviceWith(transport);
+  await service.poll();
+  assert.equal(f.store.read().cursor, 'after-voice');
+  assert.deepEqual(inputs(f).map(r => [r.status, r.skippedVoiceItems]), [['skipped', 1], ['accepted', undefined], ['accepted', 1]]);
+  assert.equal(inputs(f)[0].reason, 'VOICE_ITEMS_SKIPPED');
+  assert.deepEqual(f.calls.filter(c => c.name === 'prompt').map(c => c.body.text), ['next text', 'mixed text']);
+  await service.poll();
+  assert.equal(inputs(f).length, 3);
+  assert.equal(f.calls.filter(c => c.name === 'prompt').length, 2);
+  const reopened = new Store(f.store.root, 'fixture-account');
+  const restarted = new Service(f.context, f.config, reopened, transport);
+  try {
+    await restarted.poll();
+    assert.equal(reopened.read().receipts.filter(r => r.direction === 'input').length, 3);
+    assert.equal(f.calls.filter(c => c.name === 'prompt').length, 2);
+  } finally { await restarted.stop(); reopened.close(); }
+});
+test('a pure voice skip does not load native sessions, answer Ask or refresh a paused context', async t => {
+  const f = fixture(t);
+  await bind(f);
+  f.getMeta().ask = { requestId: 'pending', question: 'Choose', choices: ['Yes'] };
+  f.store.change(s => {
+    s.binding.contextToken = 'old-context';
+    s.binding.replyContextRejection = { observedAt: 1 };
+    s.outboundGate = { epoch: 1, pausedAt: 1 };
+  });
+  const before = f.calls.length;
+  await f.service.ingest([message('voice', '', { items: [], skippedVoiceItems: 1, createdAt: Date.now() })],
+    'skip-cursor', f.store.read().binding);
+  assert.equal(f.calls.length, before);
+  assert.equal(f.sent.length, 0);
+  assert.equal(f.store.read().binding.contextToken, 'old-context');
+  assert.equal(f.store.read().outboundGate.pausedAt, 1);
+  assert.equal(inputs(f)[0].status, 'skipped');
+});
 test('binding and ticks are passive; real input loads only the original ID and submits immediately', async t => {
   const f = fixture(t);
   await bind(f);
@@ -194,14 +242,19 @@ test('encrypted CDN file, image and video traverse native attachments, immutable
   let uploadKey;
   const transport = new WechatTransport({ account: 'account', peer: 'peer', token: 'synthetic-only' }, async (url, init) => {
     if (url.pathname === '/ilink/bot/getupdates') return new Response(JSON.stringify({
-      get_updates_buf: 'media', msgs: fixtures.map(({ type, name, bytes }, index) => {
+      get_updates_buf: 'media', msgs: [{
+        message_id: '699', from_user_id: 'peer', to_user_id: 'account',
+        message_type: 1, message_state: 2, context_token: 'voice-context',
+        item_list: [{ type: 3, voice_item: {} }],
+      }, ...fixtures.map(({ type, name, bytes }, index) => {
         const media = { encrypt_query_param: String(index), aes_key: key.toString('base64'), encrypt_type: 1 };
         const body = type === 4 ? { file_item: { file_name: name, len: String(bytes.length), media } }
           : type === 2 ? { image_item: { media } } : { video_item: { media, video_size: bytes.length } };
         return { message_id: String(700 + index), from_user_id: 'peer', to_user_id: 'account',
           message_type: 1, message_state: 2, context_token: 'fake-context',
-          item_list: [{ type, msg_id: `media-part/${index}`, ...body }] };
-      }),
+          item_list: [...(type === 2 ? [{ type: 3, voice_item: {} }] : []),
+            { type, msg_id: `media-part/${index}`, ...body }] };
+      })],
     }));
     if (url.pathname === '/c2c/download') return new Response(encrypted[Number(url.searchParams.get('encrypted_query_param'))]);
     if (url.pathname === '/ilink/bot/getuploadurl') {
@@ -220,6 +273,8 @@ test('encrypted CDN file, image and video traverse native attachments, immutable
   });
   const service = f.serviceWith(transport);
   await service.poll();
+  assert.equal(inputs(f)[0].reason, 'VOICE_ITEMS_SKIPPED');
+  assert.equal(inputs(f).find(r => r.messageId === '701').skippedVoiceItems, 1);
   const prompts = f.calls.filter(call => call.name === 'prompt');
   assert.equal(prompts.length, 3);
   for (const [index, prompt] of prompts.entries()) {
@@ -880,19 +935,19 @@ test('upload URL rejection is attributed to the media output rather than to send
   assert.equal(endpoints.filter(endpoint => endpoint.endsWith('/getuploadurl')).length, 1);
 });
 test('unpresented, disallowed, pre-presentation and media replies cannot answer a question or become prompts', async t => {
-  for (const kind of ['unpresented', 'choice-only', 'old-timestamp', 'media', 'empty']) await t.test(kind, async t => {
+  for (const kind of ['unpresented', 'choice-only', 'old-timestamp', 'media', 'voice-mixed', 'empty']) await t.test(kind, async t => {
     const f = fixture(t);
     await bind(f);
     await establishContext(f);
     f.getMeta().ask = { requestId: 'ask-1', question: 'Which?', choices: ['Blue'], allowFreeform: kind !== 'choice-only' };
     if (kind !== 'unpresented') await f.service.tick();
     const extra = kind === 'old-timestamp' ? { createdAt: f.store.read().question.presentedAt - 1 }
-      : kind === 'media' ? { items: [{ type: 4 }] } : {};
+      : kind === 'media' ? { items: [{ type: 4 }] } : kind === 'voice-mixed' ? { skippedVoiceItems: 1 } : {};
     await f.service.ingest([message('answer', kind === 'empty' ? ' ' : 'custom', extra)], 'answer', f.store.read().binding);
     assert.equal(inputs(f).at(-1).status, 'failed');
     assert.equal(inputs(f).at(-1).reason, {
       unpresented: 'ANSWER_QUESTION_NOT_PRESENTED', 'choice-only': 'ANSWER_CHOICE_NOT_ALLOWED',
-      'old-timestamp': 'ANSWER_PREDATES_QUESTION', media: 'ANSWER_TEXT_ONLY', empty: 'ANSWER_EMPTY',
+      'old-timestamp': 'ANSWER_PREDATES_QUESTION', media: 'ANSWER_TEXT_ONLY', 'voice-mixed': 'ANSWER_TEXT_ONLY', empty: 'ANSWER_EMPTY',
     }[kind]);
     assert(!f.calls.some(call => call.name === 'respondAsk'));
     assert.equal(f.calls.filter(call => call.name === 'prompt').length, 1);

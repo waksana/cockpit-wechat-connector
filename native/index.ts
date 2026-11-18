@@ -69,7 +69,8 @@ export async function activate(context: ModuleBackendContext): Promise<ModuleBac
           },
           receipts: state?.receipts.map(receipt => ({ key: receipt.key, direction: receipt.direction,
             status: receipt.status, reason: receipt.reason,
-            ...(receipt.apiFailure ? { apiFailure: receipt.apiFailure } : {}) })) ?? [] } };
+            ...(receipt.apiFailure ? { apiFailure: receipt.apiFailure } : {}),
+            ...(receipt.skippedVoiceItems ? { skippedVoiceItems: receipt.skippedVoiceItems } : {}) })) ?? [] } };
       } },
     ],
     roleAssignments: {
