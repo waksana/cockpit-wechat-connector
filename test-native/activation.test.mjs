@@ -98,6 +98,8 @@ test('status exposes persisted allowlisted API diagnostics without response or m
         text: 'SECRET_MESSAGE', media: [] },
       { key: 'current', generation: 0, direction: 'output', status: 'unknown', reason: 'WECHAT_API_REJECTED',
         text: 'SECRET_MESSAGE', media: [], apiFailure: failure },
+      { key: 'voice', generation: 0, direction: 'input', status: 'skipped', reason: 'VOICE_ITEMS_SKIPPED',
+        text: '', media: [], skippedVoiceItems: 1 },
     );
   });
   store.close();
@@ -107,6 +109,8 @@ test('status exposes persisted allowlisted API diagnostics without response or m
     const status = (await backend.routes.find(route => route.path === '/status').handler({})).body;
     assert.deepEqual(status.lastApiFailure, failure);
     assert.deepEqual(status.receipts[1].apiFailure, failure);
+    assert.equal(status.receipts[2].skippedVoiceItems, 1);
+    assert.equal(status.receipts[2].reason, 'VOICE_ITEMS_SKIPPED');
     assert(!('apiFailure' in status.receipts[0]));
     assert(!JSON.stringify(status).includes('SECRET_'));
   } finally { await backend.dispose(); }

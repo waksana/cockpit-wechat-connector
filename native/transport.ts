@@ -38,6 +38,7 @@ export interface InboundMessage {
   items: Item[];
   quotes: Quote[];
   createdAt?: number;
+  skippedVoiceItems?: number;
 }
 export interface TransportOptions {
   account: string;
@@ -337,7 +338,15 @@ export class WechatTransport {
       assert(value.message_type === 1 && value.message_state === 2, 'MESSAGE_INCOMPLETE');
       assert(string(value.context_token, 16_384) && value.context_token.length > 0, 'MESSAGE_CONTEXT_INVALID');
       assert(Array.isArray(value.item_list) && value.item_list.length > 0 && value.item_list.length <= 100, 'MESSAGE_ITEMS_INVALID');
-      const items = value.item_list.map(item => validateItem(item));
+      let skippedVoiceItems = 0;
+      const items = value.item_list.flatMap(item => {
+        if (record(item) && item.type === 3) {
+          assert(record(item.voice_item), 'ITEM_VOICE_INVALID');
+          skippedVoiceItems++;
+          return [];
+        }
+        return [validateItem(item)];
+      });
       const text = items.filter(item => item.type === 1).map(item => item.text_item!.text).join('\n');
       assert(text.length <= 50_000, 'MESSAGE_TEXT_TOO_LARGE');
       let createdAt: number | undefined;
@@ -347,7 +356,8 @@ export class WechatTransport {
       }
       messages.push({ id: serverMessageId(value.message_id), account: this.account, peer: this.peer, text,
         contextToken: value.context_token, items, quotes: items.flatMap(item => item.ref_msg ? [item.ref_msg] : []),
-        ...(createdAt === undefined ? {} : { createdAt }) });
+        ...(createdAt === undefined ? {} : { createdAt }),
+        ...(skippedVoiceItems ? { skippedVoiceItems } : {}) });
     }
     return { messages, cursor: result.get_updates_buf };
   }

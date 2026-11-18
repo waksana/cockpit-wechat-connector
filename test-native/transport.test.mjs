@@ -109,7 +109,8 @@ test('invalid item metadata on unrelated senders is filtered before item validat
 test('malformed known-authorized messages reject the entire poll without exposing a new cursor', async () => {
   for (const malformed of [
     { message_state: 1 }, { message_type: 2 }, { context_token: '' }, { item_list: [] },
-    { item_list: [{ type: 3, voice_item: {} }] }, { message_id: '18446744073709551616' },
+    { item_list: [{ type: 3, voice_item: null }] }, { message_id: '18446744073709551616' },
+    { item_list: [{ type: '3', voice_item: {} }] }, { item_list: [{ type: 99 }] },
     { item_list: [{ type: 1, text_item: { text: 'hello' }, ref_msg: { svr_id: -1 } }] },
     { item_list: [{ type: 2, image_item: { media: { full_url: 'http://127.0.0.1/c2c/download' } } }] },
     { item_list: [{ type: 4, file_item: { media: { encrypt_query_param: 'missing-key' } } }] },
@@ -117,6 +118,37 @@ test('malformed known-authorized messages reject the entire poll without exposin
     const transport = new WechatTransport(config, async () => json({ msgs: [message(), message(malformed)], get_updates_buf: 'unsafe' }));
     await assert.rejects(transport.poll('before'));
   }
+});
+
+test('voice items are explicitly omitted without losing following text or images', async () => {
+  const voice = { type: 3, voice_item: { text: 'not forwarded', media: { full_url: 'not fetched' } } };
+  const text = { type: 1, text_item: { text: 'keep text' } };
+  const image = { type: 2, image_item: { media: { encrypt_query_param: 'image', encrypt_type: 0 } } };
+  let requests = 0;
+  const transport = new WechatTransport(config, async () => {
+    requests++;
+    return json({ msgs: [
+      message({ message_id: '1', item_list: [voice] }),
+      message({ message_id: '2', item_list: [text] }),
+      message({ message_id: '3', item_list: [image] }),
+      message({ message_id: '4', item_list: [voice, text, image, voice] }),
+      message({ from_user_id: 'stranger', item_list: [{ type: 3 }] }),
+    ], get_updates_buf: 'next' });
+  });
+  const result = await transport.poll('before');
+  assert.equal(result.cursor, 'next');
+  assert.equal(result.messages.length, 4);
+  assert.equal(result.messages[0].skippedVoiceItems, 1);
+  assert.deepEqual(result.messages[0].items, []);
+  assert.equal(result.messages[0].text, '');
+  assert.deepEqual(result.messages[1].items, [text]);
+  assert.deepEqual(result.messages[2].items, [image]);
+  assert.equal(result.messages[3].skippedVoiceItems, 2);
+  assert.deepEqual(result.messages[3].items, [text, image]);
+  assert.equal(result.messages[3].text, 'keep text');
+  assert(!JSON.stringify(result).includes('not forwarded'));
+  await assert.rejects(transport.send([voice], 'context', 'client'), /ITEM_INVALID/);
+  assert.equal(requests, 1);
 });
 
 test('send uses bound peer and requires an explicit valid success receipt', async () => {
